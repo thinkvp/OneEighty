@@ -17,7 +17,8 @@ namespace
 using Clock = std::chrono::steady_clock;
 double Ms(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); }
 
-// Downscale (area) then convert to 8-bit luma.
+// Downscale (area) then convert to 8-bit luma (motion estimation only; float
+// input is clamped to 0..1, which is fine for estimating motion).
 cv::Mat SmallGray(const cv::Mat& bgra, double scale, const ChannelOrder& o)
 {
     cv::Mat small;
@@ -26,6 +27,24 @@ cv::Mat SmallGray(const cv::Mat& bgra, double scale, const ChannelOrder& o)
     else
         small = bgra;
     cv::Mat gray(small.size(), CV_8UC1);
+    if (small.depth() == CV_32F)
+    {
+        for (int y = 0; y < small.rows; ++y)
+        {
+            const float* s = small.ptr<float>(y);
+            uchar* d = gray.ptr<uchar>(y);
+            for (int x = 0; x < small.cols; ++x, s += 4)
+            {
+                // same weights and rounding as the 8-bit branch (77/150/29 of 256) so an
+                // 8-bit preview and a float export of the same frame get the same motion
+                const int r = (int)(std::clamp(s[o.r], 0.0f, 1.0f) * 255.0f + 0.5f);
+                const int g = (int)(std::clamp(s[o.g], 0.0f, 1.0f) * 255.0f + 0.5f);
+                const int b = (int)(std::clamp(s[o.b], 0.0f, 1.0f) * 255.0f + 0.5f);
+                d[x] = (uchar)((77 * r + 150 * g + 29 * b + 128) >> 8);
+            }
+        }
+        return gray;
+    }
     for (int y = 0; y < small.rows; ++y)
     {
         const uchar* s = small.ptr<uchar>(y);
@@ -36,29 +55,129 @@ cv::Mat SmallGray(const cv::Mat& bgra, double scale, const ChannelOrder& o)
     return gray;
 }
 
+// Pixel component traits: 8-bit (0..255) or 32-bit float (0..1, may exceed).
+template <typename T> struct Px;
+template <> struct Px<uchar>
+{
+    static constexpr float kOne = 255.0f;
+    static uchar From(float v) { return (uchar)std::clamp(v + 0.5f, 0.0f, 255.0f); }
+};
+template <> struct Px<float>
+{
+    static constexpr float kOne = 1.0f;
+    static float From(float v) { return v; } // no clamping: keeps HDR / super-whites
+};
+
 // Motion field view: hue = direction, colour strength = speed (full at 1% of
 // the frame width per source frame), over a grey version of the picture.
+template <typename T>
 void DrawVectors(const cv::Mat& cur, const cv::Mat& vFull, const ChannelOrder& o, cv::Mat& out)
 {
-    const float norm = std::max(4.0f, 0.01f * cur.cols);
+    const float norm = std::max(4.0f, 0.01f * cur.cols), one = Px<T>::kOne;
     cv::parallel_for_(cv::Range(0, cur.rows), [&](const cv::Range& rows) {
         for (int y = rows.start; y < rows.end; ++y)
         {
             const cv::Vec2f* vr = vFull.ptr<cv::Vec2f>(y);
-            const uchar* p = cur.ptr<uchar>(y);
-            uchar* d = out.ptr<uchar>(y);
+            const T* p = cur.ptr<T>(y);
+            T* d = out.ptr<T>(y);
             for (int x = 0; x < cur.cols; ++x, p += 4, d += 4)
             {
                 float rgb[3];
                 VectorColour(vr[x][0], vr[x][1], norm, rgb);
-                const float g = (0.299f * p[o.r] + 0.587f * p[o.g] + 0.114f * p[o.b]) / 255.0f;
-                d[o.r] = (uchar)std::clamp((0.35f * g + 0.65f * rgb[0] * (0.4f + 0.6f * g)) * 255.0f, 0.0f, 255.0f);
-                d[o.g] = (uchar)std::clamp((0.35f * g + 0.65f * rgb[1] * (0.4f + 0.6f * g)) * 255.0f, 0.0f, 255.0f);
-                d[o.b] = (uchar)std::clamp((0.35f * g + 0.65f * rgb[2] * (0.4f + 0.6f * g)) * 255.0f, 0.0f, 255.0f);
+                const float g = std::clamp((0.299f * p[o.r] + 0.587f * p[o.g] + 0.114f * p[o.b]) / one, 0.0f, 1.0f);
+                const float k = 0.65f * (0.4f + 0.6f * g);
+                d[o.r] = Px<T>::From((0.35f * g + k * rgb[0]) * one);
+                d[o.g] = Px<T>::From((0.35f * g + k * rgb[1]) * one);
+                d[o.b] = Px<T>::From((0.35f * g + k * rgb[2]) * one);
                 d[o.a] = p[o.a];
             }
         }
     });
+}
+
+// Average of cur along each pixel's motion path (see FlowMotionBlur).
+template <typename T>
+void GatherBlur(const cv::Mat& cur, const cv::Mat& vFull, const BlurSettings& s, cv::Mat& out, long long* samplesOut,
+                int* maxSpeedX100Out)
+{
+    const int W = cur.cols, H = cur.rows;
+    // mip chain for long smears (level l = 1/2^l resolution, area filtered)
+    std::vector<cv::Mat> mip{cur};
+    if (s.mipThreshold > 0)
+        for (int l = 1; l <= s.maxMipLevel && mip.back().cols >= 4 && mip.back().rows >= 4; ++l)
+        {
+            cv::Mat half;
+            cv::resize(mip.back(), half, cv::Size((mip.back().cols + 1) / 2, (mip.back().rows + 1) / 2), 0, 0,
+                       cv::INTER_AREA);
+            mip.push_back(half);
+        }
+    const int topLevel = (int)mip.size() - 1;
+    const float hw = (float)s.halfWidth;
+    const float c0 = (float)s.centerOffset;
+    const int maxS = std::max(1, s.maxSamples);
+    const float mipT = (float)std::max(1, s.mipThreshold);
+    std::atomic<long long> totalSamples{0};
+    std::atomic<int> maxSpeedX100{0};
+
+    cv::parallel_for_(cv::Range(0, H), [&](const cv::Range& rows) {
+        long long localSamples = 0;
+        int localMax = 0;
+        for (int y = rows.start; y < rows.end; ++y)
+        {
+            const cv::Vec2f* vr = vFull.ptr<cv::Vec2f>(y);
+            T* o = out.ptr<T>(y);
+            for (int x = 0; x < W; ++x, o += 4)
+            {
+                const float vx = vr[x][0], vy = vr[x][1];
+                const float speed = std::sqrt(vx * vx + vy * vy);
+                localMax = std::max(localMax, (int)(speed * 100));
+                const float smear = 2.0f * hw * speed; // blur length in full-res pixels
+                if (smear <= 1.0f && std::fabs(c0) * speed < 0.5f)
+                {
+                    const T* p = cur.ptr<T>(y) + 4 * x;
+                    o[0] = p[0]; o[1] = p[1]; o[2] = p[2]; o[3] = p[3];
+                    ++localSamples;
+                    continue;
+                }
+                int lvl = 0;
+                while (lvl < topLevel && smear / (float)(1 << lvl) > mipT)
+                    ++lvl;
+                const cv::Mat& img = mip[lvl];
+                const float inv2l = 1.0f / (float)(1 << lvl);
+                const int w = img.cols, h = img.rows;
+                const int n = std::min(maxS, std::max(2, (int)std::ceil(smear * inv2l)));
+                localSamples += n;
+
+                float acc[4] = {0, 0, 0, 0};
+                for (int j = 0; j < n; ++j)
+                {
+                    const float off = c0 + hw * (((j + 0.5f) / n) * 2.0f - 1.0f);
+                    // full-res sample position -> this level's pixel grid
+                    float sx = (x - off * vx + 0.5f) * inv2l - 0.5f;
+                    float sy = (y - off * vy + 0.5f) * inv2l - 0.5f;
+                    sx = std::clamp(sx, 0.0f, (float)(w - 1));
+                    sy = std::clamp(sy, 0.0f, (float)(h - 1));
+                    const int x0 = std::min((int)sx, std::max(0, w - 2)), y0 = std::min((int)sy, std::max(0, h - 2));
+                    const float fx = sx - x0, fy = sy - y0;
+                    const T* p00 = img.ptr<T>(y0) + 4 * x0;
+                    const T* p10 = p00 + 4;
+                    const T* p01 = img.ptr<T>(y0 + 1) + 4 * x0;
+                    const T* p11 = p01 + 4;
+                    const float w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+                    for (int c = 0; c < 4; ++c)
+                        acc[c] += w00 * p00[c] + w10 * p10[c] + w01 * p01[c] + w11 * p11[c];
+                }
+                const float inv = 1.0f / n;
+                for (int c = 0; c < 4; ++c)
+                    o[c] = Px<T>::From(acc[c] * inv);
+            }
+        }
+        totalSamples += localSamples;
+        int prevMax = maxSpeedX100.load();
+        while (localMax > prevMax && !maxSpeedX100.compare_exchange_weak(prevMax, localMax)) {}
+    });
+    *samplesOut = totalSamples;
+    *maxSpeedX100Out = maxSpeedX100;
 }
 
 } // namespace
@@ -122,7 +241,9 @@ double BlurHalfWidth(double srcFps, double outFps, double srcShutterDeg, double 
 void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next, cv::Mat& out,
                     const ChannelOrder& order, const BlurSettings& s, BlurStats* stats)
 {
-    CV_Assert(cur.type() == CV_8UC4 && out.type() == CV_8UC4 && out.size() == cur.size());
+    CV_Assert((cur.type() == CV_8UC4 || cur.type() == CV_32FC4) && out.type() == cur.type() &&
+              out.size() == cur.size());
+    const bool isFloat = cur.depth() == CV_32F;
     const auto t0 = Clock::now();
     const int W = cur.cols, H = cur.rows;
 
@@ -172,89 +293,22 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
 
     if (s.showVectors)
     {
-        DrawVectors(cur, vFull, order, out);
+        if (isFloat)
+            DrawVectors<float>(cur, vFull, order, out);
+        else
+            DrawVectors<uchar>(cur, vFull, order, out);
         if (stats)
             stats->flowMs = Ms(t0, t1);
         return;
     }
 
-    // ---- mip chain for long smears (level l = 1/2^l resolution, area filtered)
-    std::vector<cv::Mat> mip{cur};
-    if (s.mipThreshold > 0)
-        for (int l = 1; l <= s.maxMipLevel && mip.back().cols >= 4 && mip.back().rows >= 4; ++l)
-        {
-            cv::Mat half;
-            cv::resize(mip.back(), half, cv::Size((mip.back().cols + 1) / 2, (mip.back().rows + 1) / 2), 0, 0,
-                       cv::INTER_AREA);
-            mip.push_back(half);
-        }
-    const int topLevel = (int)mip.size() - 1;
-
     // ---- gather blur: average cur along each pixel's motion path
-    const float hw = (float)s.halfWidth;
-    const float c0 = (float)s.centerOffset;
-    const int maxS = std::max(1, s.maxSamples);
-    const float mipT = (float)std::max(1, s.mipThreshold);
-    std::atomic<long long> totalSamples{0};
-    std::atomic<int> maxSpeedX100{0};
-
-    cv::parallel_for_(cv::Range(0, H), [&](const cv::Range& rows) {
-        long long localSamples = 0;
-        int localMax = 0;
-        for (int y = rows.start; y < rows.end; ++y)
-        {
-            const cv::Vec2f* vr = vFull.ptr<cv::Vec2f>(y);
-            uchar* o = out.ptr<uchar>(y);
-            for (int x = 0; x < W; ++x, o += 4)
-            {
-                const float vx = vr[x][0], vy = vr[x][1];
-                const float speed = std::sqrt(vx * vx + vy * vy);
-                localMax = std::max(localMax, (int)(speed * 100));
-                const float smear = 2.0f * hw * speed; // blur length in full-res pixels
-                if (smear <= 1.0f)
-                {
-                    const uchar* p = cur.ptr<uchar>(y) + 4 * x;
-                    o[0] = p[0]; o[1] = p[1]; o[2] = p[2]; o[3] = p[3];
-                    ++localSamples;
-                    continue;
-                }
-                int lvl = 0;
-                while (lvl < topLevel && smear / (float)(1 << lvl) > mipT)
-                    ++lvl;
-                const cv::Mat& img = mip[lvl];
-                const float inv2l = 1.0f / (float)(1 << lvl);
-                const int w = img.cols, h = img.rows;
-                const int n = std::min(maxS, std::max(2, (int)std::ceil(smear * inv2l)));
-                localSamples += n;
-
-                float acc[4] = {0, 0, 0, 0};
-                for (int j = 0; j < n; ++j)
-                {
-                    const float off = c0 + hw * (((j + 0.5f) / n) * 2.0f - 1.0f);
-                    // full-res sample position -> this level's pixel grid
-                    float sx = (x - off * vx + 0.5f) * inv2l - 0.5f;
-                    float sy = (y - off * vy + 0.5f) * inv2l - 0.5f;
-                    sx = std::clamp(sx, 0.0f, (float)(w - 1));
-                    sy = std::clamp(sy, 0.0f, (float)(h - 1));
-                    const int x0 = std::min((int)sx, std::max(0, w - 2)), y0 = std::min((int)sy, std::max(0, h - 2));
-                    const float fx = sx - x0, fy = sy - y0;
-                    const uchar* p00 = img.ptr<uchar>(y0) + 4 * x0;
-                    const uchar* p10 = p00 + 4;
-                    const uchar* p01 = img.ptr<uchar>(y0 + 1) + 4 * x0;
-                    const uchar* p11 = p01 + 4;
-                    const float w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
-                    for (int c = 0; c < 4; ++c)
-                        acc[c] += w00 * p00[c] + w10 * p10[c] + w01 * p01[c] + w11 * p11[c];
-                }
-                const float inv = 1.0f / n;
-                for (int c = 0; c < 4; ++c)
-                    o[c] = (uchar)std::min(255.0f, acc[c] * inv + 0.5f);
-            }
-        }
-        totalSamples += localSamples;
-        int prevMax = maxSpeedX100.load();
-        while (localMax > prevMax && !maxSpeedX100.compare_exchange_weak(prevMax, localMax)) {}
-    });
+    long long totalSamples = 0;
+    int maxSpeedX100 = 0;
+    if (isFloat)
+        GatherBlur<float>(cur, vFull, s, out, &totalSamples, &maxSpeedX100);
+    else
+        GatherBlur<uchar>(cur, vFull, s, out, &totalSamples, &maxSpeedX100);
     const auto t2 = Clock::now();
 
     if (stats)

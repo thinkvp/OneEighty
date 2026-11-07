@@ -96,6 +96,23 @@ int main(int argc, char** argv)
     if (hostPair && argb)
         for (auto& f : hostSrc)
             swapBGRA_ARGB(f, true);
+    // OE_FLOAT=1: hybrid path with 32-bit float frames (Premiere 32-bit);
+    // OE_FLOAT=2: same, input values x1.5 (HDR-style >1.0) to check nothing clips.
+    char floatEnv[8] = {0};
+    size_t floatLen = 0;
+    getenv_s(&floatLen, floatEnv, sizeof(floatEnv), "OE_FLOAT");
+    const bool useFloat = hostPair && (floatEnv[0] == '1' || floatEnv[0] == '2');
+    const float gain = floatEnv[0] == '2' ? 1.5f : 1.0f;
+    std::vector<cv::Mat> hostF;
+    if (useFloat)
+        for (auto& f : hostSrc)
+        {
+            cv::Mat m;
+            cv::Mat(H, W, CV_8UC4, f.data()).convertTo(m, CV_32FC4, gain / 255.0);
+            hostF.push_back(m);
+        }
+    cv::Mat outF(H, W, CV_32FC4);
+    double outMax = 0, outAbove1 = 0, outPixels = 0;
     char view[8] = {0};
     size_t viewLen = 0;
     getenv_s(&viewLen, view, sizeof(view), "OE_VIEW"); // OE_VIEW=1: motion-vector view
@@ -118,10 +135,20 @@ int main(int argc, char** argv)
             if (A + 1 >= (long)src.size())
                 break;
             using HI = oe::gpu::Engine::HostImage;
-            const HI ha{hostSrc[A].data(), (size_t)W * 4, W, H, argb}, hb{hostSrc[A + 1].data(), (size_t)W * 4, W, H, argb};
+            HI ha{hostSrc[A].data(), (size_t)W * 4, W, H, argb}, hb{hostSrc[A + 1].data(), (size_t)W * 4, W, H, argb};
+            void* outPtr = buf.data();
+            size_t outRB = (size_t)W * 4;
+            if (useFloat)
+            {
+                ha = HI{hostF[A].data, hostF[A].step, W, H, false, true};
+                hb = HI{hostF[A + 1].data, hostF[A + 1].step, W, H, false, true};
+                outPtr = outF.data;
+                outRB = outF.step;
+            }
             if (disMotion)
             {
-                const cv::Mat ma(H, W, CV_8UC4, hostSrc[A].data()), mb(H, W, CV_8UC4, hostSrc[A + 1].data());
+                const cv::Mat ma = useFloat ? hostF[A] : cv::Mat(H, W, CV_8UC4, hostSrc[A].data());
+                const cv::Mat mb = useFloat ? hostF[A + 1] : cv::Mat(H, W, CV_8UC4, hostSrc[A + 1].data());
                 const oe::ChannelOrder ord = argb ? oe::kARGB : oe::kBGRA;
                 cv::Mat fa, fbBack;
                 const auto td0 = std::chrono::steady_clock::now();
@@ -137,11 +164,20 @@ int main(int argc, char** argv)
                 const cv::Mat fb = -fbBack;
                 const oe::gpu::Engine::HostFlow hfa{fa.data, fa.step, fa.cols, fa.rows};
                 const oe::gpu::Engine::HostFlow hfb{fb.data, fb.step, fb.cols, fb.rows};
-                ok = eng->ProcessHostPairFlow(ha, hb, k * r - (double)A, hfa, hfb, buf.data(), (size_t)W * 4, s, &st,
-                                              &err);
+                ok = eng->ProcessHostPairFlow(ha, hb, k * r - (double)A, hfa, hfb, outPtr, outRB, s, &st, &err);
             }
             else
-                ok = eng->ProcessHostPair(ha, hb, k * r - (double)A, buf.data(), (size_t)W * 4, s, &st, &err);
+                ok = eng->ProcessHostPair(ha, hb, k * r - (double)A, outPtr, outRB, s, &st, &err);
+            if (ok && useFloat)
+            {
+                double mn, mx;
+                cv::minMaxLoc(outF.reshape(1), &mn, &mx);
+                outMax = std::max(outMax, mx);
+                outAbove1 += cv::countNonZero(outF.reshape(1) > 1.0);
+                outPixels += (double)W * H * 4;
+                cv::Mat(H, W, CV_8UC4, buf.data()) = cv::Scalar::all(0);
+                outF.convertTo(cv::Mat(H, W, CV_8UC4, buf.data()), CV_8UC4, 255.0 / gain);
+            }
             if (ok)
             {
                 if (argb)
@@ -175,6 +211,9 @@ int main(int argc, char** argv)
         std::fwrite(buf.data(), 1, frameBytes, fo);
     }
     std::fclose(fo);
+    if (useFloat)
+        std::printf("float output: max value %.3f, %.2f%% of components above 1.0 (input gain %.1f)\n", outMax,
+                    100.0 * outAbove1 / std::max(1.0, outPixels), gain);
     if (disCount)
         std::printf("DIS motion (%s): avg %.1f ms per frame pair\n", seqFlow ? "sequential" : "parallel pair",
                     disMsTotal / disCount);

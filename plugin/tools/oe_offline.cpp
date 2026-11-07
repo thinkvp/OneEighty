@@ -51,6 +51,27 @@ int main(int argc, char** argv)
     getenv_s(&cadLen, cad, sizeof(cad), "OE_CADENCE");
     const bool cadence = cad[0] == '1';
     cv::Mat out(H, W, CV_8UC4);
+    // OE_FLOAT=1: run the frames as 32-bit float (Premiere 32-bit) and write 8-bit
+    char floatEnv[8] = {0};
+    size_t floatLen = 0;
+    getenv_s(&floatLen, floatEnv, sizeof(floatEnv), "OE_FLOAT");
+    const bool useFloat = floatEnv[0] == '1';
+    if (useFloat)
+    {
+        for (auto& m : src)
+            m.convertTo(m, CV_32FC4, 1.0 / 255.0);
+        out = cv::Mat(H, W, CV_32FC4);
+    }
+    cv::Mat out8(H, W, CV_8UC4);
+    auto writeOut = [&]() {
+        if (useFloat)
+        {
+            out.convertTo(out8, CV_8UC4, 255.0);
+            std::fwrite(out8.data, 1, frameBytes, fo);
+        }
+        else
+            std::fwrite(out.data, 1, frameBytes, fo);
+    };
     double flowMs = 0, blurMs = 0;
     int k = 0;
     for (;; ++k)
@@ -71,7 +92,7 @@ int main(int argc, char** argv)
                 break;
             if (a > 1e-3)
             {
-                cv::Mat outA(H, W, CV_8UC4), outB(H, W, CV_8UC4);
+                cv::Mat outA(H, W, out.type()), outB(H, W, out.type());
                 s.centerOffset = a;
                 oe::FlowMotionBlur(cv::Mat(), src[A], src[A + 1], outA, oe::kBGRA, s, &st);
                 s.centerOffset = a - 1.0;
@@ -83,14 +104,14 @@ int main(int argc, char** argv)
                 s.centerOffset = 0.0;
                 oe::FlowMotionBlur(cv::Mat(), src[A], src[A + 1], out, oe::kBGRA, s, &st);
             }
-            std::fwrite(out.data, 1, frameBytes, fo);
+            writeOut();
             continue;
         }
         s.centerOffset = cadence ? k * r - (double)i : 0.0;
         oe::FlowMotionBlur(prev, src[i], next, out, oe::kBGRA, s, &st);
         flowMs += st.flowMs;
         blurMs += st.blurMs;
-        std::fwrite(out.data, 1, frameBytes, fo);
+        writeOut();
     }
     std::fclose(fo);
     std::printf("wrote %d frames; avg flow %.1f ms, blur %.1f ms per frame\n", k, flowMs / k, blurMs / k);

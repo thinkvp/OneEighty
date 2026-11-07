@@ -68,7 +68,8 @@ public:
         const void* data = nullptr;
         size_t rowBytes = 0;
         int width = 0, height = 0;
-        bool argb = false; // byte order A,R,G,B (After Effects / Premiere default for AE effects) instead of B,G,R,A
+        bool argb = false;    // 8-bit only: byte order A,R,G,B instead of B,G,R,A
+        bool isFloat = false; // 4 x float32 B,G,R,A (Premiere 32-bit), copied as is: no clamping
     };
     // Two-frame interpolation (see ProcessPair).
     virtual bool ProcessHostPair(const HostImage& A, const HostImage& B, double a, void* out, size_t outRowBytes,

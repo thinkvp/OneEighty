@@ -9,8 +9,8 @@
 
 // Keep in sync with AE_Effect_Version in OneEightyPiPL.r
 #define MAJOR_VERSION 0
-#define MINOR_VERSION 5
-#define BUG_VERSION   1
+#define MINOR_VERSION 6
+#define BUG_VERSION   0
 #define STAGE_VERSION PF_Stage_DEVELOP
 #define BUILD_VERSION 1
 

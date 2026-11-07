@@ -118,9 +118,12 @@ oe::ChannelOrder PixelOrder(PF_InData* in_data, PF_LayerDef* world, unsigned* fo
     return order;
 }
 
-inline cv::Mat Wrap(const PF_LayerDef* w)
+// Premiere 32-bit float BGRA (declared in GlobalSetup); everything else here is 8-bit.
+inline bool IsFloatFormat(unsigned fourcc) { return fourcc == (unsigned)PrPixelFormat_BGRA_4444_32f; }
+
+inline cv::Mat Wrap(const PF_LayerDef* w, bool isFloat)
 {
-    return cv::Mat(w->height, w->width, CV_8UC4, w->data, (size_t)w->rowbytes);
+    return cv::Mat(w->height, w->width, isFloat ? CV_32FC4 : CV_8UC4, w->data, (size_t)w->rowbytes);
 }
 
 bool Valid(const PF_LayerDef* w) { return w && w->data && w->width > 0 && w->height > 0; }
@@ -138,8 +141,10 @@ PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_
     out_data->my_version = PF_VERSION(MAJOR_VERSION, MINOR_VERSION, BUG_VERSION, STAGE_VERSION, BUILD_VERSION);
     out_data->out_flags = PF_OutFlag_WIDE_TIME_INPUT;
     out_data->out_flags2 = PF_OutFlag2_SUPPORTS_THREADED_RENDERING;
-    // Premiere: accept its native 8-bit BGRA (saves a byte-swap per fetched
-    // frame); 8-bit ARGB stays available as the implicit default.
+    // Premiere: formats in order of preference. 32-bit float BGRA keeps the
+    // clip in Premiere's 32-bit pipeline (no 8-bit banding on log/graded
+    // footage, HDR values above 1.0 preserved); 8-bit BGRA is Premiere's native
+    // 8-bit layout; 8-bit ARGB stays available as the implicit default.
     if (in_data->appl_id == kAppID_Premiere && in_data->pica_basicP)
     {
         const void* p = nullptr;
@@ -147,7 +152,10 @@ PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_
         {
             const PF_PixelFormatSuite1* pf = static_cast<const PF_PixelFormatSuite1*>(p);
             if (pf->AddSupportedPixelFormat)
+            {
+                pf->AddSupportedPixelFormat(in_data->effect_ref, PrPixelFormat_BGRA_4444_32f);
                 pf->AddSupportedPixelFormat(in_data->effect_ref, PrPixelFormat_BGRA_4444_8u);
+            }
             in_data->pica_basicP->ReleaseSuite(kPFPixelFormatSuite, kPFPixelFormatSuiteVersion1);
         }
         // Checked-out frames otherwise arrive as ARGB while input/output are
@@ -237,15 +245,20 @@ bool SameOrder(const oe::ChannelOrder& a, const oe::ChannelOrder& b)
     return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
 }
 
-// src viewed in byte order `from`, returned in byte order `to` (a copy only
-// when they differ).
-cv::Mat Reorder(const cv::Mat& src, const oe::ChannelOrder& from, const oe::ChannelOrder& to)
+// src (byte order `from`) returned in the output's byte order and bit depth
+// (a copy only when something differs; float is 0..1 = 8-bit 0..255).
+cv::Mat Conform(const cv::Mat& src, const oe::ChannelOrder& from, const oe::ChannelOrder& to, bool toFloat)
 {
+    cv::Mat m = src;
+    if (toFloat && m.depth() != CV_32F)
+        m.convertTo(m, CV_32FC4, 1.0 / 255.0);
+    else if (!toFloat && m.depth() == CV_32F)
+        m.convertTo(m, CV_8UC4, 255.0);
     if (SameOrder(from, to))
-        return src;
-    cv::Mat dst(src.size(), CV_8UC4);
+        return m;
+    cv::Mat dst(m.size(), m.type());
     const int pairs[] = {from.r, to.r, from.g, to.g, from.b, to.b, from.a, to.a};
-    cv::mixChannels(&src, 1, &dst, 1, pairs, 4);
+    cv::mixChannels(&m, 1, &dst, 1, pairs, 4);
     return dst;
 }
 
@@ -259,9 +272,18 @@ double SampledDiff(const cv::Mat& a, const cv::Mat& b)
         for (int i = 0; i < 64; ++i)
         {
             const int x = (int)((i + 0.5) * a.cols / 64), y = (int)((j + 0.5) * a.rows / 64);
-            const uchar* p = a.ptr<uchar>(y) + 4 * x;
-            const uchar* q = b.ptr<uchar>(y) + 4 * x;
-            acc += std::abs(p[0] - q[0]) + std::abs(p[1] - q[1]) + std::abs(p[2] - q[2]);
+            if (a.depth() == CV_32F)
+            {
+                const float* p = a.ptr<float>(y) + 4 * x;
+                const float* q = b.ptr<float>(y) + 4 * x;
+                acc += 255.0 * (std::fabs(p[0] - q[0]) + std::fabs(p[1] - q[1]) + std::fabs(p[2] - q[2]));
+            }
+            else
+            {
+                const uchar* p = a.ptr<uchar>(y) + 4 * x;
+                const uchar* q = b.ptr<uchar>(y) + 4 * x;
+                acc += std::abs(p[0] - q[0]) + std::abs(p[1] - q[1]) + std::abs(p[2] - q[2]);
+            }
         }
     return acc / (64.0 * 64.0 * 3.0);
 }
@@ -329,17 +351,18 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     const bool have2 = !e2 && Valid(&d2.u.ld) && SameSize(&d2.u.ld, curW);
 
     // Premiere can hand the input, the checked-out frames and the output in
-    // different byte orders (seen: input BGRA, checkouts ARGB). Bring every
-    // frame into the output's order before processing.
+    // different formats (seen: input BGRA, checkouts ARGB). Bring every frame
+    // into the output's byte order and bit depth (8-bit or 32-bit float).
     unsigned fourcc = 0, fcIn = 0, fc1 = 0, fc2 = 0;
     const oe::ChannelOrder order = PixelOrder(in_data, output, &fourcc);
     const oe::ChannelOrder ordIn = PixelOrder(in_data, curW, &fcIn);
     const oe::ChannelOrder ord1 = have1 ? PixelOrder(in_data, &d1.u.ld, &fc1) : order;
     const oe::ChannelOrder ord2 = have2 ? PixelOrder(in_data, &d2.u.ld, &fc2) : order;
-    const cv::Mat cur = Reorder(Wrap(curW), ordIn, order);
-    const cv::Mat m1 = have1 ? Reorder(Wrap(&d1.u.ld), ord1, order) : cv::Mat();
-    const cv::Mat m2 = have2 ? Reorder(Wrap(&d2.u.ld), ord2, order) : cv::Mat();
-    cv::Mat out = Wrap(output);
+    const bool outFloat = IsFloatFormat(fourcc);
+    const cv::Mat cur = Conform(Wrap(curW, IsFloatFormat(fcIn)), ordIn, order, outFloat);
+    const cv::Mat m1 = have1 ? Conform(Wrap(&d1.u.ld, IsFloatFormat(fc1)), ord1, order, outFloat) : cv::Mat();
+    const cv::Mat m2 = have2 ? Conform(Wrap(&d2.u.ld, IsFloatFormat(fc2)), ord2, order, outFloat) : cv::Mat();
+    cv::Mat out = Wrap(output, outFloat);
     char fmts[48];
     auto cc = [](unsigned f, int i) { return f ? (char)(f >> (8 * i)) : '?'; };
     snprintf(fmts, sizeof(fmts), "out=%c%c%c%c in=%c%c%c%c d1=%c%c%c%c", cc(fourcc, 0), cc(fourcc, 1), cc(fourcc, 2),
@@ -380,9 +403,10 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
             // analysis resolution relative to the frame (validated: half-res, grid 2 best)
             gs.flowWidth = q == OE_QUALITY_FAST ? std::max(256, cur.cols / 4) : std::max(512, cur.cols / 2);
             gs.flowGrid = q == OE_QUALITY_FAST ? 4 : q == OE_QUALITY_HIGH ? 1 : 2;
-            const oe::gpu::Engine::HostImage hc{cur.data, cur.step, cur.cols, cur.rows, argb};
-            const oe::gpu::Engine::HostImage h1{m1.data, m1.step, m1.cols, m1.rows, argb};
-            const oe::gpu::Engine::HostImage h2{m2.data, m2.step, m2.cols, m2.rows, argb};
+            const bool a8 = argb && !outFloat;
+            const oe::gpu::Engine::HostImage hc{cur.data, cur.step, cur.cols, cur.rows, a8, outFloat};
+            const oe::gpu::Engine::HostImage h1{m1.data, m1.step, m1.cols, m1.rows, a8, outFloat};
+            const oe::gpu::Engine::HostImage h2{m2.data, m2.step, m2.cols, m2.rows, a8, outFloat};
             oe::gpu::Stats gst;
             if (q == OE_QUALITY_FAST)
             {
@@ -457,7 +481,7 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
             if (pair && !vectors && phase > 1e-3)
             {
                 // two-frame interpolation on the CPU: A at +a, B at -(1-a), blended
-                cv::Mat outA(cur.size(), CV_8UC4), outB(cur.size(), CV_8UC4);
+                cv::Mat outA(cur.size(), cur.type()), outB(cur.size(), cur.type());
                 bs.centerOffset = phase;
                 oe::FlowMotionBlur(cv::Mat(), m1, m2, outA, order, bs);
                 bs.centerOffset = phase - 1.0;

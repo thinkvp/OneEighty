@@ -1,6 +1,6 @@
 # OneEighty Motion Blur (Premiere Pro / After Effects effect)
 
-v0.5.1. Gives high-frame-rate footage (50p, 59.94p) played at 100% speed on a
+v0.6. Gives high-frame-rate footage (50p, 59.94p) played at 100% speed on a
 lower-rate timeline (25p) the motion blur a 180° shutter at the timeline rate
 would have recorded, and (optionally) evens out the uneven frame steps of
 non-integer conversions like 59.94p → 25p.
@@ -40,8 +40,20 @@ The GPU is used automatically when an NVIDIA GPU with optical-flow hardware
    output time and B likewise, blended by closeness. CUDA when available
    (`gpu/GpuMotionBlur.cu`), else OpenCV (`MotionBlur.cpp`).
 
-Premiere hands the input and output as 8-bit BGRA but checked-out frames as
-ARGB; every frame is converted to the output's byte order before processing.
+**Bit depth.** The effect declares 32-bit float BGRA to Premiere (preferred),
+then 8-bit BGRA, so it shows Premiere's 32-bit badge and doesn't force a clip
+into an 8-bit pipeline: no 8-bit banding on log/graded footage, and HDR values
+above 1.0 pass through unclipped (checked offline: input x1.5 -> output max
+1.500, nothing clipped). In float the GPU path copies frames straight into its
+float buffers; the CPU maths runs in float too. Motion is always estimated on
+an 8-bit greyscale copy (precision doesn't matter there). Float and 8-bit
+renders of the same frame agree to 60 dB (0.05% of pixels differ by more than
+8 levels, at motion edges). `../prototype/validate_float.py`.
+
+Premiere can hand the input, the checked-out frames and the output in
+different formats (seen: checkouts as ARGB while input/output were BGRA); the
+effect asks for checkouts in the render format and converts anything that
+still differs to the output's byte order and bit depth.
 
 ## Measured
 

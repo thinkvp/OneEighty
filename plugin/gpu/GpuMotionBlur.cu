@@ -524,7 +524,7 @@ public:
             return Fail(err, "cuCtxPushCurrent failed");
         bool ok = UploadHost(A, 0, err) && UploadHost(B, 1, err) && EnsureHostOut(A.width, A.height, err);
         ok = ok && ProcessPairLocked(hostF_[0], hostF_[1], a, hostOut_, s, nullptr, stats, err);
-        ok = ok && DownloadHost(out, outRowBytes, A.argb, err);
+        ok = ok && DownloadHost(out, outRowBytes, A.argb, A.isFloat, err);
         CUcontext dummy;
         cuCtxPopCurrent(&dummy);
         return ok;
@@ -541,7 +541,7 @@ public:
         const bool hn = ok && next && UploadHost(*next, 2, err);
         ok = ok && ProcessLocked(hp ? &hostF_[0] : nullptr, hostF_[1], hn ? &hostF_[2] : nullptr, hostOut_, s,
                                  nullptr, stats, err);
-        ok = ok && DownloadHost(out, outRowBytes, cur.argb, err);
+        ok = ok && DownloadHost(out, outRowBytes, cur.argb, cur.isFloat, err);
         CUcontext dummy;
         cuCtxPopCurrent(&dummy);
         return ok;
@@ -574,7 +574,7 @@ public:
                 ok = Finish(nullptr, stats, err, true);
             }
         }
-        ok = ok && DownloadHost(out, outRowBytes, A.argb, err);
+        ok = ok && DownloadHost(out, outRowBytes, A.argb, A.isFloat, err);
         CUcontext dummy;
         cuCtxPopCurrent(&dummy);
         return ok;
@@ -600,7 +600,7 @@ public:
                 ok = Finish(nullptr, stats, err, true);
             }
         }
-        ok = ok && DownloadHost(out, outRowBytes, cur.argb, err);
+        ok = ok && DownloadHost(out, outRowBytes, cur.argb, cur.isFloat, err);
         CUcontext dummy;
         cuCtxPopCurrent(&dummy);
         return ok;
@@ -971,6 +971,15 @@ private:
     {
         if (!img.data || img.width <= 0 || img.height <= 0)
             return Fail(err, "empty host image");
+        if (img.isFloat) // already float BGRA: straight copy, nothing clamped or quantised
+        {
+            if (!EnsureFloatFrame(hostF_[slot], img.width, img.height))
+                return Fail(err, "out of GPU memory (upload)");
+            if (cudaMemcpy2D(hostF_[slot].ptr, hostF_[slot].pitch, img.data, img.rowBytes, (size_t)img.width * 16,
+                             img.height, cudaMemcpyHostToDevice) != cudaSuccess)
+                return Fail(err, "upload failed");
+            return true;
+        }
         if (!stage_[slot].Ensure(img.width, img.height, 4) || !EnsureFloatFrame(hostF_[slot], img.width, img.height))
             return Fail(err, "out of GPU memory (upload)");
         if (cudaMemcpy2D(stage_[slot].ptr, stage_[slot].pitch, img.data, img.rowBytes, (size_t)img.width * 4,
@@ -1002,8 +1011,15 @@ private:
         return true;
     }
 
-    bool DownloadHost(void* out, size_t outRowBytes, bool argb, std::string* err)
+    bool DownloadHost(void* out, size_t outRowBytes, bool argb, bool isFloat, std::string* err)
     {
+        if (isFloat)
+        {
+            if (cudaMemcpy2D(out, outRowBytes, hostOut_.ptr, hostOut_.pitch, (size_t)hostOut_.width * 16,
+                             hostOut_.height, cudaMemcpyDeviceToHost) != cudaSuccess)
+                return Fail(err, "download failed");
+            return true;
+        }
         const dim3 b(16, 16);
         KF4ToU8<<<Grid(hostOut_.width, hostOut_.height, b), b>>>((const char*)hostOut_.ptr, hostOut_.pitch,
                                                                   (unsigned char*)stageOut_.ptr, stageOut_.pitch,
