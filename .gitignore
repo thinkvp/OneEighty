@@ -22,3 +22,6 @@ prototype/compare.png
 
 # Logs
 *.log
+
+# Release packages (python release/make_release.py)
+/dist/
