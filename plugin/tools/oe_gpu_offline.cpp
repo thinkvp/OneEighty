@@ -5,6 +5,7 @@
 #include "../MotionBlur.h" // BlurHalfWidth
 #include "../gpu/GpuMotionBlur.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -74,6 +75,12 @@ int main(int argc, char** argv)
     const bool pair = cad[0] == '2';
     const bool hostPair = cad[0] == '3' || cad[0] == '4'; // hybrid: frames in host memory (CPU effect path)
     const bool disMotion = cad[0] == '4';                   // ...with CPU (OpenCV DIS) motion, GPU blur
+    char seqEnv[8] = {0};
+    size_t seqLen = 0;
+    getenv_s(&seqLen, seqEnv, sizeof(seqEnv), "OE_SEQFLOW");
+    const bool seqFlow = seqEnv[0] == '1';
+    double disMsTotal = 0;
+    int disCount = 0;
     char argbEnv[8] = {0};
     size_t argbLen = 0;
     getenv_s(&argbLen, argbEnv, sizeof(argbEnv), "OE_ARGB"); // OE_ARGB=1: feed the hybrid path ARGB bytes
@@ -116,8 +123,18 @@ int main(int argc, char** argv)
             {
                 const cv::Mat ma(H, W, CV_8UC4, hostSrc[A].data()), mb(H, W, CV_8UC4, hostSrc[A + 1].data());
                 const oe::ChannelOrder ord = argb ? oe::kARGB : oe::kBGRA;
-                const cv::Mat fa = oe::EstimateFlow(ma, mb, ord, 960);
-                const cv::Mat fb = -oe::EstimateFlow(mb, ma, ord, 960);
+                cv::Mat fa, fbBack;
+                const auto td0 = std::chrono::steady_clock::now();
+                if (seqFlow) // OE_SEQFLOW=1: the two estimates one after the other (old behaviour, for timing)
+                {
+                    fa = oe::EstimateFlow(ma, mb, ord, 960);
+                    fbBack = oe::EstimateFlow(mb, ma, ord, 960);
+                }
+                else
+                    oe::EstimateFlowPair(ma, mb, ord, 960, fa, fbBack);
+                disMsTotal += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
+                ++disCount;
+                const cv::Mat fb = -fbBack;
                 const oe::gpu::Engine::HostFlow hfa{fa.data, fa.step, fa.cols, fa.rows};
                 const oe::gpu::Engine::HostFlow hfb{fb.data, fb.step, fb.cols, fb.rows};
                 ok = eng->ProcessHostPairFlow(ha, hb, k * r - (double)A, hfa, hfb, buf.data(), (size_t)W * 4, s, &st,
@@ -158,6 +175,9 @@ int main(int argc, char** argv)
         std::fwrite(buf.data(), 1, frameBytes, fo);
     }
     std::fclose(fo);
+    if (disCount)
+        std::printf("DIS motion (%s): avg %.1f ms per frame pair\n", seqFlow ? "sequential" : "parallel pair",
+                    disMsTotal / disCount);
     if (timed)
         std::printf("wrote %d frames; GPU avg flow %.2f ms, blur %.2f ms, total %.2f ms per frame\n", k,
                     flowMs / timed, blurMs / timed, totMs / timed);

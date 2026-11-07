@@ -49,8 +49,9 @@ unevenly the background moves from frame to frame (a real 25p camera: 0.02 px):
 | OneEighty v0.5, Quality Normal (default), exact timing on | 38.6 dB | 0.14 px |
 | OneEighty v0.5, Quality Fast, exact timing on | 39.2 dB | 0.13 px |
 
-In Premiere (RTX 4070, UHD 59.94p on 25p) the default takes ~1.35 s per frame,
-~80% of it Premiere fetching the extra source frames; see `plugin/README.md`.
+In Premiere (RTX 4070, UHD 59.94p on 25p) the default takes ~1.35 s per frame on
+long-GOP camera files (mostly Premiere decoding the extra source frames) and
+~0.27 s on ProRes copies or proxies; see `plugin/README.md`.
 
 Scripts: `prototype/validate.py`, `validate_plugin.py`, `validate_gpu.py`,
 `validate_cadence.py`, `validate_timing.py`, `validate_edges.py`.

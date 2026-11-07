@@ -10,7 +10,7 @@
 // Keep in sync with AE_Effect_Version in OneEightyPiPL.r
 #define MAJOR_VERSION 0
 #define MINOR_VERSION 5
-#define BUG_VERSION   0
+#define BUG_VERSION   1
 #define STAGE_VERSION PF_Stage_DEVELOP
 #define BUILD_VERSION 1
 
@@ -73,8 +73,8 @@ enum
 };
 // Fast: motion and blur on the GPU (NVIDIA optical-flow hardware); quickest,
 //       but can mis-track fine repeating patterns.
-// Normal / High: motion estimated on the CPU (OpenCV DIS at 960 / 1920 px
-//       wide), blur on the GPU.
+// Normal / High: motion estimated on the CPU (OpenCV DIS at 960 px, FAST / MEDIUM
+//       preset), blur on the GPU.
 #define OE_QUALITY_CHOICES "Fast|Normal|High"
 
 namespace oe

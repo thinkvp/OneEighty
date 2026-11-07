@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import math
 import subprocess
 from collections import deque
@@ -85,7 +86,9 @@ class Flow:
 
     def __init__(self, max_width: int = 960):
         self.max_width = max_width
-        self.dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+        # OE_DIS_PRESET=FAST|ULTRAFAST to compare speed/quality (default MEDIUM)
+        preset = os.environ.get("OE_DIS_PRESET", "MEDIUM").upper()
+        self.dis = cv2.DISOpticalFlow_create(getattr(cv2, f"DISOPTICAL_FLOW_PRESET_{preset}"))
 
     def _small_gray(self, img):
         h, w = img.shape[:2]

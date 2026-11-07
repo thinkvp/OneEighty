@@ -22,6 +22,8 @@
 #include "MotionBlur.h"
 #include "gpu/GpuMotionBlur.h"
 
+#include <opencv2/video/tracking.hpp> // DIS presets
+
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -147,6 +149,17 @@ PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_
             if (pf->AddSupportedPixelFormat)
                 pf->AddSupportedPixelFormat(in_data->effect_ref, PrPixelFormat_BGRA_4444_8u);
             in_data->pica_basicP->ReleaseSuite(kPFPixelFormatSuite, kPFPixelFormatSuiteVersion1);
+        }
+        // Checked-out frames otherwise arrive as ARGB while input/output are
+        // BGRA; ask for the render format so no per-frame reorder is needed
+        // (Render still reorders defensively if they differ).
+        p = nullptr;
+        if (in_data->pica_basicP->AcquireSuite(kPFUtilitySuite, kPFUtilitySuiteVersion, &p) == kSPNoError && p)
+        {
+            const PF_UtilitySuite* u = static_cast<const PF_UtilitySuite*>(p);
+            if (u->EffectWantsCheckedOutFramesToMatchRenderPixelFormat)
+                u->EffectWantsCheckedOutFramesToMatchRenderPixelFormat(in_data->effect_ref);
+            in_data->pica_basicP->ReleaseSuite(kPFUtilitySuite, kPFUtilitySuiteVersion);
         }
     }
     Log("GlobalSetup appl_id=%c%c%c%c version=%d.%d", (char)(in_data->appl_id >> 24), (char)(in_data->appl_id >> 16),
@@ -385,12 +398,17 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
                 // motion from OpenCV DIS on the CPU (copes with repeating
                 // patterns), blur on the GPU (the expensive part at UHD)
                 path = "hybrid-dis";
-                const int fw = q == OE_QUALITY_HIGH ? 1920 : 960;
+                // Normal: DIS FAST preset (17 ms/pair at UHD, -0.4 dB on the synthetic test);
+                // High: DIS MEDIUM (41 ms/pair; the setting that kept a fine checked shirt clean)
+                const int fw = 960;
+                const int preset = q == OE_QUALITY_HIGH ? cv::DISOpticalFlow::PRESET_MEDIUM
+                                                        : cv::DISOpticalFlow::PRESET_FAST;
                 const auto tFlow0 = Clock::now();
                 if (pair)
                 {
-                    const cv::Mat fa = oe::EstimateFlow(m1, m2, order, fw);
-                    const cv::Mat fb = -oe::EstimateFlow(m2, m1, order, fw);
+                    cv::Mat fa, fbBack;
+                    oe::EstimateFlowPair(m1, m2, order, fw, fa, fbBack, preset); // A->B and B->A
+                    const cv::Mat fb = -fbBack;                          // B's forward motion
                     disMs = std::chrono::duration<double, std::milli>(Clock::now() - tFlow0).count();
                     const oe::gpu::Engine::HostFlow hfa{fa.data, fa.step, fa.cols, fa.rows};
                     const oe::gpu::Engine::HostFlow hfb{fb.data, fb.step, fb.cols, fb.rows};
@@ -402,12 +420,12 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
                     int nv = 0;
                     if (have2)
                     {
-                        v = oe::EstimateFlow(cur, m2, order, fw);
+                        v = oe::EstimateFlow(cur, m2, order, fw, preset);
                         ++nv;
                     }
                     if (have1)
                     {
-                        const cv::Mat b = oe::EstimateFlow(cur, m1, order, fw);
+                        const cv::Mat b = oe::EstimateFlow(cur, m1, order, fw, preset);
                         v = v.empty() ? cv::Mat(-b) : cv::Mat(v - b);
                         ++nv;
                     }
@@ -433,7 +451,8 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         {
             oe::BlurSettings bs;
             bs.halfWidth = hw;
-            bs.flowWidth = q == OE_QUALITY_FAST ? 480 : q == OE_QUALITY_HIGH ? 1920 : 960;
+            bs.flowWidth = q == OE_QUALITY_FAST ? 480 : 960;
+            bs.disPreset = q == OE_QUALITY_HIGH ? cv::DISOpticalFlow::PRESET_MEDIUM : cv::DISOpticalFlow::PRESET_FAST;
             bs.showVectors = vectors;
             if (pair && !vectors && phase > 1e-3)
             {

@@ -63,15 +63,32 @@ void DrawVectors(const cv::Mat& cur, const cv::Mat& vFull, const ChannelOrder& o
 
 } // namespace
 
-cv::Mat EstimateFlow(const cv::Mat& from, const cv::Mat& to, const ChannelOrder& order, int flowWidth)
+cv::Mat EstimateFlow(const cv::Mat& from, const cv::Mat& to, const ChannelOrder& order, int flowWidth, int disPreset)
 {
     const double scale = std::min(1.0, (double)flowWidth / from.cols);
-    cv::Ptr<cv::DISOpticalFlow> dis = cv::DISOpticalFlow::create(cv::DISOpticalFlow::PRESET_MEDIUM);
+    cv::Ptr<cv::DISOpticalFlow> dis = cv::DISOpticalFlow::create(disPreset);
     cv::Mat f;
     dis->calc(SmallGray(from, scale, order), SmallGray(to, scale, order), f);
     if (scale < 1.0)
         f *= 1.0 / scale;
     return f;
+}
+
+void EstimateFlowPair(const cv::Mat& a, const cv::Mat& b, const ChannelOrder& order, int flowWidth, cv::Mat& fab,
+                      cv::Mat& fba, int disPreset)
+{
+    // Sequential on purpose: DIS already uses all cores internally (running the
+    // two directions concurrently measured no faster at UHD: 64.2 vs 64.3 ms).
+    const double scale = std::min(1.0, (double)flowWidth / a.cols);
+    const cv::Mat ga = SmallGray(a, scale, order), gb = SmallGray(b, scale, order);
+    cv::Ptr<cv::DISOpticalFlow> dis = cv::DISOpticalFlow::create(disPreset);
+    dis->calc(ga, gb, fab);
+    dis->calc(gb, ga, fba);
+    if (scale < 1.0)
+    {
+        fab *= 1.0 / scale;
+        fba *= 1.0 / scale;
+    }
 }
 
 void VectorColour(float vx, float vy, float norm, float rgb[3])
@@ -118,7 +135,7 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
     // ---- motion estimation (reduced resolution)
     const double scale = std::min(1.0, (double)s.flowWidth / W);
     cv::Mat gCur = SmallGray(cur, scale, order);
-    cv::Ptr<cv::DISOpticalFlow> dis = cv::DISOpticalFlow::create(cv::DISOpticalFlow::PRESET_MEDIUM);
+    cv::Ptr<cv::DISOpticalFlow> dis = cv::DISOpticalFlow::create(s.disPreset);
 
     cv::Mat v; // velocity per source frame, small res, CV_32FC2
     int nFlows = 0;
