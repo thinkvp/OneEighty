@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <mutex>
+#include <vector>
 
 namespace oe::gpu
 {
@@ -275,7 +276,7 @@ public:
     ~EngineImpl() override
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (cuCtxPushCurrent(ctx_) == CUDA_SUCCESS)
+        if (ctx_ && cuCtxPushCurrent(ctx_) == CUDA_SUCCESS)
         {
             DestroyOF();
             flow_.Release();
@@ -293,6 +294,11 @@ public:
 
     bool Init(void* cuContext, std::string* err)
     {
+        // nvcuda.dll is delay-loaded by the plugin so it still loads on machines
+        // without an NVIDIA driver: check it exists before the first cu* call.
+        if (!GetModuleHandleA("nvcuda.dll") && !LoadLibraryA("nvcuda.dll"))
+            return Fail(err, "nvcuda.dll not found (no NVIDIA driver)");
+        ofs_.reserve(kMaxOFStates + 1);
         if (cuInit(0) != CUDA_SUCCESS)
             return Fail(err, "cuInit failed (no NVIDIA driver?)");
         if (cuContext)
@@ -404,32 +410,66 @@ private:
         return false;
     }
 
+    // One NVOF session per analysis size. Premiere renders at several sizes
+    // (full / 1/2 / 1/4 playback resolution, thumbnails), so keep a few alive
+    // instead of re-initialising the hardware on every size change.
+    struct OFState
+    {
+        NvOFHandle h = nullptr;
+        int w = 0, ht = 0, grid = 0, perf = 0, outW = 0, outH = 0;
+        cudaStream_t stream = nullptr;
+        NvOFGPUBufferHandle in[3] = {}, out[2] = {};
+        CUdeviceptr inPtr[3] = {}, outPtr[2] = {};
+        uint32_t inPitch[3] = {}, outPitch[2] = {};
+        unsigned long long lastUse = 0;
+    };
+    static constexpr size_t kMaxOFStates = 4;
+
+    void DestroyState(OFState& a)
+    {
+        for (auto& b : a.in)
+            if (b)
+                of_.nvOFDestroyGPUBufferCuda(b), b = nullptr;
+        for (auto& b : a.out)
+            if (b)
+                of_.nvOFDestroyGPUBufferCuda(b), b = nullptr;
+        if (a.h)
+            of_.nvOFDestroy(a.h), a.h = nullptr;
+    }
+
     void DestroyOF()
     {
-        for (auto& b : in_)
-            if (b)
-                of_.nvOFDestroyGPUBufferCuda(b), b = nullptr;
-        for (auto& b : outBuf_)
-            if (b)
-                of_.nvOFDestroyGPUBufferCuda(b), b = nullptr;
-        if (hOf_)
-            of_.nvOFDestroy(hOf_), hOf_ = nullptr;
-        ofW_ = ofH_ = 0;
+        for (auto& a : ofs_)
+            DestroyState(a);
+        ofs_.clear();
+        active_ = nullptr;
     }
 
     bool EnsureOF(int w, int h, int grid, int perf, cudaStream_t stream, std::string* err)
     {
-        if (hOf_ && w == ofW_ && h == ofH_ && grid == ofGrid_ && perf == ofPerf_)
-        {
-            if (stream != ofStream_)
+        ++useClock_;
+        for (auto& a : ofs_)
+            if (a.w == w && a.ht == h && a.grid == grid && a.perf == perf)
             {
-                of_.nvOFSetIOCudaStreams(hOf_, (CUstream)stream, (CUstream)stream);
-                ofStream_ = stream;
+                if (a.stream != stream)
+                {
+                    of_.nvOFSetIOCudaStreams(a.h, (CUstream)stream, (CUstream)stream);
+                    a.stream = stream;
+                }
+                a.lastUse = useClock_;
+                active_ = &a;
+                return true;
             }
-            return true;
+        if (ofs_.size() >= kMaxOFStates) // evict least recently used
+        {
+            auto lru = std::min_element(ofs_.begin(), ofs_.end(),
+                                        [](const OFState& x, const OFState& y) { return x.lastUse < y.lastUse; });
+            DestroyState(*lru);
+            ofs_.erase(lru);
         }
-        DestroyOF();
-        if (of_.nvCreateOpticalFlowCuda(ctx_, &hOf_) != NV_OF_SUCCESS)
+        active_ = nullptr;
+        OFState a;
+        if (of_.nvCreateOpticalFlowCuda(ctx_, &a.h) != NV_OF_SUCCESS)
             return Fail(err, "nvCreateOpticalFlowCuda failed");
         NV_OF_INIT_PARAMS ip = {};
         ip.width = w;
@@ -438,57 +478,59 @@ private:
         ip.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
         ip.mode = NV_OF_MODE_OPTICALFLOW;
         ip.perfLevel = (NV_OF_PERF_LEVEL)perf;
-        if (of_.nvOFInit(hOf_, &ip) != NV_OF_SUCCESS)
+        if (of_.nvOFInit(a.h, &ip) != NV_OF_SUCCESS)
         {
-            LastError(err, "nvOFInit failed");
-            DestroyOF();
+            LastError(a.h, err, "nvOFInit failed");
+            DestroyState(a);
             return false;
         }
+        a.w = w;
+        a.ht = h;
+        a.grid = grid;
+        a.perf = perf;
+        a.outW = (w + grid - 1) / grid;
+        a.outH = (h + grid - 1) / grid;
         NV_OF_BUFFER_DESCRIPTOR in = {(uint32_t)w, (uint32_t)h, NV_OF_BUFFER_USAGE_INPUT, NV_OF_BUFFER_FORMAT_GRAYSCALE8};
-        outW_ = (w + grid - 1) / grid;
-        outH_ = (h + grid - 1) / grid;
-        NV_OF_BUFFER_DESCRIPTOR od = {(uint32_t)outW_, (uint32_t)outH_, NV_OF_BUFFER_USAGE_OUTPUT,
+        NV_OF_BUFFER_DESCRIPTOR od = {(uint32_t)a.outW, (uint32_t)a.outH, NV_OF_BUFFER_USAGE_OUTPUT,
                                       NV_OF_BUFFER_FORMAT_SHORT2};
         for (int i = 0; i < 3; ++i)
         {
             NV_OF_CUDA_BUFFER_STRIDE_INFO si = {};
-            if (of_.nvOFCreateGPUBufferCuda(hOf_, &in, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &in_[i]) != NV_OF_SUCCESS ||
-                of_.nvOFGPUBufferGetStrideInfo(in_[i], &si) != NV_OF_SUCCESS)
+            if (of_.nvOFCreateGPUBufferCuda(a.h, &in, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &a.in[i]) != NV_OF_SUCCESS ||
+                of_.nvOFGPUBufferGetStrideInfo(a.in[i], &si) != NV_OF_SUCCESS)
             {
-                DestroyOF();
+                DestroyState(a);
                 return Fail(err, "NVOF input buffer creation failed");
             }
-            inPtr_[i] = of_.nvOFGPUBufferGetCUdeviceptr(in_[i]);
-            inPitch_[i] = si.strideInfo[0].strideXInBytes;
+            a.inPtr[i] = of_.nvOFGPUBufferGetCUdeviceptr(a.in[i]);
+            a.inPitch[i] = si.strideInfo[0].strideXInBytes;
         }
         for (int i = 0; i < 2; ++i)
         {
             NV_OF_CUDA_BUFFER_STRIDE_INFO si = {};
-            if (of_.nvOFCreateGPUBufferCuda(hOf_, &od, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &outBuf_[i]) !=
-                    NV_OF_SUCCESS ||
-                of_.nvOFGPUBufferGetStrideInfo(outBuf_[i], &si) != NV_OF_SUCCESS)
+            if (of_.nvOFCreateGPUBufferCuda(a.h, &od, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &a.out[i]) != NV_OF_SUCCESS ||
+                of_.nvOFGPUBufferGetStrideInfo(a.out[i], &si) != NV_OF_SUCCESS)
             {
-                DestroyOF();
+                DestroyState(a);
                 return Fail(err, "NVOF output buffer creation failed");
             }
-            outPtr_[i] = of_.nvOFGPUBufferGetCUdeviceptr(outBuf_[i]);
-            outPitch_[i] = si.strideInfo[0].strideXInBytes;
+            a.outPtr[i] = of_.nvOFGPUBufferGetCUdeviceptr(a.out[i]);
+            a.outPitch[i] = si.strideInfo[0].strideXInBytes;
         }
-        of_.nvOFSetIOCudaStreams(hOf_, (CUstream)stream, (CUstream)stream);
-        ofStream_ = stream;
-        ofW_ = w;
-        ofH_ = h;
-        ofGrid_ = grid;
-        ofPerf_ = perf;
+        of_.nvOFSetIOCudaStreams(a.h, (CUstream)stream, (CUstream)stream);
+        a.stream = stream;
+        a.lastUse = useClock_;
+        ofs_.push_back(a);
+        active_ = &ofs_.back();
         return true;
     }
 
-    void LastError(std::string* err, const char* prefix)
+    void LastError(NvOFHandle h, std::string* err, const char* prefix)
     {
         char buf[512] = {0};
         uint32_t n = sizeof(buf);
-        if (hOf_ && of_.nvOFGetLastError)
-            of_.nvOFGetLastError(hOf_, buf, &n);
+        if (h && of_.nvOFGetLastError)
+            of_.nvOFGetLastError(h, buf, &n);
         if (err)
             *err = std::string(prefix) + ": " + buf;
     }
@@ -498,20 +540,20 @@ private:
     {
         const dim3 b(16, 16);
         KGray<HALF_IN><<<Grid(w, h, b), b, 0, st>>>((const char*)f.ptr, f.pitch, f.width, f.height,
-                                                    (unsigned char*)inPtr_[i], inPitch_[i], w, h);
+                                                    (unsigned char*)active_->inPtr[i], active_->inPitch[i], w, h);
     }
 
     bool Execute(int refIdx, int outIdx, std::string* err)
     {
         NV_OF_EXECUTE_INPUT_PARAMS ip = {};
-        ip.inputFrame = in_[1];
-        ip.referenceFrame = in_[refIdx];
+        ip.inputFrame = active_->in[1];
+        ip.referenceFrame = active_->in[refIdx];
         ip.disableTemporalHints = NV_OF_TRUE; // frame pairs are independent
         NV_OF_EXECUTE_OUTPUT_PARAMS op = {};
-        op.outputBuffer = outBuf_[outIdx];
-        if (of_.nvOFExecute(hOf_, &ip, &op) != NV_OF_SUCCESS)
+        op.outputBuffer = active_->out[outIdx];
+        if (of_.nvOFExecute(active_->h, &ip, &op) != NV_OF_SUCCESS)
         {
-            LastError(err, "nvOFExecute failed");
+            LastError(active_->h, err, "nvOFExecute failed");
             return false;
         }
         return true;
@@ -569,11 +611,12 @@ private:
             return false;
         if (prev && !Execute(0, 1, err))
             return false;
-        if (!flow_.Ensure(outW_, outH_, sizeof(float2)))
+        const OFState& a = *active_;
+        if (!flow_.Ensure(a.outW, a.outH, sizeof(float2)))
             return Fail(err, "out of GPU memory (flow)");
-        KCombineFlow<<<Grid(outW_, outH_, b), b, 0, st>>>(
-            next ? (const short2*)outPtr_[0] : nullptr, outPitch_[0], prev ? (const short2*)outPtr_[1] : nullptr,
-            outPitch_[1], (float2*)flow_.ptr, flow_.pitch, outW_, outH_, (float)W / w);
+        KCombineFlow<<<Grid(a.outW, a.outH, b), b, 0, st>>>(
+            next ? (const short2*)a.outPtr[0] : nullptr, a.outPitch[0], prev ? (const short2*)a.outPtr[1] : nullptr,
+            a.outPitch[1], (float2*)flow_.ptr, flow_.pitch, a.outW, a.outH, (float)W / w);
         cudaEventRecord(ev_[1], st);
 
         // 4: mip chain
@@ -611,7 +654,7 @@ private:
         // With hw == 0 every pixel takes the copy path, so the flow buffer is never read.
         const float2* fl = (const float2*)flow_.ptr;
         const size_t fp = flow_.pitch;
-        const int fw = std::max(1, outW_), fh = std::max(1, outH_);
+        const int fw = std::max(1, flow_.w), fh = std::max(1, flow_.h);
         const int maxS = std::max(2, s.maxSamples);
         const float mipT = (float)std::max(1, s.mipThreshold);
         char* o = (char*)out.ptr;
@@ -656,12 +699,9 @@ private:
     CUcontext ctx_ = nullptr;
     HMODULE lib_ = nullptr;
     NV_OF_CUDA_API_FUNCTION_LIST of_ = {};
-    NvOFHandle hOf_ = nullptr;
-    int ofW_ = 0, ofH_ = 0, ofGrid_ = 0, ofPerf_ = 0, outW_ = 0, outH_ = 0;
-    cudaStream_t ofStream_ = nullptr;
-    NvOFGPUBufferHandle in_[3] = {}, outBuf_[2] = {};
-    CUdeviceptr inPtr_[3] = {}, outPtr_[2] = {};
-    uint32_t inPitch_[3] = {}, outPitch_[2] = {};
+    std::vector<OFState> ofs_ = std::vector<OFState>(); // capacity reserved in Init (active_ points into it)
+    OFState* active_ = nullptr;
+    unsigned long long useClock_ = 0;
     DevBuf flow_, mip_[3];
     cudaEvent_t ev_[3] = {};
 };
