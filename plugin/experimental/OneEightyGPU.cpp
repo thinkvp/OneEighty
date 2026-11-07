@@ -1,4 +1,15 @@
 /*
+    NOT BUILT (kept for reference, removed from the plugin in v0.5).
+
+    Finding: Premiere's GPU filter API floors GetFrameDependencies requests to
+    whole timeline frames, so on a 25p timeline a GPU filter can never see the
+    in-between 50p/59.94p source frames this effect needs (logged in v0.4.1:
+    requests at -0.23/+0.18 timeline frames both returned the current frame;
+    -0.42 returned the previous timeline frame). The shipped effect fetches
+    frames through the AE API instead and processes them on the GPU itself.
+    To build it again it would need the parameter list it was written for
+    (v0.4, OE_MODE/OE_RENDER) and the PRINC compile step in build.bat.
+
     OneEighty Motion Blur: Premiere Pro GPU filter.
 
     Paired with the CPU effect (same match name, same plugin file). Premiere
@@ -27,7 +38,9 @@
 #include "OneEightyParams.h"
 #include "gpu/GpuMotionBlur.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -84,8 +97,12 @@ public:
     {
         PrGPUFilterBase::Initialize(ioInstanceData);
 
-        const int mode = PopupValue(GetParam(OE_MODE, 0));
         mLog = ParamNumber(GetParam(OE_LOG, 0)) != 0.0;
+
+        // A new instance is created whenever parameters change, so this
+        // decision follows the Render popup.
+        if (PopupValue(GetParam(OE_RENDER, 0)) != OE_RENDER_PREMIERE_GPU)
+            return suiteError_Fail; // Auto / CPU only render through the CPU effect (see OneEightyParams.h)
 
         if (mDeviceInfo.outDeviceFramework != PrGPUDeviceFramework_CUDA)
         {
@@ -95,8 +112,6 @@ public:
                         mDeviceIndex, (int)mDeviceInfo.outDeviceFramework);
             return suiteError_Fail;
         }
-        if (mode == OE_MODE_BLEND_CENTRED) // test mode only exists on the CPU path
-            return suiteError_Fail;
 
         DeviceEngines& de = Engines();
         std::lock_guard<std::mutex> lock(de.mu);
@@ -126,30 +141,63 @@ public:
         return suiteError_NoError;
     }
 
+    // Where this output frame sits in the source. With the clip's media in-point
+    // known, `centre` is the exact fractional source frame of the output time;
+    // we interpolate between frame A = floor(centre) and B = A+1 (a = centre - A).
+    // Without it (or with "Exact frame timing" off) we use the frame Premiere
+    // picked plus neighbours one source interval away.
+    struct Plan
+    {
+        bool exact = false;
+        long long frameA = 0;
+        double centre = 0, a = 0;
+        PrTime seqTime[2] = {}; // dependency times: exact = A, B; fallback = prev, next
+    };
+
+    Plan MakePlan(const PrGPUFilterRenderParams* rp)
+    {
+        Plan p;
+        const double fps = SourceFps();
+        const double tpf = oe::kPrTicksPerSecond / fps; // media ticks per source frame
+        const bool wantExact = ParamNumber(GetParam(OE_EXACT_TIMING, rp->inClipTime)) != 0.0;
+        if (wantExact && mHaveInPoint && mSpeed > 0 && fps > 0)
+        {
+            const PrTime trackStart = rp->inSequenceTime - rp->inClipTime;
+            const double mediaTime = (double)mInPoint + (double)rp->inClipTime * mSpeed;
+            p.centre = mediaTime / tpf;
+            p.frameA = (long long)std::floor(p.centre + 1e-6);
+            p.a = std::clamp(p.centre - (double)p.frameA, 0.0, 1.0);
+            p.exact = true;
+            for (int k = 0; k < 2; ++k)
+            {
+                // a quarter frame past the frame's own timestamp: picks that
+                // frame whether Premiere rounds to nearest or floors
+                const double media = ((double)(p.frameA + k) + 0.25) * tpf;
+                p.seqTime[k] = trackStart + (PrTime)std::llround((media - (double)mInPoint) / mSpeed);
+            }
+        }
+        else
+        {
+            const PrTime dt = SourceFrameTicks(rp);
+            p.seqTime[0] = rp->inSequenceTime - dt;
+            p.seqTime[1] = rp->inSequenceTime + dt;
+        }
+        return p;
+    }
+
     prSuiteError GetFrameDependencies(const PrGPUFilterRenderParams* inRenderParams, csSDK_int32* ioQueryIndex,
                                       PrGPUFilterFrameDependency* outFrameRequirements) override
     {
-        const int mode = PopupValue(GetParam(OE_MODE, inRenderParams->inClipTime));
-        if (mode == OE_MODE_OFF)
-            return suiteError_NotImplemented; // only the current frame
-
-        const PrTime dt = SourceFrameTicks(inRenderParams);
-        const bool wantPrev = mode != OE_MODE_SHOW_NEXT;
-        const bool wantNext = mode != OE_MODE_SHOW_PREVIOUS;
-
-        // Dependencies are returned one per call; incrementing ioQueryIndex asks
-        // Premiere to call again for the next one.
-        int slot = *ioQueryIndex; // 0 = first dependency
-        if (!wantPrev)
-            ++slot; // skip "prev"
-        if (slot > 1 || (slot == 1 && !wantNext))
+        // One dependency per call; incrementing ioQueryIndex asks Premiere to
+        // call again for the next one. Two either way (A, B or prev, next).
+        const int q = *ioQueryIndex;
+        if (q >= 2)
             return suiteError_NotImplemented;
-
+        const Plan plan = MakePlan(inRenderParams);
         outFrameRequirements->outDependencyType = PrGPUDependency_InputFrame;
         outFrameRequirements->outTrackID = 0;
-        outFrameRequirements->outSequenceTime = inRenderParams->inSequenceTime + (slot == 0 ? -dt : dt);
-        const bool more = slot == 0 && wantNext && wantPrev;
-        if (more)
+        outFrameRequirements->outSequenceTime = plan.seqTime[q];
+        if (q == 0)
             *ioQueryIndex += 1;
         return suiteError_NoError;
     }
@@ -160,23 +208,15 @@ public:
         if (inFrameCount < 1 || !inFrames[0])
             return suiteError_Fail;
         const PrTime t = inRenderParams->inClipTime;
-        const int mode = PopupValue(GetParam(OE_MODE, t));
-        const bool wantPrev = mode != OE_MODE_SHOW_NEXT && mode != OE_MODE_OFF;
-        const bool wantNext = mode != OE_MODE_SHOW_PREVIOUS && mode != OE_MODE_OFF;
+        const int view = PopupValue(GetParam(OE_VIEW, t));
+        const Plan plan = MakePlan(inRenderParams);
 
-        // Frame 0 = current; then dependencies in the order we returned them.
-        size_t idx = 1;
-        PPixHand prevH = nullptr, nextH = nullptr;
-        if (wantPrev && idx < inFrameCount)
-            prevH = inFrames[idx++];
-        if (wantNext && idx < inFrameCount)
-            nextH = inFrames[idx++];
-
-        oe::gpu::Frame cur, prev, next, out;
-        if (!Describe(inFrames[0], &cur))
+        // Frame 0 = Premiere's current frame; then our two dependencies in order.
+        oe::gpu::Frame f0, d1, d2, out;
+        if (!Describe(inFrames[0], &f0))
             return suiteError_Fail;
-        const bool havePrev = prevH && Describe(prevH, &prev);
-        const bool haveNext = nextH && Describe(nextH, &next);
+        const bool have1 = inFrameCount > 1 && inFrames[1] && Describe(inFrames[1], &d1);
+        const bool have2 = inFrameCount > 2 && inFrames[2] && Describe(inFrames[2], &d2);
 
         PrPixelFormat pf = PrPixelFormat_Invalid;
         mPPixSuite->GetPixelFormat(inFrames[0], &pf);
@@ -186,7 +226,7 @@ public:
         mPPix2Suite->GetFieldOrder(inFrames[0], &field);
         csSDK_uint32 dev = mDeviceIndex;
         mGPUDeviceSuite->GetGPUPPixDeviceIndex(inFrames[0], &dev);
-        if (mGPUDeviceSuite->CreateGPUPPix(dev, pf, cur.width, cur.height, parN, parD, field, outFrame) !=
+        if (mGPUDeviceSuite->CreateGPUPPix(dev, pf, f0.width, f0.height, parN, parD, field, outFrame) !=
                 suiteError_NoError ||
             !*outFrame || !Describe(*outFrame, &out))
             return suiteError_Fail;
@@ -200,44 +240,57 @@ public:
         // Analysis resolution relative to the frame (validated: half-res, grid 2 scored best)
         if (q == OE_QUALITY_FAST)
         {
-            s.flowWidth = std::max(256, cur.width / 4);
+            s.flowWidth = std::max(256, f0.width / 4);
             s.flowGrid = 4;
         }
         else if (q == OE_QUALITY_HIGH)
         {
-            s.flowWidth = std::max(512, cur.width / 2);
+            s.flowWidth = std::max(512, f0.width / 2);
             s.flowGrid = 1;
         }
         else
         {
-            s.flowWidth = std::max(512, cur.width / 2);
+            s.flowWidth = std::max(512, f0.width / 2);
             s.flowGrid = 2;
         }
+        s.showVectors = view == OE_VIEW_VECTORS;
 
-        const oe::gpu::Frame* pPrev = havePrev ? &prev : nullptr;
-        const oe::gpu::Frame* pNext = haveNext ? &next : nullptr;
-        const oe::gpu::Frame* src = &cur;
-        if (mode == OE_MODE_SHOW_PREVIOUS || mode == OE_MODE_SHOW_NEXT || mode == OE_MODE_OFF)
+        // Diagnostics for the first renders of each instance: which of our
+        // requested frames is identical to Premiere's own current frame.
+        // Logged in both timing modes: requested times (relative to this render,
+        // in timeline frames) and pairwise differences (0.00 = same picture).
+        char match[192] = "";
+        if (mLog && mDiagRenders < 20 && have1 && have2)
         {
-            // plain copy of the requested frame (halfWidth 0 = copy path)
-            if (mode == OE_MODE_SHOW_PREVIOUS && pPrev)
-                src = pPrev;
-            if (mode == OE_MODE_SHOW_NEXT && pNext)
-                src = pNext;
-            s.halfWidth = 0;
-            pPrev = pNext = nullptr;
+            ++mDiagRenders;
+            void* st0 = mDeviceInfo.outCommandQueueHandle;
+            const double tlFrame = (double)std::max<PrTime>(1, inRenderParams->inRenderTicksPerFrame);
+            snprintf(match, sizeof(match),
+                     " | req d1=%+.3f d2=%+.3f tl-frames | diff f0-d1=%.2f f0-d2=%.2f d1-d2=%.2f",
+                     (double)(plan.seqTime[0] - inRenderParams->inSequenceTime) / tlFrame,
+                     (double)(plan.seqTime[1] - inRenderParams->inSequenceTime) / tlFrame,
+                     mEngine->SampledDiff(f0, d1, st0), mEngine->SampledDiff(f0, d2, st0),
+                     mEngine->SampledDiff(d1, d2, st0));
         }
 
         oe::gpu::Stats st;
         std::string err;
-        const bool ok = mEngine->Process(pPrev, *src, pNext, out, s, mDeviceInfo.outCommandQueueHandle, &st, &err);
+        bool ok;
+        const bool pair = plan.exact && have1 && have2;
+        if (pair)
+            ok = mEngine->ProcessPair(d1, d2, plan.a, out, s, mDeviceInfo.outCommandQueueHandle, &st, &err);
+        else
+            ok = mEngine->Process(have1 ? &d1 : nullptr, f0, have2 ? &d2 : nullptr, out, s,
+                                  mDeviceInfo.outCommandQueueHandle, &st, &err);
         if (mLog)
-            oe::Log("[gpu] render seq=%.4fs clip=%.4fs mode=%d %dx%d %s | srcFps=%.3f (%s) speed=%.2f timeline=%.3f "
-                    "frames=%zu prev:%s next:%s | halfWidth=%.3f flow=%d/g%d | flow=%.2fms blur=%.2fms total=%.2fms%s%s",
-                    inRenderParams->inSequenceTime / oe::kPrTicksPerSecond, t / oe::kPrTicksPerSecond, mode, cur.width,
-                    cur.height, cur.half ? "16f" : "32f", SourceFps(), mFpsSource.c_str(), mSpeed, timelineFps,
-                    (size_t)inFrameCount, havePrev ? "ok" : "-", haveNext ? "ok" : "-", s.halfWidth, s.flowWidth,
-                    s.flowGrid, st.flowMs, st.blurMs, st.totalMs, ok ? "" : " ERROR: ", ok ? "" : err.c_str());
+            oe::Log("[gpu] render seq=%.4fs clip=%.4fs view=%d %dx%d %s | srcFps=%.3f (%s) speed=%.2f timeline=%.3f "
+                    "frames=%zu | timing=%s src=%.3f A=%lld a=%.3f | halfWidth=%.3f flow=%d/g%d | flow=%.2fms "
+                    "blur=%.2fms total=%.2fms%s%s%s",
+                    inRenderParams->inSequenceTime / oe::kPrTicksPerSecond, t / oe::kPrTicksPerSecond, view, f0.width,
+                    f0.height, f0.half ? "16f" : "32f", SourceFps(), mFpsSource.c_str(), mSpeed, timelineFps,
+                    (size_t)inFrameCount, pair ? "exact-pair" : "nearest", plan.centre, plan.frameA, plan.a,
+                    s.halfWidth, s.flowWidth, s.flowGrid, st.flowMs, st.blurMs, st.totalMs, match, ok ? "" : " ERROR: ",
+                    ok ? "" : err.c_str());
         return ok ? suiteError_NoError : suiteError_Fail;
     }
 
@@ -321,12 +374,23 @@ private:
                     mVideoSegmentSuite->GetNodeInfo(in, type, &hash, &flags);
                     if (strcmp(type, kVideoSegment_NodeType_Media) == 0)
                     {
+                        // Some nodes report INT64_MAX ("no rate"): accept 1..1000 fps only.
                         PrTime ticks = 0;
-                        if (NodeProperty(in, kVideoSegmentProperty_Media_StreamFrameRate, ticks) && ticks > 0)
+                        if (NodeProperty(in, kVideoSegmentProperty_Media_StreamFrameRate, ticks) &&
+                            ticks >= (PrTime)(oe::kPrTicksPerSecond / 1000.0) && ticks <= (PrTime)oe::kPrTicksPerSecond)
                             mMediaTicks = ticks;
                         double ms = 0;
                         if (mSpeed == 1.0 && NodeProperty(in, kVideoSegmentProperty_Media_ClipSpeed, ms) && ms != 0)
                             mSpeed = std::fabs(ms);
+                        long long inPt = 0;
+                        if (NodeProperty(in, kVideoSegmentProperty_Media_InPointMediaTimeAsTicks, inPt))
+                        {
+                            mInPoint = (PrTime)inPt;
+                            mHaveInPoint = true;
+                        }
+                        bool backwards = false;
+                        if (NodeProperty(in, kVideoSegmentProperty_Media_ClipBackwards, backwards) && backwards)
+                            mHaveInPoint = false; // reversed clips: keep the simple nearest-frame path
                         mVideoSegmentSuite->ReleaseVideoNodeID(in);
                     }
                     else if (nextCount < 16)
@@ -346,10 +410,13 @@ private:
         mVideoSegmentSuite->ReleaseVideoNodeID(clip);
         mFpsSource = mMediaTicks ? "media stream rate" : "media node not found";
         if (mLog)
-            oe::Log("[gpu] instance node=%d clip='%s' file='%s' streamTicksPerFrame=%lld (%.3f fps) speed=%.3f",
+            oe::Log("[gpu] instance node=%d clip='%s' file='%s' streamTicksPerFrame=%lld (%.3f fps) speed=%.3f "
+                    "inPoint=%s%lld ticks (%.4f source frames)",
                     mNodeID, NodeString(mNodeID, kVideoSegmentProperty_Effect_ClipName).c_str(),
                     NodeString(mNodeID, kVideoSegmentProperty_Effect_FileName).c_str(), (long long)mMediaTicks,
-                    mMediaTicks ? oe::kPrTicksPerSecond / (double)mMediaTicks : 0.0, mSpeed);
+                    mMediaTicks ? oe::kPrTicksPerSecond / (double)mMediaTicks : 0.0, mSpeed,
+                    mHaveInPoint ? "" : "(none) ", (long long)mInPoint,
+                    mMediaTicks ? (double)mInPoint / (double)mMediaTicks : 0.0);
     }
 
     double SourceFps()
@@ -375,6 +442,9 @@ private:
 
     std::shared_ptr<oe::gpu::Engine> mEngine;
     PrTime mMediaTicks = 0;
+    PrTime mInPoint = 0;
+    bool mHaveInPoint = false;
+    int mDiagRenders = 0;
     double mSpeed = 1.0;
     std::string mFpsSource = "not detected";
     bool mLog = false;

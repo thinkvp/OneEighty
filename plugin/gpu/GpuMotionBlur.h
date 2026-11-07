@@ -26,6 +26,8 @@ struct Settings
     int maxSamples = 64;
     int mipThreshold = 48;   // samples before switching to the next mip level (0 = off)
     int maxMipLevel = 3;
+    double centerOffset = 0; // wanted output time relative to cur, source-frame intervals (-0.5..0.5)
+    bool showVectors = false; // draw the motion field instead of blurring
 };
 
 struct Stats
@@ -47,6 +49,51 @@ public:
     // (calls are serialised per engine).
     virtual bool Process(const Frame* prev, const Frame& cur, const Frame* next, const Frame& out,
                          const Settings& s, void* stream, Stats* stats, std::string* err) = 0;
+
+    // Two-frame interpolation: the output time lies `a` (0..1) of the way from
+    // source frame A to the next source frame B. Motion is estimated both ways,
+    // A is blurred at +a and B at -(1-a), blended by closeness. Validated as
+    // better than the single-frame shift on both 50p and 59.94p.
+    virtual bool ProcessPair(const Frame& A, const Frame& B, double a, const Frame& out, const Settings& s,
+                             void* stream, Stats* stats, std::string* err) = 0;
+
+    // Mean |x - y| per channel (0..255 scale) over a 64x64 sample grid; 0 = same frame.
+    virtual double SampledDiff(const Frame& x, const Frame& y, void* stream) = 0;
+
+    // Hybrid path: frames that live in host memory (8-bit BGRA, e.g. checked out
+    // by the CPU effect) are uploaded, processed on the GPU and the result
+    // written back to `out`. Device buffers are kept between calls.
+    struct HostImage
+    {
+        const void* data = nullptr;
+        size_t rowBytes = 0;
+        int width = 0, height = 0;
+        bool argb = false; // byte order A,R,G,B (After Effects / Premiere default for AE effects) instead of B,G,R,A
+    };
+    // Two-frame interpolation (see ProcessPair).
+    virtual bool ProcessHostPair(const HostImage& A, const HostImage& B, double a, void* out, size_t outRowBytes,
+                                 const Settings& s, Stats* stats, std::string* err) = 0;
+    // Single frame with optional neighbours (see Process).
+    virtual bool ProcessHost(const HostImage* prev, const HostImage& cur, const HostImage* next, void* out,
+                             size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) = 0;
+
+    // Same, but with motion supplied by the caller (e.g. OpenCV DIS on the CPU,
+    // which copes better with fine repeating patterns than the NVOF hardware's
+    // block matching). Flow: 2 x float32 per vector, velocity in full-res pixels
+    // per source frame, any resolution (sampled bilinearly).
+    struct HostFlow
+    {
+        const void* data = nullptr;
+        size_t rowBytes = 0;
+        int width = 0, height = 0;
+    };
+    // Two-frame interpolation; fa = motion at A, fb = motion at B (both forward in time).
+    virtual bool ProcessHostPairFlow(const HostImage& A, const HostImage& B, double a, const HostFlow& fa,
+                                     const HostFlow& fb, void* out, size_t outRowBytes, const Settings& s,
+                                     Stats* stats, std::string* err) = 0;
+    // Single frame with its motion v.
+    virtual bool ProcessHostFlow(const HostImage& cur, const HostFlow& v, void* out, size_t outRowBytes,
+                                 const Settings& s, Stats* stats, std::string* err) = 0;
 
     // Test helpers (offline harness): 8-bit BGRA host image <-> float device frame.
     virtual bool Upload8(const void* host, int width, int height, Frame* dev, std::string* err) = 0;

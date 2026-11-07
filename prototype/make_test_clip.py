@@ -3,8 +3,9 @@
 Scene: textured background panning right-to-left (camera pan) plus a textured
 square swinging left/right at varying speed (moving subject, occlusion edges).
 
-Outputs (lossless FFV1):
+Outputs (lossless FFV1), pick with arguments (default: 50p gt):
   test_src_50p.mkv   - what the camera records: 50p, 180 deg shutter (10 ms)
+  test_src_5994p.mkv - same scene at 59.94p, 180 deg shutter (8.3 ms)  [arg 5994p]
   test_gt_25p.mkv    - ground truth: 25p, 180 deg shutter (20 ms)
 Motion blur is rendered by averaging many sub-frame renders.
 """
@@ -72,5 +73,11 @@ def write(path, fps, shutter_deg, samples):
 
 
 if __name__ == "__main__":
-    write("test_src_50p.mkv", 50, 180, 16)
-    write("test_gt_25p.mkv", 25, 180, 32)
+    import sys
+    which = sys.argv[1:] or ["50p", "gt"]
+    if "50p" in which:
+        write("test_src_50p.mkv", 50, 180, 16)
+    if "5994p" in which:  # uneven cadence on 25p: 2.4 source frames per output frame
+        write("test_src_5994p.mkv", 60000 / 1001, 180, 16)
+    if "gt" in which:
+        write("test_gt_25p.mkv", 25, 180, 32)

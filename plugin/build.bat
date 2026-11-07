@@ -19,8 +19,6 @@ if not exist "%OBJ%" mkdir "%OBJ%"
 
 set CFLAGS=/nologo /c /O2 /EHsc /MD /W3 /WX /std:c++17 /DMSWindows /DWIN32 /D_WINDOWS /DNOMINMAX /I "%CV%\include\opencv4"
 set AEINC=/I "%SDK%\Headers" /I "%SDK%\Headers\SP" /I "%SDK%\Util" /I "%SDK%\Resources"
-rem Premiere SDK headers first so its PrSDK*.h win over the AE SDK copies
-set PRINC=/DPRWIN_ENV /I "%PRSDK%\Headers" /I "%PRSDK%\Projects\GPUVideoFilter\Utils" /I "%SDK%\Headers" /I "%SDK%\Headers\SP" /I "%SDK%\Util"
 set CVLIBS="%CV%\lib\opencv_video4.lib" "%CV%\lib\opencv_imgproc4.lib" "%CV%\lib\opencv_core4.lib" "%CV%\lib\zs.lib"
 set CUDALIBS="%CUDA_PATH%\lib\x64\cudart_static.lib" "%CUDA_PATH%\lib\x64\cuda.lib"
 
@@ -32,8 +30,6 @@ rc /nologo /fo "%OBJ%\OneEightyPiPL.res" "%OBJ%\OneEightyPiPL.rc" || exit /b 1
 
 echo [2/5] Compile C++
 cl %CFLAGS% %AEINC% /Fo"%OBJ%\\" OneEighty.cpp MotionBlur.cpp Log.cpp tools\oe_offline.cpp tools\oe_gpu_offline.cpp || exit /b 1
-rem (no /DNOMINMAX here: PrSDKTypes.h defines it itself)
-cl %CFLAGS:/DNOMINMAX=% %PRINC% /Fo"%OBJ%\\" OneEightyGPU.cpp || exit /b 1
 
 echo [3/5] Compile CUDA
 "%CUDA_PATH%\bin\nvcc.exe" -c -O3 -std=c++17 -Xcompiler "/MD /EHsc /W3" -I "%NVOF%" ^
@@ -50,7 +46,7 @@ echo [5/5] Link plugin
 rem CUDA 13's cuda.lib/cudart_static load the NVIDIA driver at runtime (no nvcuda.dll import),
 rem so the plugin still loads, CPU-only, on machines without NVIDIA.
 link /nologo /DLL /OUT:"%OUT%\OneEighty.aex" /IMPLIB:"%OBJ%\OneEighty.lib" ^
-   "%OBJ%\OneEighty.obj" "%OBJ%\OneEightyGPU.obj" "%OBJ%\MotionBlur.obj" "%OBJ%\Log.obj" "%OBJ%\GpuMotionBlur.obj" ^
+   "%OBJ%\OneEighty.obj" "%OBJ%\MotionBlur.obj" "%OBJ%\Log.obj" "%OBJ%\GpuMotionBlur.obj" ^
    "%OBJ%\OneEightyPiPL.res" %CVLIBS% %CUDALIBS% kernel32.lib user32.lib || exit /b 1
 
 echo BUILD OK: %OUT%\OneEighty.aex

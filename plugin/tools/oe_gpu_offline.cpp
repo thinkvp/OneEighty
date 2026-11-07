@@ -38,6 +38,7 @@ int main(int argc, char** argv)
     const size_t frameBytes = (size_t)W * H * 4;
     std::vector<unsigned char> buf(frameBytes);
     std::vector<oe::gpu::Frame> src;
+    std::vector<std::vector<unsigned char>> hostSrc; // for OE_CADENCE=3
     FILE* fi = nullptr;
     if (fopen_s(&fi, argv[1], "rb") || !fi)
         return 1;
@@ -50,6 +51,7 @@ int main(int argc, char** argv)
             return 1;
         }
         src.push_back(f);
+        hostSrc.push_back(buf);
     }
     std::fclose(fi);
 
@@ -62,6 +64,35 @@ int main(int argc, char** argv)
     if (fopen_s(&fo, argv[6], "wb") || !fo)
         return 1;
     const double r = srcFps / outFps;
+    // OE_CADENCE=1: shift the nearest frame to the exact output time (k/outFps)
+    // OE_CADENCE=2: two-frame interpolation between the frames either side (plugin default)
+    // otherwise: nearest source frame's moment (what Premiere does)
+    char cad[8] = {0};
+    size_t cadLen = 0;
+    getenv_s(&cadLen, cad, sizeof(cad), "OE_CADENCE");
+    const bool cadence = cad[0] == '1';
+    const bool pair = cad[0] == '2';
+    const bool hostPair = cad[0] == '3' || cad[0] == '4'; // hybrid: frames in host memory (CPU effect path)
+    const bool disMotion = cad[0] == '4';                   // ...with CPU (OpenCV DIS) motion, GPU blur
+    char argbEnv[8] = {0};
+    size_t argbLen = 0;
+    getenv_s(&argbLen, argbEnv, sizeof(argbEnv), "OE_ARGB"); // OE_ARGB=1: feed the hybrid path ARGB bytes
+    const bool argb = argbEnv[0] == '1';
+    auto swapBGRA_ARGB = [](std::vector<unsigned char>& v, bool toArgb) {
+        for (size_t i = 0; i + 3 < v.size(); i += 4)
+        {
+            const unsigned char b = v[i], g = v[i + 1], r = v[i + 2], a = v[i + 3];
+            if (toArgb) { v[i] = a; v[i + 1] = r; v[i + 2] = g; v[i + 3] = b; }
+            else { v[i] = v[i + 3]; v[i + 3] = b; v[i + 1] = v[i + 2]; v[i + 2] = g; (void)r; (void)a; }
+        }
+    };
+    if (hostPair && argb)
+        for (auto& f : hostSrc)
+            swapBGRA_ARGB(f, true);
+    char view[8] = {0};
+    size_t viewLen = 0;
+    getenv_s(&viewLen, view, sizeof(view), "OE_VIEW"); // OE_VIEW=1: motion-vector view
+    s.showVectors = view[0] == '1';
     double flowMs = 0, blurMs = 0, totMs = 0;
     int k = 0, timed = 0;
     for (;; ++k)
@@ -72,7 +103,46 @@ int main(int argc, char** argv)
         const oe::gpu::Frame* prev = i > 0 ? &src[i - 1] : nullptr;
         const oe::gpu::Frame* next = i + 1 < (long)src.size() ? &src[i + 1] : nullptr;
         oe::gpu::Stats st;
-        if (!eng->Process(prev, src[i], next, out, s, nullptr, &st, &err))
+        s.centerOffset = cadence ? k * r - (double)i : 0.0;
+        bool ok;
+        if (hostPair)
+        {
+            const long A = (long)std::floor(k * r + 1e-9);
+            if (A + 1 >= (long)src.size())
+                break;
+            using HI = oe::gpu::Engine::HostImage;
+            const HI ha{hostSrc[A].data(), (size_t)W * 4, W, H, argb}, hb{hostSrc[A + 1].data(), (size_t)W * 4, W, H, argb};
+            if (disMotion)
+            {
+                const cv::Mat ma(H, W, CV_8UC4, hostSrc[A].data()), mb(H, W, CV_8UC4, hostSrc[A + 1].data());
+                const oe::ChannelOrder ord = argb ? oe::kARGB : oe::kBGRA;
+                const cv::Mat fa = oe::EstimateFlow(ma, mb, ord, 960);
+                const cv::Mat fb = -oe::EstimateFlow(mb, ma, ord, 960);
+                const oe::gpu::Engine::HostFlow hfa{fa.data, fa.step, fa.cols, fa.rows};
+                const oe::gpu::Engine::HostFlow hfb{fb.data, fb.step, fb.cols, fb.rows};
+                ok = eng->ProcessHostPairFlow(ha, hb, k * r - (double)A, hfa, hfb, buf.data(), (size_t)W * 4, s, &st,
+                                              &err);
+            }
+            else
+                ok = eng->ProcessHostPair(ha, hb, k * r - (double)A, buf.data(), (size_t)W * 4, s, &st, &err);
+            if (ok)
+            {
+                if (argb)
+                    swapBGRA_ARGB(buf, false);
+                std::fwrite(buf.data(), 1, frameBytes, fo);
+                continue;
+            }
+        }
+        else if (pair)
+        {
+            const long A = (long)std::floor(k * r + 1e-9);
+            const double a = k * r - (double)A;
+            ok = A + 1 < (long)src.size() ? eng->ProcessPair(src[A], src[A + 1], a, out, s, nullptr, &st, &err)
+                                          : eng->Process(&src[A - 1], src[A], nullptr, out, s, nullptr, &st, &err);
+        }
+        else
+            ok = eng->Process(prev, src[i], next, out, s, nullptr, &st, &err);
+        if (!ok)
         {
             std::fprintf(stderr, "frame %d: %s\n", k, err.c_str());
             return 1;

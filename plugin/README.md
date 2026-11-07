@@ -1,22 +1,79 @@
 # OneEighty Motion Blur (Premiere Pro / After Effects effect)
 
-v0.3: optical-flow shutter blur. Estimates per-pixel motion between the current
-source frame and its neighbours (Premiere lets the effect read the in-between
-50p/59.94p frames on a 25p timeline) and smears each pixel along its path to add
-the exposure a 180° shutter at the timeline rate would have recorded.
+v0.5. Gives high-frame-rate footage (50p, 59.94p) played at 100% speed on a
+lower-rate timeline (25p) the motion blur a 180° shutter at the timeline rate
+would have recorded, and (optionally) evens out the uneven frame steps of
+non-integer conversions like 59.94p → 25p.
 
-Two render paths in one plugin file:
+## Effect controls
 
-| | When | Files |
-|---|---|---|
-| **GPU** | Premiere, project renderer = *Mercury Playback Engine GPU Acceleration (CUDA)*, NVIDIA GPU with optical-flow hardware (Turing or newer) | `OneEightyGPU.cpp` (Premiere GPU filter), `gpu/GpuMotionBlur.cu` |
-| **CPU** | everything else (OpenCL/DirectX renderer, other GPUs, After Effects, "Blend 3 frames" mode) | `OneEighty.cpp` (AE API effect), `MotionBlur.cpp` |
+| Control | Meaning |
+|---|---|
+| **Shutter angle** | Look to simulate at the timeline rate (default 180°; 360° = maximum smear). |
+| **Quality** | **Fast**: motion and blur on the GPU (NVIDIA optical-flow hardware). Quickest, but can mis-track fine repeating patterns (checked shirts). **Normal** (default): motion estimated on the CPU (OpenCV DIS at 960 px wide), blur on the GPU. **High**: as Normal at 1920 px; ~5× the motion-estimation time for little visible gain. |
+| **Exact frame timing** | On (default): each output frame is built at its exact timeline moment from the two source frames either side, so motion advances evenly (removes the 2/3-frame judder of 59.94p → 25p). Off: Premiere's own frame choice, blur only. No visible difference for 50p → 25p. |
+| *Advanced* ▸ Source shutter angle | Shutter the footage was shot with (default 180°). |
+| *Advanced* ▸ Source fps (0 = auto) | Clip's real frame rate; auto reads the original clip rate from Premiere. |
+| *Advanced* ▸ View | Result · Motion vectors (hue = direction, colour strength = speed, full at 1% of frame width per source frame; still areas grey). Shows why a shot artefacts. |
+| *Advanced* ▸ Force CPU | Do everything on the CPU (troubleshooting). |
+| *Advanced* ▸ Write debug log | One line per rendered frame in `%TEMP%\OneEighty.log`: path (`hybrid-dis`, `hybrid-nvof`, `cpu`), frame formats, timing plan, fetch / motion / total ms. |
 
-The GPU filter asks Premiere for the frames one source-frame interval either side
-(`GetFrameDependencies`); Premiere decodes them and passes them in GPU memory.
+The GPU is used automatically when an NVIDIA GPU with optical-flow hardware
+(Turing or newer) and driver are present; otherwise everything runs on the CPU.
 
-Accuracy on the synthetic test: CPU 38.8 dB, GPU 39.2–39.5 dB vs a real 180°
-shutter, against 28.1 dB for Premiere's frame dropping.
+## How it works
+
+1. **Fetch.** The effect checks out its input at sub-frame times through the
+   After Effects API, which Premiere honours: on a 25p timeline it can read the
+   in-between 50p/59.94p source frames. (Premiere's GPU filter API cannot: it
+   floors frame requests to whole timeline frames. That route was built, tested
+   and dropped in v0.5; the code is kept in `experimental/`.)
+2. **Timing.** Exact frame timing: output time p (in source frames) lies
+   between frames A = floor(p) and B = A+1. Off: Premiere's frame and its
+   neighbours one source interval away.
+3. **Motion.** Dense optical flow A→B and B→A (or cur→prev/next): OpenCV DIS on
+   the CPU (Normal/High) or the NVIDIA optical-flow hardware (Fast).
+4. **Blur.** Each pixel is averaged along its motion path over the missing
+   shutter time (long smears sampled from downscaled copies), A blurred at the
+   output time and B likewise, blended by closeness. CUDA when available
+   (`gpu/GpuMotionBlur.cu`), else OpenCV (`MotionBlur.cpp`).
+
+Premiere hands the input and output as 8-bit BGRA but checked-out frames as
+ARGB; every frame is converted to the output's byte order before processing.
+
+## Measured
+
+Synthetic clips with a known-correct answer (`../prototype`), PSNR vs a real
+25p camera at 180°:
+
+| 59.94p → 25p | Accuracy | Frame-to-frame | Pan-step variation |
+|---|---|---|---|
+| Premiere | 24.9 dB | 21.8 dB | 9.8 px |
+| Blur only (exact timing off) | 30.7 dB | 26.1 dB | 9.8 px |
+| Exact timing, Normal (DIS motion) | 38.6 dB | 35.4 dB | 0.14 px |
+| Exact timing, Fast (NVIDIA motion) | 39.2 dB | 36.1 dB | 0.13 px |
+
+(Fast scores higher on the smooth synthetic textures, but mis-tracks real
+repeating patterns, hence Normal is the default.)
+
+In Premiere 26, RTX 4070, UHD 59.94p H.264/HEVC-style source on a 25p timeline,
+per frame:
+
+| | Fetch frames from Premiere | Motion | GPU blur etc. | Total |
+|---|---|---|---|---|
+| CPU only (v0.4) | 0.8 s | 2.6 s (motion + blur) | | 3.3 s |
+| **Normal** | 1.1 s | 0.18 s | 0.04 s | **1.35 s** |
+| High | 1.1 s | 0.96 s | 0.04 s | 2.15 s |
+| Fast | 0.6 s | – | 0.05 s | 0.68 s |
+
+Frame fetching (Premiere decoding the extra source frames on the CPU) is now
+~80% of the time; decoding backwards in long-GOP footage is especially slow.
+
+**Edges (tried, not adopted):** depth-free "reconstruction filter" variants
+(McGuire 2012 style) were 0.3–1.7 dB *worse* than the plain gather, a version
+gated to motion boundaries only +0.1–0.2 dB (`../prototype/validate_edges.py`).
+Proper edge handling needs to know which object is in front (RSMB Pro asks for
+a matte); an effect mask on OneEighty is the practical workaround.
 
 ## Build / install
 
@@ -26,48 +83,17 @@ shutter, against 28.1 dB for Premiere's frame dropping.
 build.bat                  # -> build\OneEighty.aex, build\oe_offline.exe, build\oe_gpu_offline.exe
 install.bat                # once, as admin: junction Adobe\Common\Plug-ins\7.0\MediaCore\OneEighty -> build\
 ```
-Close Premiere before rebuilding (it locks the .aex); restart it to load the new build.
-
-## Effect controls
-
-| Control | Meaning |
-|---|---|
-| Mode | **Optical flow blur** · Blend 3 frames (test) · Show previous / next source frame · Off |
-| Source fps (0 = auto) | Clip's real frame rate; auto reads the original clip rate from Premiere |
-| Source shutter angle | Shutter the footage was shot with (default 180°) |
-| Target shutter angle | Look to simulate at the timeline rate (default 180°; 360° = maximum smear) |
-| Motion analysis | CPU: analysis width 480 / 960 / 1920 px. GPU: ¼ width grid 4 / ½ width grid 2 / ½ width grid 1 |
-| Write debug log | One line per rendered frame (timings, frame rates, `[gpu]` or CPU path) in `%TEMP%\OneEighty.log` |
-
-## Performance
-
-In Premiere 26 on an RTX 4070 (UHD 59.94p clip on a 25p timeline, 1,297 GPU frames,
-before the popup fix so analysis ran at "Fast"): median **4.1 ms** per frame,
-95th percentile 7.6 ms, no fallbacks or errors.
-
-CPU path (OpenCV DIS optical flow, 24 threads):
-
-| | Motion analysis | Blur | Accuracy (720p test) |
-|---|---|---|---|
-| 1280×720 | ~60 ms | ~25 ms | 38.8 dB |
-| 3840×2160 | ~75 ms | ~325 ms | |
-
-GPU path (`gpu/`, NVIDIA Optical Flow hardware + CUDA, RTX 4070), offline harness:
-
-| | Analysis width / NVOF grid | Total per frame | Accuracy (720p test) |
-|---|---|---|---|
-| 1280×720 | 640 / 2 | 2.4 ms | 39.5 dB |
-| 3840×2160 | 960 / 2 | 7.3 ms | |
-| 3840×2160 | 1920 / 4 | 8.2 ms | |
-| 3840×2160 | 1920 / 2 | 13.9 ms | |
-
-Needs the CUDA toolkit to build (`build.bat` expects v13.4 or `CUDA_PATH`) and
-`..\deps\setup_nvof.bat` for the NVIDIA Optical Flow headers; at runtime only the
-NVIDIA driver (Turing or newer).
+Needs the VS 2022 Build Tools, the CUDA toolkit (v13.4 or `CUDA_PATH`) and the
+After Effects SDK in `..\sdk\ae`. At runtime only the NVIDIA driver is needed
+for the GPU path; the plugin loads and runs CPU-only without it. Close Premiere
+before rebuilding (it locks the .aex); restart it to load the new build.
 
 ## Offline tests
 
 - `oe_offline in.bgra W H srcFps outFps out.bgra [srcShutter targetShutter [mipThreshold]]` (CPU)
 - `oe_gpu_offline in.bgra W H srcFps outFps out.bgra [flowWidth grid perf mipThreshold]` (GPU)
+  - `OE_CADENCE=1|2|3|4`: single-frame shift / two-frame / hybrid host frames / hybrid with DIS motion
+  - `OE_VIEW=1` motion-vector view, `OE_ARGB=1` feed the hybrid path ARGB bytes
 
-`../prototype/validate_plugin.py` and `../prototype/validate_gpu.py` score them against ground truth.
+`../prototype/validate_plugin.py`, `validate_gpu.py`, `validate_cadence.py`,
+`validate_timing.py` and `validate_edges.py` score them against ground truth.

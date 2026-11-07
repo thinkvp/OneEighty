@@ -23,6 +23,11 @@ struct BlurSettings
     // mipThreshold samples. 0 disables (always full resolution).
     int mipThreshold = 32; // UHD test: 2x faster than exact, 49.6 dB vs exact (24 was 3.6x but 40.9 dB)
     int maxMipLevel = 3;
+    // Time of the wanted output frame relative to `cur`, in source-frame
+    // intervals (-0.5..0.5). Non-zero when source and timeline rates don't
+    // divide evenly (59.94p on 25p): the blur window is shifted to that time.
+    double centerOffset = 0.0;
+    bool showVectors = false; // draw the motion field instead of blurring
 };
 
 struct BlurStats
@@ -35,6 +40,14 @@ struct BlurStats
 // output interval. Widths combine like standard deviations ("variance" rule,
 // which matched a real shutter best in prototype/validate.py).
 double BlurHalfWidth(double srcFps, double outFps, double srcShutterDeg, double targetShutterDeg);
+
+// Dense motion from `from` to `to` (OpenCV DIS, medium preset) estimated at
+// `flowWidth` and returned at that reduced size (CV_32FC2), in full-res pixels:
+// from(x) ~ to(x + f(x)). Used to feed the GPU blur in the hybrid path.
+cv::Mat EstimateFlow(const cv::Mat& from, const cv::Mat& to, const ChannelOrder& order, int flowWidth);
+
+// Colour for a motion vector (hue = direction, saturation = speed / norm), RGB 0..1.
+void VectorColour(float vx, float vy, float norm, float rgb[3]);
 
 // prev/next may be empty (clip edges). All images CV_8UC4, same size; out must
 // be allocated and must not alias the inputs.

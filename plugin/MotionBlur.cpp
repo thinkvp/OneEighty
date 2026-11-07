@@ -36,7 +36,60 @@ cv::Mat SmallGray(const cv::Mat& bgra, double scale, const ChannelOrder& o)
     return gray;
 }
 
+// Motion field view: hue = direction, colour strength = speed (full at 1% of
+// the frame width per source frame), over a grey version of the picture.
+void DrawVectors(const cv::Mat& cur, const cv::Mat& vFull, const ChannelOrder& o, cv::Mat& out)
+{
+    const float norm = std::max(4.0f, 0.01f * cur.cols);
+    cv::parallel_for_(cv::Range(0, cur.rows), [&](const cv::Range& rows) {
+        for (int y = rows.start; y < rows.end; ++y)
+        {
+            const cv::Vec2f* vr = vFull.ptr<cv::Vec2f>(y);
+            const uchar* p = cur.ptr<uchar>(y);
+            uchar* d = out.ptr<uchar>(y);
+            for (int x = 0; x < cur.cols; ++x, p += 4, d += 4)
+            {
+                float rgb[3];
+                VectorColour(vr[x][0], vr[x][1], norm, rgb);
+                const float g = (0.299f * p[o.r] + 0.587f * p[o.g] + 0.114f * p[o.b]) / 255.0f;
+                d[o.r] = (uchar)std::clamp((0.35f * g + 0.65f * rgb[0] * (0.4f + 0.6f * g)) * 255.0f, 0.0f, 255.0f);
+                d[o.g] = (uchar)std::clamp((0.35f * g + 0.65f * rgb[1] * (0.4f + 0.6f * g)) * 255.0f, 0.0f, 255.0f);
+                d[o.b] = (uchar)std::clamp((0.35f * g + 0.65f * rgb[2] * (0.4f + 0.6f * g)) * 255.0f, 0.0f, 255.0f);
+                d[o.a] = p[o.a];
+            }
+        }
+    });
+}
+
 } // namespace
+
+cv::Mat EstimateFlow(const cv::Mat& from, const cv::Mat& to, const ChannelOrder& order, int flowWidth)
+{
+    const double scale = std::min(1.0, (double)flowWidth / from.cols);
+    cv::Ptr<cv::DISOpticalFlow> dis = cv::DISOpticalFlow::create(cv::DISOpticalFlow::PRESET_MEDIUM);
+    cv::Mat f;
+    dis->calc(SmallGray(from, scale, order), SmallGray(to, scale, order), f);
+    if (scale < 1.0)
+        f *= 1.0 / scale;
+    return f;
+}
+
+void VectorColour(float vx, float vy, float norm, float rgb[3])
+{
+    // HSV with H = direction, S = speed / norm, V = 1
+    const float sat = std::min(1.0f, std::sqrt(vx * vx + vy * vy) / norm);
+    float h = std::atan2(vy, vx) / 6.2831853f; // -0.5..0.5
+    if (h < 0)
+        h += 1.0f;
+    const float h6 = h * 6.0f;
+    const int i = (int)h6 % 6;
+    const float f = h6 - std::floor(h6);
+    const float p = 1 - sat, q = 1 - sat * f, t = 1 - sat * (1 - f);
+    const float table[6][3] = {{1, t, p}, {q, 1, p}, {p, 1, t}, {p, q, 1}, {t, p, 1}, {1, p, q}};
+    rgb[0] = table[i][0];
+    rgb[1] = table[i][1];
+    rgb[2] = table[i][2];
+}
 
 double BlurHalfWidth(double srcFps, double outFps, double srcShutterDeg, double targetShutterDeg)
 {
@@ -56,7 +109,7 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
     const auto t0 = Clock::now();
     const int W = cur.cols, H = cur.rows;
 
-    if (s.halfWidth <= 0 || (prev.empty() && next.empty()))
+    if ((s.halfWidth <= 0 && s.centerOffset == 0.0 && !s.showVectors) || (prev.empty() && next.empty()))
     {
         cur.copyTo(out);
         return;
@@ -100,6 +153,14 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
         vFull = v;
     const auto t1 = Clock::now();
 
+    if (s.showVectors)
+    {
+        DrawVectors(cur, vFull, order, out);
+        if (stats)
+            stats->flowMs = Ms(t0, t1);
+        return;
+    }
+
     // ---- mip chain for long smears (level l = 1/2^l resolution, area filtered)
     std::vector<cv::Mat> mip{cur};
     if (s.mipThreshold > 0)
@@ -114,6 +175,7 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
 
     // ---- gather blur: average cur along each pixel's motion path
     const float hw = (float)s.halfWidth;
+    const float c0 = (float)s.centerOffset;
     const int maxS = std::max(1, s.maxSamples);
     const float mipT = (float)std::max(1, s.mipThreshold);
     std::atomic<long long> totalSamples{0};
@@ -151,7 +213,7 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
                 float acc[4] = {0, 0, 0, 0};
                 for (int j = 0; j < n; ++j)
                 {
-                    const float off = hw * (((j + 0.5f) / n) * 2.0f - 1.0f);
+                    const float off = c0 + hw * (((j + 0.5f) / n) * 2.0f - 1.0f);
                     // full-res sample position -> this level's pixel grid
                     float sx = (x - off * vx + 0.5f) * inv2l - 0.5f;
                     float sy = (y - off * vy + 0.5f) * inv2l - 0.5f;

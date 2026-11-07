@@ -44,6 +44,12 @@ int main(int argc, char** argv)
     if (fopen_s(&fo, argv[6], "wb") || !fo)
         return 1;
     const double r = srcFps / outFps;
+    // OE_CADENCE=1: shift each output frame to its exact time (k/outFps) instead of
+    // showing the nearest source frame's moment (what Premiere does).
+    char cad[8] = {0};
+    size_t cadLen = 0;
+    getenv_s(&cadLen, cad, sizeof(cad), "OE_CADENCE");
+    const bool cadence = cad[0] == '1';
     cv::Mat out(H, W, CV_8UC4);
     double flowMs = 0, blurMs = 0;
     int k = 0;
@@ -56,6 +62,31 @@ int main(int argc, char** argv)
         const cv::Mat& prev = i > 0 ? src[i - 1] : empty;
         const cv::Mat& next = i + 1 < (long)src.size() ? src[i + 1] : empty;
         oe::BlurStats st;
+        if (cad[0] == '2')
+        {
+            // two-frame interpolation exactly as the plugin's CPU-only path does it
+            const long A = (long)std::floor(k * r + 1e-9);
+            const double a = k * r - (double)A;
+            if (A + 1 >= (long)src.size())
+                break;
+            if (a > 1e-3)
+            {
+                cv::Mat outA(H, W, CV_8UC4), outB(H, W, CV_8UC4);
+                s.centerOffset = a;
+                oe::FlowMotionBlur(cv::Mat(), src[A], src[A + 1], outA, oe::kBGRA, s, &st);
+                s.centerOffset = a - 1.0;
+                oe::FlowMotionBlur(src[A], src[A + 1], cv::Mat(), outB, oe::kBGRA, s, &st);
+                cv::addWeighted(outA, 1.0 - a, outB, a, 0.0, out);
+            }
+            else
+            {
+                s.centerOffset = 0.0;
+                oe::FlowMotionBlur(cv::Mat(), src[A], src[A + 1], out, oe::kBGRA, s, &st);
+            }
+            std::fwrite(out.data, 1, frameBytes, fo);
+            continue;
+        }
+        s.centerOffset = cadence ? k * r - (double)i : 0.0;
         oe::FlowMotionBlur(prev, src[i], next, out, oe::kBGRA, s, &st);
         flowMs += st.flowMs;
         blurMs += st.blurMs;
