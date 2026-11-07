@@ -1,0 +1,24 @@
+# Adobe After Effects / Premiere SDKs (Adobe licence; download from developer.adobe.com)
+/sdk/
+
+# Third-party dependencies, fetched by deps/setup_*.bat
+/deps/vcpkg/
+/deps/nvof/
+
+# Build output
+/plugin/build/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Generated test media (re-create with prototype/make_test_clip.py)
+*.mkv
+*.mov
+*.mp4
+*.bgra
+prototype/compare.png
+
+# Logs
+*.log

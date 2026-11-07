@@ -1,0 +1,35 @@
+@echo off
+rem Builds build\OneEighty.aex (x64 Release) and build\oe_offline.exe with the VS 2022 Build Tools.
+rem Needs ..\deps\setup_opencv.bat to have been run once (static OpenCV via vcpkg).
+setlocal
+cd /d "%~dp0"
+set "PATH=%PATH%;C:\Program Files (x86)\Microsoft Visual Studio\Installer"
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+
+set "SDK=%~dp0..\sdk\AfterEffectsSDK_26.5_win\Examples"
+set "CV=%~dp0..\deps\vcpkg\installed\x64-windows-static-md"
+set "OUT=%~dp0build"
+set "OBJ=%~dp0build\obj"
+if not exist "%OBJ%" mkdir "%OBJ%"
+
+set CFLAGS=/nologo /c /O2 /EHsc /MD /W3 /WX /std:c++17 /DMSWindows /DWIN32 /D_WINDOWS /DNOMINMAX /I "%CV%\include\opencv4"
+set CVLIBS="%CV%\lib\opencv_video4.lib" "%CV%\lib\opencv_imgproc4.lib" "%CV%\lib\opencv_core4.lib" "%CV%\lib\zs.lib"
+
+echo [1/4] PiPL resource
+cl /nologo /I "%SDK%\Headers" /EP OneEightyPiPL.r > "%OBJ%\OneEightyPiPL.rr" || exit /b 1
+"%SDK%\Resources\PiPLtool.exe" "%OBJ%\OneEightyPiPL.rr" "%OBJ%\OneEightyPiPL.rrc" || exit /b 1
+cl /nologo /D "MSWindows" /EP "%OBJ%\OneEightyPiPL.rrc" > "%OBJ%\OneEightyPiPL.rc" || exit /b 1
+rc /nologo /fo "%OBJ%\OneEightyPiPL.res" "%OBJ%\OneEightyPiPL.rc" || exit /b 1
+
+echo [2/4] Compile
+cl %CFLAGS% /I "%SDK%\Headers" /I "%SDK%\Headers\SP" /I "%SDK%\Util" /I "%SDK%\Resources" ^
+   /Fo"%OBJ%\\" OneEighty.cpp MotionBlur.cpp tools\oe_offline.cpp || exit /b 1
+
+echo [3/4] Link offline test tool
+link /nologo /OUT:"%OUT%\oe_offline.exe" "%OBJ%\oe_offline.obj" "%OBJ%\MotionBlur.obj" %CVLIBS% || exit /b 1
+
+echo [4/4] Link plugin
+link /nologo /DLL /OUT:"%OUT%\OneEighty.aex" /IMPLIB:"%OBJ%\OneEighty.lib" "%OBJ%\OneEighty.obj" "%OBJ%\MotionBlur.obj" ^
+   "%OBJ%\OneEightyPiPL.res" %CVLIBS% kernel32.lib user32.lib || exit /b 1
+
+echo BUILD OK: %OUT%\OneEighty.aex
