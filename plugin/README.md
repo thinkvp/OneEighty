@@ -28,16 +28,32 @@ Close Premiere before rebuilding (it locks the .aex); restart it to load the new
 | Motion analysis | Resolution of the motion estimate: Fast 480 px · Normal 960 px · High 1920 px wide |
 | Write debug log | One line per rendered frame (timings, frame rates) in `%TEMP%\OneEighty.log` |
 
-## Performance (RTX-less CPU path, 24 threads)
+## Performance
 
-| | Motion analysis | Blur | 
-|---|---|---|
-| 1280×720 | ~60 ms | ~25 ms |
-| 3840×2160 | ~75 ms | ~325 ms |
+CPU path (OpenCV DIS optical flow, 24 threads) — used in the current Premiere build:
 
-UHD renders at ~2–3 fps: fine for export/render-in-to-out, not for real-time playback yet.
+| | Motion analysis | Blur | Accuracy (720p test) |
+|---|---|---|---|
+| 1280×720 | ~60 ms | ~25 ms | 38.8 dB |
+| 3840×2160 | ~75 ms | ~325 ms | |
 
-## Offline test
+GPU path (`gpu/`, NVIDIA Optical Flow hardware + CUDA, RTX 4070) — offline only so far,
+Premiere integration needs the Premiere Pro SDK's GPU filter API:
 
-`oe_offline in.bgra W H srcFps outFps out.bgra [srcShutter targetShutter [mipThreshold]]`
-runs the same algorithm on raw BGRA frames; `../prototype/validate_plugin.py` scores it.
+| | Analysis width / NVOF grid | Total per frame | Accuracy (720p test) |
+|---|---|---|---|
+| 1280×720 | 640 / 2 | 2.4 ms | 39.5 dB |
+| 3840×2160 | 960 / 2 | 7.3 ms | |
+| 3840×2160 | 1920 / 4 | 8.2 ms | |
+| 3840×2160 | 1920 / 2 | 13.9 ms | |
+
+Needs the CUDA toolkit to build (`build.bat` expects v13.4 or `CUDA_PATH`) and
+`..\deps\setup_nvof.bat` for the NVIDIA Optical Flow headers; at runtime only the
+NVIDIA driver (Turing or newer).
+
+## Offline tests
+
+- `oe_offline in.bgra W H srcFps outFps out.bgra [srcShutter targetShutter [mipThreshold]]` (CPU)
+- `oe_gpu_offline in.bgra W H srcFps outFps out.bgra [flowWidth grid perf mipThreshold]` (GPU)
+
+`../prototype/validate_plugin.py` and `../prototype/validate_gpu.py` score them against ground truth.

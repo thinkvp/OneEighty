@@ -6,7 +6,9 @@ cd /d "%~dp0"
 set "PATH=%PATH%;C:\Program Files (x86)\Microsoft Visual Studio\Installer"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 
-set "SDK=%~dp0..\sdk\AfterEffectsSDK_26.5_win\Examples"
+rem Adobe SDKs (not in git): sdk\ae = After Effects SDK 26.5, sdk\premiere = Premiere Pro 26.0 C++ SDK
+set "SDK=%~dp0..\sdk\ae\Examples"
+set "PRSDK=%~dp0..\sdk\premiere\Examples"
 set "CV=%~dp0..\deps\vcpkg\installed\x64-windows-static-md"
 set "OUT=%~dp0build"
 set "OBJ=%~dp0build\obj"
@@ -27,6 +29,20 @@ cl %CFLAGS% /I "%SDK%\Headers" /I "%SDK%\Headers\SP" /I "%SDK%\Util" /I "%SDK%\R
 
 echo [3/4] Link offline test tool
 link /nologo /OUT:"%OUT%\oe_offline.exe" "%OBJ%\oe_offline.obj" "%OBJ%\MotionBlur.obj" %CVLIBS% || exit /b 1
+
+rem ---- GPU path (CUDA + NVIDIA Optical Flow); needs the CUDA toolkit and ..\deps\setup_nvof.bat
+if not defined CUDA_PATH set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+set "NVOF=%~dp0..\deps\nvof"
+echo [GPU] Compile CUDA
+"%CUDA_PATH%\bin\nvcc.exe" -c -O3 -std=c++17 -Xcompiler "/MD /EHsc /W3" -I "%NVOF%" ^
+   -gencode arch=compute_75,code=sm_75 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 ^
+   -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120 ^
+   -o "%OBJ%\GpuMotionBlur.obj" gpu\GpuMotionBlur.cu || exit /b 1
+set CUDALIBS="%CUDA_PATH%\lib\x64\cudart_static.lib" "%CUDA_PATH%\lib\x64\cuda.lib"
+cl %CFLAGS% /Fo"%OBJ%\\" tools\oe_gpu_offline.cpp || exit /b 1
+echo [GPU] Link GPU test tool
+link /nologo /OUT:"%OUT%\oe_gpu_offline.exe" "%OBJ%\oe_gpu_offline.obj" "%OBJ%\GpuMotionBlur.obj" "%OBJ%\MotionBlur.obj" ^
+   %CVLIBS% %CUDALIBS% || exit /b 1
 
 echo [4/4] Link plugin
 link /nologo /DLL /OUT:"%OUT%\OneEighty.aex" /IMPLIB:"%OBJ%\OneEighty.lib" "%OBJ%\OneEighty.obj" "%OBJ%\MotionBlur.obj" ^

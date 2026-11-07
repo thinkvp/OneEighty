@@ -16,13 +16,15 @@ flow and smears each pixel along its path to add the missing exposure.
 | `plugin/` | The effect (C++, After Effects SDK + OpenCV). See [plugin/README.md](plugin/README.md). |
 | `prototype/` | Python reference implementation, synthetic ground-truth test clip and scoring scripts. |
 | `deps/` | Scripts that fetch third-party dependencies (vcpkg/OpenCV, NVIDIA Optical Flow headers). |
-| `sdk/` | Adobe SDKs: not in git, download from developer.adobe.com and unzip here. |
+| `sdk/` | Adobe SDKs: not in git (Adobe licence), download from developer.adobe.com and unzip here. |
 
 ## Setup from a fresh clone
 
-1. Visual Studio 2022 Build Tools with the C++ workload.
-2. After Effects SDK unzipped to `sdk\AfterEffectsSDK_26.5_win`.
-3. `deps\setup_opencv.bat`, then `plugin\build.bat`, then `plugin\install.bat` (once, as admin).
+1. Visual Studio 2022 Build Tools with the C++ workload; CUDA Toolkit (13.x) for the GPU path.
+2. Adobe SDKs, renamed to version-free folders so updating one is just replacing the folder:
+   - After Effects SDK (built against 26.5) → `sdk\ae` (contains `Examples\`)
+   - Premiere Pro C++ SDK (built against 26.0) → `sdk\premiere` (contains `Examples\`)
+3. `deps\setup_opencv.bat` and `deps\setup_nvof.bat`, then `plugin\build.bat`, then `plugin\install.bat` (once, as admin).
 4. Prototype: `cd prototype`, `python -m venv .venv`, `.venv\Scripts\pip install -r requirements.txt`,
    `python make_test_clip.py`, `python validate.py`, `python validate_plugin.py`.
 
