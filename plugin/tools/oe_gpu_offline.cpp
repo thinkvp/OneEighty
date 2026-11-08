@@ -10,6 +10,7 @@
 //                  check values above 1.0 pass through unclipped
 //   OE_ARGB=1      feed ARGB bytes instead of BGRA (After Effects order)
 //   OE_VIEW=1      motion-vector view
+//   OE_EDGEFIX=0   skip the motion-boundary clean-up (RefineFlowEdges)
 #include "../MotionBlur.h"
 #include "../gpu/GpuMotionBlur.h"
 
@@ -59,6 +60,7 @@ int main(int argc, char** argv)
     const bool exact = Env("OE_EXACT") != '0';
     const int preset = Env("OE_QUALITY") == 'h' ? cv::DISOpticalFlow::PRESET_MEDIUM : cv::DISOpticalFlow::PRESET_FAST;
     const bool argb = Env("OE_ARGB") == '1';
+    const bool edgeFix = Env("OE_EDGEFIX") != '0';
     const char fl = Env("OE_FLOAT");
     const bool useFloat = fl == '1' || fl == '2';
     const float gain = fl == '2' ? 1.5f : 1.0f;
@@ -115,7 +117,7 @@ int main(int argc, char** argv)
             if (A + 1 >= (long)src.size())
                 break;
             cv::Mat fa, fbBack;
-            oe::EstimateFlowPair(src[A], src[A + 1], order, 960, fa, fbBack, preset);
+            oe::EstimateFlowPair(src[A], src[A + 1], order, 960, fa, fbBack, preset, edgeFix);
             const cv::Mat fb = -fbBack;
             tFlow = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             ok = eng->ProcessPair(host(src[A]), host(src[A + 1]), k * r - (double)A,
@@ -131,12 +133,12 @@ int main(int argc, char** argv)
             int nv = 0;
             if (i + 1 < (long)src.size())
             {
-                v = oe::EstimateFlow(src[i], src[i + 1], order, 960, preset);
+                v = oe::EstimateFlow(src[i], src[i + 1], order, 960, preset, edgeFix);
                 ++nv;
             }
             if (i > 0)
             {
-                const cv::Mat b = oe::EstimateFlow(src[i], src[i - 1], order, 960, preset);
+                const cv::Mat b = oe::EstimateFlow(src[i], src[i - 1], order, 960, preset, edgeFix);
                 v = v.empty() ? cv::Mat(-b) : cv::Mat(v - b);
                 ++nv;
             }

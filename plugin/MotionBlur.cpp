@@ -17,15 +17,20 @@ namespace
 using Clock = std::chrono::steady_clock;
 double Ms(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); }
 
-// Downscale (area) then convert to 8-bit luma (motion estimation only; float
-// input is clamped to 0..1, which is fine for estimating motion).
-cv::Mat SmallGray(const cv::Mat& bgra, double scale, const ChannelOrder& o)
+// Frame downscaled (area) to the motion-analysis size.
+cv::Mat Downscale(const cv::Mat& bgra, double scale)
 {
+    if (scale >= 1.0)
+        return bgra;
     cv::Mat small;
-    if (scale < 1.0)
-        cv::resize(bgra, small, cv::Size(), scale, scale, cv::INTER_AREA);
-    else
-        small = bgra;
+    cv::resize(bgra, small, cv::Size(), scale, scale, cv::INTER_AREA);
+    return small;
+}
+
+// 8-bit luma of a (downscaled) frame, for motion estimation (float input is
+// clamped to 0..1, which is fine for estimating motion).
+cv::Mat GrayOf(const cv::Mat& small, const ChannelOrder& o)
+{
     cv::Mat gray(small.size(), CV_8UC1);
     if (small.depth() == CV_32F)
     {
@@ -53,6 +58,113 @@ cv::Mat SmallGray(const cv::Mat& bgra, double scale, const ChannelOrder& o)
             d[x] = (uchar)((77 * s[o.r] + 150 * s[o.g] + 29 * s[o.b] + 128) >> 8);
     }
     return gray;
+}
+
+cv::Mat SmallGray(const cv::Mat& bgra, double scale, const ChannelOrder& o) { return GrayOf(Downscale(bgra, scale), o); }
+
+// 8-bit colour copy of a (downscaled) frame (B,G,R; 3x3 box-smoothed against
+// noise) for the motion-boundary clean-up below.
+cv::Mat ColorOf(const cv::Mat& small, const ChannelOrder& o)
+{
+    cv::Mat s8 = small;
+    if (s8.depth() == CV_32F)
+        small.convertTo(s8, CV_8UC4, 255.0); // saturates: fine for comparing colours
+    cv::Mat col(s8.size(), CV_8UC3);
+    const int pairs[] = {o.b, 0, o.g, 1, o.r, 2};
+    cv::mixChannels(&s8, 1, &col, 1, pairs, 3);
+    cv::blur(col, col, cv::Size(3, 3));
+    return col;
+}
+
+// Motion-boundary clean-up. DIS motion is smooth, so a fast object's motion
+// spills 20-40 px past its outline onto the background around it, and the
+// blur then smears that background (e.g. a court line next to a bouncing
+// ball). Near a motion boundary each pixel takes the motion of nearby pixels
+// that look like it: candidates are sampled in 8 directions out to beyond the
+// spill, weighted by colour similarity to the pixel, and the weighted median
+// motion wins. Court and line pixels next to the ball side with the court
+// around them, ball pixels with the ball. col: the flow's source frame
+// (ColorOf), same size as flow.
+void RefineFlowEdges(const cv::Mat& col, cv::Mat& flow)
+{
+    CV_Assert(col.type() == CV_8UC3 && flow.type() == CV_32FC2 && flow.size() == col.size());
+    const int W = col.cols, H = col.rows;
+    const int radii[] = {3, 8, 16, 28, 42};    // candidate distances (flow-res pixels)
+    const int dirs[8][2] = {{1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1}};
+    constexpr int kReach = 42;
+    constexpr int kN = 5 * 8 + 1;
+    float colourWeight[766];                    // by L1 colour distance (0..765)
+    for (int d = 0; d < 766; ++d)
+        colourWeight[d] = std::exp(-(d / 36.0f) * (d / 36.0f));
+    const cv::Mat src = flow.clone();
+
+    // Only near motion boundaries: where the motion changes by more than
+    // ~1.5 px per pixel, grown by the candidate reach. Worked out on
+    // every 4th pixel: it only needs to be roughly right.
+    cv::Mat q, ch[2], g0, g1, mask;
+    cv::resize(src, q, cv::Size((W + 3) / 4, (H + 3) / 4), 0, 0, cv::INTER_NEAREST);
+    cv::split(q, ch);
+    cv::morphologyEx(ch[0], g0, cv::MORPH_GRADIENT, cv::Mat());
+    cv::morphologyEx(ch[1], g1, cv::MORPH_GRADIENT, cv::Mat());
+    mask = (g0 + g1) > 3.0f; // neighbours here are 4 px apart
+    cv::dilate(mask, mask, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2 * (kReach / 4) + 3, 2 * (kReach / 4) + 3)));
+    cv::resize(mask, mask, cv::Size(W, H), 0, 0, cv::INTER_NEAREST);
+
+    cv::parallel_for_(cv::Range(0, H), [&](const cv::Range& rows) {
+        float vx[kN], vy[kN], w[kN];
+        int idx[kN];
+        auto weightedMedian = [&](const float* v, int n) {
+            for (int i = 0; i < n; ++i)
+                idx[i] = i;
+            std::sort(idx, idx + n, [&](int p, int q) { return v[p] < v[q]; });
+            float total = 0;
+            for (int i = 0; i < n; ++i)
+                total += w[i];
+            float acc = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                acc += w[idx[i]];
+                if (acc >= 0.5f * total)
+                    return v[idx[i]];
+            }
+            return v[idx[n - 1]];
+        };
+        for (int y = rows.start; y < rows.end; ++y)
+        {
+            const uchar* mrow = mask.ptr<uchar>(y);
+            const cv::Vec3b* crow = col.ptr<cv::Vec3b>(y);
+            cv::Vec2f* drow = flow.ptr<cv::Vec2f>(y);
+            for (int x = 0; x < W; ++x)
+            {
+                if (!mrow[x])
+                    continue;
+                const cv::Vec2f own = src.ptr<cv::Vec2f>(y)[x];
+                const cv::Vec3b c0 = crow[x];
+                int n = 0;
+                float spread = 0;
+                vx[n] = own[0];
+                vy[n] = own[1];
+                w[n++] = 1.0f;
+                for (int r : radii)
+                    for (const auto& d : dirs)
+                    {
+                        const int cx = x + d[0] * r, cy = y + d[1] * r;
+                        if (cx < 0 || cy < 0 || cx >= W || cy >= H)
+                            continue;
+                        const cv::Vec2f v = src.ptr<cv::Vec2f>(cy)[cx];
+                        const cv::Vec3b c = col.ptr<cv::Vec3b>(cy)[cx];
+                        spread = std::max(spread, std::abs(v[0] - own[0]) + std::abs(v[1] - own[1]));
+                        vx[n] = v[0];
+                        vy[n] = v[1];
+                        w[n++] = colourWeight[std::abs(c[0] - c0[0]) + std::abs(c[1] - c0[1]) + std::abs(c[2] - c0[2])];
+                    }
+                if (spread < 1.0f)
+                    continue; // every candidate agrees: nothing to fix
+                // weighted median per component (robust: never averages two motions)
+                drow[x] = cv::Vec2f(weightedMedian(vx, n), weightedMedian(vy, n));
+            }
+        }
+    });
 }
 
 // Pixel component traits: 8-bit (0..255) or 32-bit float (0..1, may exceed).
@@ -182,27 +294,37 @@ void GatherBlur(const cv::Mat& cur, const cv::Mat& vFull, const BlurSettings& s,
 
 } // namespace
 
-cv::Mat EstimateFlow(const cv::Mat& from, const cv::Mat& to, const ChannelOrder& order, int flowWidth, int disPreset)
+cv::Mat EstimateFlow(const cv::Mat& from, const cv::Mat& to, const ChannelOrder& order, int flowWidth, int disPreset,
+                     bool refineEdges)
 {
     const double scale = std::min(1.0, (double)flowWidth / from.cols);
     cv::Ptr<cv::DISOpticalFlow> dis = cv::DISOpticalFlow::create(disPreset);
     cv::Mat f;
-    dis->calc(SmallGray(from, scale, order), SmallGray(to, scale, order), f);
+    const cv::Mat s0 = Downscale(from, scale);
+    dis->calc(GrayOf(s0, order), SmallGray(to, scale, order), f);
+    if (refineEdges)
+        RefineFlowEdges(ColorOf(s0, order), f);
     if (scale < 1.0)
         f *= 1.0 / scale;
     return f;
 }
 
 void EstimateFlowPair(const cv::Mat& a, const cv::Mat& b, const ChannelOrder& order, int flowWidth, cv::Mat& fab,
-                      cv::Mat& fba, int disPreset)
+                      cv::Mat& fba, int disPreset, bool refineEdges)
 {
     // Sequential on purpose: DIS already uses all cores internally (running the
     // two directions concurrently measured no faster at UHD: 64.2 vs 64.3 ms).
     const double scale = std::min(1.0, (double)flowWidth / a.cols);
-    const cv::Mat ga = SmallGray(a, scale, order), gb = SmallGray(b, scale, order);
+    const cv::Mat sa = Downscale(a, scale), sb = Downscale(b, scale);
+    const cv::Mat ga = GrayOf(sa, order), gb = GrayOf(sb, order);
     cv::Ptr<cv::DISOpticalFlow> dis = cv::DISOpticalFlow::create(disPreset);
     dis->calc(ga, gb, fab);
     dis->calc(gb, ga, fba);
+    if (refineEdges)
+    {
+        RefineFlowEdges(ColorOf(sa, order), fab);
+        RefineFlowEdges(ColorOf(sb, order), fba);
+    }
     if (scale < 1.0)
     {
         fab *= 1.0 / scale;
@@ -255,7 +377,11 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
 
     // ---- motion estimation (reduced resolution)
     const double scale = std::min(1.0, (double)s.flowWidth / W);
-    cv::Mat gCur = SmallGray(cur, scale, order);
+    const cv::Mat sCur = Downscale(cur, scale);
+    const cv::Mat gCur = GrayOf(sCur, order);
+    cv::Mat cCur; // colour copy for the boundary clean-up, made once
+    if (s.refineEdges)
+        cCur = ColorOf(sCur, order);
     cv::Ptr<cv::DISOpticalFlow> dis = cv::DISOpticalFlow::create(s.disPreset);
 
     cv::Mat v; // velocity per source frame, small res, CV_32FC2
@@ -263,14 +389,20 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
     if (!next.empty())
     {
         cv::Mat f;
-        dis->calc(gCur, SmallGray(next, scale, order), f);
+        const cv::Mat gNext = SmallGray(next, scale, order);
+        dis->calc(gCur, gNext, f);
+        if (s.refineEdges)
+            RefineFlowEdges(cCur, f);
         v = f;
         ++nFlows;
     }
     if (!prev.empty())
     {
         cv::Mat f;
-        dis->calc(gCur, SmallGray(prev, scale, order), f);
+        const cv::Mat gPrev = SmallGray(prev, scale, order);
+        dis->calc(gCur, gPrev, f);
+        if (s.refineEdges)
+            RefineFlowEdges(cCur, f);
         if (v.empty())
             v = -f;
         else

@@ -17,7 +17,7 @@ whenever Premiere would drop frames: clips at 100% speed, and slowed-down files
 | *Advanced* ▸ Source fps (0 = auto) | The clip's frame rate before any speed change; auto reads Premiere's original clip rate. |
 | *Advanced* ▸ View | Result · Motion vectors (hue = direction, colour strength = speed, full at 1% of frame width per source frame; still areas grey). Shows why a shot artefacts. |
 | *Advanced* ▸ Force CPU | Do everything on the CPU (troubleshooting). |
-| *Advanced* ▸ Write debug log | One line per rendered frame in `%TEMP%\OneEighty.log`: path (`hybrid` = CPU motion + GPU blur, `cpu`), frame formats, the frame rate / speed Premiere reports and source frames per output frame, timing plan, the two fetch times, motion and total ms. |
+| *Advanced* ▸ Write debug log | One line per rendered frame in `%TEMP%\OneEighty.log`: path (`hybrid` = CPU motion + GPU blur, `cpu`), frame formats, the frame rate / speed Premiere reports and source frames per output frame, timing plan and frame offset, how the fetched frames compare with Premiere's own, the fetch times, motion and total ms. |
 | *Advanced* ▸ Updates [Check for updates] | Checks now and shows the result in a Windows message box (offers to open the release page if newer). When a newer release is known, the Advanced group and this button are renamed ("Advanced - update available", "Update vX available") via `PF_UpdateParamUI`. |
 
 "Advanced" is a twirl-down group; Premiere ignores the start-collapsed flag, so
@@ -50,9 +50,20 @@ newer) and driver are present; otherwise everything runs on the CPU.
    speed).
 2. **Timing.** Exact frame timing: output time p (in source frames) lies
    between frames A = floor(p) and B = A+1. Off: Premiere's frame and its
-   neighbours one source interval away.
+   neighbours one source interval away. On some speed-changed clip instances
+   the computed A is one source frame away from the frame Premiere itself
+   shows (measured: a 30p file at 200%, where it hid the frame of a ball's
+   bounce). So on frames that sit exactly on a source frame the effect
+   compares Premiere's frame with A, learns the offset (±1) per effect
+   instance and shifts the plan; the debug log shows `offset` / `anchor`.
 3. **Motion.** Dense optical flow A→B and B→A (or cur→prev/next) with OpenCV
-   DIS on the CPU, at 960 px wide.
+   DIS on the CPU, at 960 px wide. DIS motion is smooth, so a fast object's
+   motion spills 20–40 px past its outline and the blur would smear the
+   background next to it (a court line beside a bouncing ball). Near motion
+   boundaries each pixel therefore takes the colour-weighted median motion of
+   nearby pixels (`RefineFlowEdges` in `MotionBlur.cpp`): background and line
+   pixels side with the background around them, object pixels with the
+   object. About +20 ms per UHD frame.
 4. **Blur.** Each pixel is averaged along its motion path over the missing
    shutter time (long smears sampled from downscaled copies), A blurred at the
    output time and B likewise, blended by closeness. CUDA when available
@@ -135,7 +146,8 @@ Raw BGRA frames in and out, processed as the effect does (`build\`):
 - `oe_gpu_offline in.bgra W H srcFps outFps out.bgra [mipThreshold]`: GPU path (DIS motion, CUDA blur)
 - `oe_update_test`: the update check against GitHub
 
-Environment: `OE_EXACT=0` exact frame timing off; `OE_QUALITY=high`; `OE_FLOAT=1`
+Environment: `OE_EXACT=0` exact frame timing off; `OE_QUALITY=high`; `OE_EDGEFIX=0`
+skip the motion-boundary clean-up; `OE_FLOAT=1`
 32-bit float (`2` on the GPU tool: input ×1.5 to check values above 1.0 pass
 through); GPU tool only: `OE_ARGB=1` ARGB bytes, `OE_VIEW=1` motion-vector view.
 

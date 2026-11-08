@@ -29,6 +29,7 @@ struct BlurSettings
     double centerOffset = 0.0;
     bool showVectors = false; // draw the motion field instead of blurring
     int disPreset = 2;        // cv::DISOpticalFlow preset (0 ultrafast, 1 fast, 2 medium)
+    bool refineEdges = true;  // clean up motion spilling past moving objects' outlines
 };
 
 struct BlurStats
@@ -46,13 +47,15 @@ double BlurHalfWidth(double srcFps, double outFps, double srcShutterDeg, double 
 // `flowWidth` and returned at that reduced size (CV_32FC2), in full-res pixels:
 // from(x) ~ to(x + f(x)). Used to feed the GPU blur in the hybrid path.
 // disPreset: cv::DISOpticalFlow::PRESET_ULTRAFAST / PRESET_FAST / PRESET_MEDIUM
+// refineEdges: clean up motion spilling past moving objects' outlines (see
+// RefineFlowEdges in MotionBlur.cpp).
 cv::Mat EstimateFlow(const cv::Mat& from, const cv::Mat& to, const ChannelOrder& order, int flowWidth,
-                     int disPreset = 2 /* PRESET_MEDIUM */);
+                     int disPreset = 2 /* PRESET_MEDIUM */, bool refineEdges = true);
 
 // Both directions between a and b (a->b and b->a, same convention as
 // EstimateFlow), each frame downscaled once.
 void EstimateFlowPair(const cv::Mat& a, const cv::Mat& b, const ChannelOrder& order, int flowWidth, cv::Mat& fab,
-                      cv::Mat& fba, int disPreset = 2 /* PRESET_MEDIUM */);
+                      cv::Mat& fba, int disPreset = 2 /* PRESET_MEDIUM */, bool refineEdges = true);
 
 // Colour for a motion vector (hue = direction, saturation = speed / norm), RGB 0..1.
 void VectorColour(float vx, float vy, float norm, float rgb[3]);

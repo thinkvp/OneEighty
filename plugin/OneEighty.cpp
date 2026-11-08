@@ -32,6 +32,7 @@
 #include <string>
 #include <chrono>
 #include <climits>
+#include <map>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -52,6 +53,7 @@ struct SourceInfo
     double mediaFps = 0;   // Premiere GetMediaFrameRate (= rate conformed to the timeline)
     double origFps = 0;    // Premiere GetOriginalClipFrameRate (= real source rate)
     double speed = 1.0;    // Premiere GetClipSpeed
+    A_long instanceId = -1; // Premiere GetFilterInstanceID (-1: unknown)
     const char* source = "";
 };
 
@@ -74,6 +76,9 @@ SourceInfo GetSourceInfo(PF_InData* in_data, PF_ParamDef* params[])
             double sp = 0;
             if (u->GetClipSpeed && u->GetClipSpeed(in_data->effect_ref, &sp) == PF_Err_NONE && sp != 0.0)
                 si.speed = std::fabs(sp);
+            A_long id = 0;
+            if (u->GetFilterInstanceID && u->GetFilterInstanceID(in_data->effect_ref, &id) == PF_Err_NONE)
+                si.instanceId = id;
             in_data->pica_basicP->ReleaseSuite(kPFUtilitySuite, kPFUtilitySuiteVersion);
         }
     }
@@ -302,7 +307,39 @@ double SampledDiff(const cv::Mat& a, const cv::Mat& b)
     return acc / (64.0 * 64.0 * 3.0);
 }
 
-std::atomic<int> gDiagRenders{0};
+// Exact frame timing works out which source frames to fetch from the effect's
+// time. On some speed-changed clip instances (measured: a 30p file at 200%)
+// that lands one source frame away from the frame Premiere itself shows at
+// that moment, so at a 2:1 cadence the ball that touches the ground in
+// Premiere's frame was shown just before / after the bounce. Per effect
+// instance we learn that offset (in source frames) by comparing Premiere's own
+// frame with the fetched ones, on frames that sit exactly on a source frame,
+// and shift the plan by it.
+struct FrameOffset
+{
+    int k = 0;          // source frames to add to the computed plan
+    int unexplained = 0; // mismatches no nearby frame explained (e.g. effects before this one)
+};
+std::mutex gOffsetMutex;
+std::map<A_long, FrameOffset> gOffsets;
+constexpr double kSameFrame = 0.6;    // SampledDiff of the same frame: 0 (allow 8-bit/float rounding)
+constexpr int kMaxUnexplained = 3;    // then stop probing for that instance
+
+FrameOffset GetFrameOffset(A_long id)
+{
+    if (id < 0)
+        return {};
+    std::lock_guard<std::mutex> lock(gOffsetMutex);
+    return gOffsets[id];
+}
+
+void SetFrameOffset(A_long id, const FrameOffset& o)
+{
+    if (id < 0)
+        return;
+    std::lock_guard<std::mutex> lock(gOffsetMutex);
+    gOffsets[id] = o;
+}
 
 PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output)
 {
@@ -342,19 +379,22 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     const long long dt = std::max<long long>(1, std::llround((double)S / clipRate));
 
     // Frame plan. Exact: interpolate between source frames A = floor(p) and
-    // B = A+1 around the output time p (source frames of clip time; assumes the
-    // clip's in-point sits on a source frame - otherwise the whole clip shifts
-    // by a constant < 1 frame, which keeps the cadence even).
-    // Otherwise: Premiere's frame plus neighbours one source interval away.
+    // B = A+1 around the output time p (source frames of clip time), shifted
+    // by the instance's learned offset (see FrameOffset). Otherwise:
+    // Premiere's frame plus neighbours one source interval away.
     const double p = (double)in_data->current_time / in_data->time_scale * clipRate;
     const double phase = p - std::floor(p + 1e-6);
     const bool pairPlan = exactTiming;
+    const bool onSourceFrame = phase < 1e-3 || phase > 1.0 - 1e-3; // 2:1 cadences (200%, 50p -> 25p)
+    FrameOffset offs = pairPlan && in_data->appl_id == kAppID_Premiere ? GetFrameOffset(si.instanceId) : FrameOffset{};
+    // checkout time for a position in source frames relative to the output time
+    auto at = [&](double frames) { return T + std::llround(frames * (double)S / clipRate); };
     long long t1, t2; // checkout times (units of S)
     if (pairPlan)
     {
         // a quarter frame past each frame's timestamp: robust to round/floor
-        t1 = T + std::llround((-phase + 0.25) * (double)S / clipRate);
-        t2 = T + std::llround((1.0 - phase + 0.25) * (double)S / clipRate);
+        t1 = at(-phase + 0.25 + offs.k);
+        t2 = at(1.0 - phase + 0.25 + offs.k);
     }
     else
     {
@@ -362,32 +402,84 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         t2 = T + dt;
     }
 
-    PF_ParamDef d1, d2;
-    AEFX_CLR_STRUCT(d1);
-    AEFX_CLR_STRUCT(d2);
-    const auto tFetch0 = Clock::now();
-    const PF_Err e1 = PF_CHECKOUT_PARAM(in_data, OE_INPUT, (A_long)t1, (A_long)dt, (A_u_long)S, &d1);
-    const auto tFetch1 = Clock::now();
-    const PF_Err e2 = PF_CHECKOUT_PARAM(in_data, OE_INPUT, (A_long)t2, (A_long)dt, (A_u_long)S, &d2);
-    const auto tFetch2 = Clock::now();
-    const double fetch1Ms = std::chrono::duration<double, std::milli>(tFetch1 - tFetch0).count();
-    const double fetch2Ms = std::chrono::duration<double, std::milli>(tFetch2 - tFetch1).count();
-    const double fetchMs = fetch1Ms + fetch2Ms;
-    const bool have1 = !e1 && Valid(&d1.u.ld) && SameSize(&d1.u.ld, curW);
-    const bool have2 = !e2 && Valid(&d2.u.ld) && SameSize(&d2.u.ld, curW);
-
     // Premiere can hand the input, the checked-out frames and the output in
     // different formats (seen: input BGRA, checkouts ARGB). Bring every frame
     // into the output's byte order and bit depth (8-bit or 32-bit float).
-    unsigned fourcc = 0, fcIn = 0, fc1 = 0, fc2 = 0;
+    unsigned fourcc = 0, fcIn = 0;
     const oe::ChannelOrder order = PixelOrder(in_data, output, &fourcc);
     const oe::ChannelOrder ordIn = PixelOrder(in_data, curW, &fcIn);
-    const oe::ChannelOrder ord1 = have1 ? PixelOrder(in_data, &d1.u.ld, &fc1) : order;
-    const oe::ChannelOrder ord2 = have2 ? PixelOrder(in_data, &d2.u.ld, &fc2) : order;
     const bool outFloat = IsFloatFormat(fourcc);
     const cv::Mat cur = Conform(Wrap(curW, IsFloatFormat(fcIn)), ordIn, order, outFloat);
-    const cv::Mat m1 = have1 ? Conform(Wrap(&d1.u.ld, IsFloatFormat(fc1)), ord1, order, outFloat) : cv::Mat();
-    const cv::Mat m2 = have2 ? Conform(Wrap(&d2.u.ld, IsFloatFormat(fc2)), ord2, order, outFloat) : cv::Mat();
+
+    // Checked-out frames (all checked in at the end).
+    struct Fetched
+    {
+        PF_ParamDef def;
+        bool ok = false;
+        unsigned fc = 0;
+        cv::Mat m;
+    };
+    Fetched pool[4];
+    int nPool = 0;
+    double fetchMs = 0;
+    auto fetch = [&](long long t) -> Fetched* {
+        Fetched* f = &pool[nPool++];
+        AEFX_CLR_STRUCT(f->def);
+        const auto tf = Clock::now();
+        const PF_Err e = PF_CHECKOUT_PARAM(in_data, OE_INPUT, (A_long)t, (A_long)dt, (A_u_long)S, &f->def);
+        fetchMs += std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
+        f->ok = !e && Valid(&f->def.u.ld) && SameSize(&f->def.u.ld, curW);
+        if (f->ok)
+        {
+            const oe::ChannelOrder o = PixelOrder(in_data, &f->def.u.ld, &f->fc);
+            f->m = Conform(Wrap(&f->def.u.ld, IsFloatFormat(f->fc)), o, order, outFloat);
+        }
+        return f;
+    };
+    const auto tFetch0 = Clock::now();
+    Fetched* fA = fetch(t1);
+    const double fetch1Ms = std::chrono::duration<double, std::milli>(Clock::now() - tFetch0).count();
+    Fetched* fB = fetch(t2);
+    const double fetch2Ms = fetchMs - fetch1Ms;
+
+    // Anchor exact timing on Premiere's own frame (see FrameOffset).
+    const char* anchor = "";
+    if (pairPlan && onSourceFrame && fA->ok && fB->ok && si.instanceId >= 0 &&
+        offs.unexplained < kMaxUnexplained && SampledDiff(cur, fA->m) >= kSameFrame)
+    {
+        if (SampledDiff(cur, fB->m) < kSameFrame) // Premiere is one frame later: A := B, fetch a new B
+        {
+            fA = fB;
+            fB = fetch(at(2.0 - phase + 0.25 + offs.k));
+            offs.k += 1;
+            offs.unexplained = 0;
+            anchor = " anchor:+1";
+        }
+        else
+        {
+            Fetched* fP = fetch(at(-1.0 - phase + 0.25 + offs.k));
+            if (fP->ok && SampledDiff(cur, fP->m) < kSameFrame) // one frame earlier: B := A, A := previous
+            {
+                fB = fA;
+                fA = fP;
+                offs.k -= 1;
+                offs.unexplained = 0;
+                anchor = " anchor:-1";
+            }
+            else
+            {
+                ++offs.unexplained;
+                anchor = " anchor:unexplained";
+            }
+        }
+        if (offs.k < -2 || offs.k > 2) // never drift far: start over
+            offs = FrameOffset{};
+        SetFrameOffset(si.instanceId, offs);
+    }
+    const bool have1 = fA->ok, have2 = fB->ok;
+    const cv::Mat& m1 = fA->m;
+    const cv::Mat& m2 = fB->m;
+    const unsigned fc1 = fA->fc;
     cv::Mat out = Wrap(output, outFloat);
     char fmts[48];
     auto cc = [](unsigned f, int i) { return f ? (char)(f >> (8 * i)) : '?'; };
@@ -514,15 +606,15 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     }
     const double computeMs = std::chrono::duration<double, std::milli>(Clock::now() - tCompute0).count();
 
-    // Diagnostics for the first renders: which fetched frame equals Premiere's
-    // own frame at this time (expect cur == A for a pair plan).
-    char diag[128] = "";
-    if (log && have1 && have2 && gDiagRenders.fetch_add(1) < 30)
-        snprintf(diag, sizeof(diag), " | diff cur-d1=%.2f cur-d2=%.2f d1-d2=%.2f", SampledDiff(cur, m1),
-                 SampledDiff(cur, m2), SampledDiff(m1, m2));
+    // Diagnostics (debug log only): how the fetched frames compare with
+    // Premiere's own frame at this time (expect cur == A for a pair plan).
+    char diag[160] = "";
+    if (log && have1 && have2)
+        snprintf(diag, sizeof(diag), " | offset %+d%s | diff cur-A=%.2f cur-B=%.2f A-B=%.2f", offs.k, anchor,
+                 SampledDiff(cur, m1), SampledDiff(cur, m2), SampledDiff(m1, m2));
 
-    ERR2(PF_CHECKIN_PARAM(in_data, &d1));
-    ERR2(PF_CHECKIN_PARAM(in_data, &d2));
+    for (int i = 0; i < nPool; ++i)
+        ERR2(PF_CHECKIN_PARAM(in_data, &pool[i].def));
 
     if (log)
     {

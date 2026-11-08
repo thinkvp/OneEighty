@@ -86,10 +86,12 @@ at 180° records), PSNR, higher is better:
 
 - **Edges:** where a subject moves against a differently moving background,
   optical flow can't know which is in front, so edges can smear or tear slightly.
-  Quality High helps; masks are the fallback.
+  OneEighty keeps a fast object's motion from spilling onto the background next
+  to it (e.g. a court line beside a bouncing ball); Quality High helps further;
+  masks are the fallback.
 - **Speed:** frame fetching from long-GOP files dominates; use proxies to preview.
-- **Exact frame timing** assumes a constant source frame rate and a clip in-point
-  on a source frame.
+- **Exact frame timing** assumes a constant source frame rate. It keeps to the
+  frames Premiere itself shows (on sped-up clips too).
 - **Speed changes:** constant speeds work (e.g. 200%); reversed clips and speed
   ramps (keyframed time remapping) aren't supported.
 - Tested in **Premiere Pro on Windows with an NVIDIA RTX 4070**. The plugin also

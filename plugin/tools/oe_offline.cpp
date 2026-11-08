@@ -6,6 +6,7 @@
 //                    neighbours (default: on, two-frame interpolation)
 //   OE_QUALITY=high  DIS MEDIUM preset (default: Normal, DIS FAST)
 //   OE_FLOAT=1       run as 32-bit float (Premiere 32-bit), write 8-bit
+//   OE_EDGEFIX=0     skip the motion-boundary clean-up (RefineFlowEdges)
 #include "../MotionBlur.h"
 
 #include <opencv2/video/tracking.hpp> // DIS presets
@@ -58,6 +59,7 @@ int main(int argc, char** argv)
     oe::BlurSettings s;
     s.halfWidth = oe::BlurHalfWidth(srcFps, outFps, srcSh, tgtSh);
     s.disPreset = Env("OE_QUALITY") == 'h' ? cv::DISOpticalFlow::PRESET_MEDIUM : cv::DISOpticalFlow::PRESET_FAST;
+    s.refineEdges = Env("OE_EDGEFIX") != '0';
     if (argc > 9)
         s.mipThreshold = std::atoi(argv[9]); // 0 = exact (no mip levels)
     std::printf("%zu source frames, halfWidth=%.4f, %s timing\n", src.size(), s.halfWidth, exact ? "exact" : "nearest");
