@@ -37,7 +37,9 @@ Studios can switch the automatic check off with the environment variable
 
 **Requirements:** Windows 10/11 64-bit and Premiere Pro (tested with Premiere Pro
 2026 / 26.x). An NVIDIA GeForce RTX 20-series or newer GPU is strongly recommended;
-without one the effect still works, on the CPU, but much more slowly.
+without one the effect still works, on the CPU, but much more slowly. Quality
+**Extra High** needs the NVIDIA GPU (its driver includes the Vulkan support it
+uses); without it, Extra High renders as High.
 
 ## Using it
 
@@ -46,7 +48,7 @@ Drop the effect on a 50p / 59.94p clip (at 100% speed) in a 25p sequence. Sped-u
 | Control | |
 |---|---|
 | **Shutter angle** | The blur to simulate at the timeline rate. 180° is the classic film look; 360° is the maximum smear. The slider starts at 90°: the footage already has that much blur (50p shot at 180° = 90° at 25p; 75° for 59.94p), so lower settings add nothing. You can still type 0–720. |
-| **Quality** | **Normal** (default): best balance. **High**: cleaner edges where people pass in front of the background, slower. |
+| **Quality** | **Normal** (default): best balance. **High**: cleaner edges where people pass in front of the background, slower. **Extra High**: builds 8 in-between frames per output frame with the RIFE neural network and averages them, like a real shutter: clean backgrounds next to fast objects (no smudged court lines beside a bouncing ball) and a natural streak on the object. About 4× slower than High. Works on 10-bit / log / 32-bit footage at full precision. |
 | **Exact frame timing** | On (default): even motion for 59.94p → 25p. Makes no difference for 50p → 25p. |
 | *Advanced* | Source shutter angle and frame rate (auto by default), a **motion-vector view** that shows what the effect is tracking, Force CPU, a debug log (`%TEMP%\OneEighty.log`), and update checks. |
 
@@ -59,10 +61,11 @@ Drop the effect on a 50p / 59.94p clip (at 100% speed) in a 25p sequence. Sped-u
 - For 10-bit, log or graded footage, tick **Render at Maximum Depth** when
   exporting: the effect then works in 32-bit float end to end.
 - Problem area on a shot (e.g. an edge that tears)? Mask the effect in Premiere,
-  or try Quality **High**.
+  or try Quality **High** or **Extra High**.
 
 **Speed** (RTX 4070, UHD 59.94p on a 25p timeline, per frame): about **0.27 s**
 with ProRes source at Normal quality, about 1.2 s with long-GOP camera files.
+Extra High adds about 0.3 s per frame (UHD, measured offline).
 
 ## How well does it work?
 
@@ -75,12 +78,13 @@ at 180° records), PSNR, higher is better:
 | OneEighty, exact frame timing off | 30.5 dB | 9.8 px |
 | **OneEighty, Normal, exact timing on** | **38.1 dB** | **0.16 px** |
 | OneEighty, High, exact timing on | 38.6 dB | 0.14 px |
+| OneEighty, Extra High, exact timing on | 40.4 dB | 0.24 px |
 
 | 50p → 25p | Accuracy |
 |---|---|
 | Premiere (frame dropping) | 28.1 dB |
 | 2-frame blend (Echo / nested-sequence trick) | 24.1 dB |
-| **OneEighty** (Normal / High) | **38.8 / 39.2 dB** |
+| **OneEighty** (Normal / High / Extra High) | **38.8 / 39.2 / 40.5 dB** |
 
 ## Known limitations
 
@@ -105,7 +109,8 @@ In short:
 1. Visual Studio 2022 Build Tools (C++ workload) and the CUDA Toolkit 13.x.
 2. The Adobe After Effects SDK (free from [developer.adobe.com](https://developer.adobe.com/after-effects/),
    Adobe licence, not included) unzipped to `sdk\ae` (containing `Examples\`).
-3. `deps\setup_opencv.bat` (fetches and builds static OpenCV via vcpkg).
+3. `deps\setup_opencv.bat` (fetches and builds static OpenCV and ncnn via vcpkg)
+   and `deps\setup_rife.bat` (downloads the RIFE model for Extra High).
 4. `plugin\build.bat` → `plugin\build\OneEighty.aex`. For development,
    `plugin\install.bat` (once, as admin) links Premiere's plug-in folder to the
    build folder.
@@ -114,14 +119,15 @@ In short:
 
 | Folder | |
 |---|---|
-| `plugin/` | The effect (C++): After Effects SDK host code, CUDA engine (`gpu/`), CPU maths (`MotionBlur.cpp`), offline test tools (`tools/`) |
+| `plugin/` | The effect (C++): After Effects SDK host code, CUDA engine (`gpu/`), RIFE via ncnn for Extra High (`rife/`), CPU maths (`MotionBlur.cpp`), offline test tools (`tools/`) |
 | `prototype/` | Python reference implementation, synthetic ground-truth clips and the validation scripts behind the numbers above |
 | `release/` | Installer scripts and release packaging |
 | `deps/` | Dependency setup scripts |
+| `third_party/` | Licences and reference sources of the RIFE components |
 
 ## Licence
 
-MIT, see [LICENSE](LICENSE). The release binary includes OpenCV, zlib and the
-NVIDIA CUDA runtime; see
+MIT, see [LICENSE](LICENSE). The release binary includes OpenCV, zlib, the
+NVIDIA CUDA runtime, ncnn and glslang, and ships the RIFE v4.6 model; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Not affiliated with Adobe or
 NVIDIA.

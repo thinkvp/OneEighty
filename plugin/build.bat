@@ -1,7 +1,7 @@
 @echo off
 rem Builds build\OneEighty.aex (x64 Release) plus the offline test tools, with
 rem the VS 2022 Build Tools and the CUDA toolkit.
-rem One-time setup: ..\deps\setup_opencv.bat.
+rem One-time setup: ..\deps\setup_opencv.bat (OpenCV, ncnn) and ..\deps\setup_rife.bat (model).
 setlocal
 cd /d "%~dp0"
 set "PATH=%PATH%;C:\Program Files (x86)\Microsoft Visual Studio\Installer"
@@ -19,6 +19,10 @@ set CFLAGS=/nologo /c /O2 /EHsc /MD /W3 /WX /std:c++17 /DMSWindows /DWIN32 /D_WI
 set AEINC=/I "%SDK%\Headers" /I "%SDK%\Headers\SP" /I "%SDK%\Util" /I "%SDK%\Resources"
 set CVLIBS="%CV%\lib\opencv_video4.lib" "%CV%\lib\opencv_imgproc4.lib" "%CV%\lib\opencv_core4.lib" "%CV%\lib\zs.lib"
 set CUDALIBS="%CUDA_PATH%\lib\x64\cudart_static.lib" "%CUDA_PATH%\lib\x64\cuda.lib"
+rem ncnn with Vulkan (loads the driver's vulkan-1.dll at runtime) + glslang for its shaders
+set NCNNINC=/I "%CV%\include\ncnn"
+set NCNNLIBS="%CV%\lib\ncnn.lib" "%CV%\lib\glslang.lib" "%CV%\lib\SPIRV.lib" "%CV%\lib\MachineIndependent.lib" ^
+   "%CV%\lib\GenericCodeGen.lib" "%CV%\lib\OSDependent.lib" "%CV%\lib\glslang-default-resource-limits.lib"
 
 echo [1/5] PiPL resource
 cl /nologo /I "%SDK%\Headers" /EP OneEightyPiPL.r > "%OBJ%\OneEightyPiPL.rr" || exit /b 1
@@ -28,6 +32,7 @@ rc /nologo /fo "%OBJ%\OneEightyPiPL.res" "%OBJ%\OneEightyPiPL.rc" || exit /b 1
 
 echo [2/5] Compile C++
 cl %CFLAGS% %AEINC% /Fo"%OBJ%\\" OneEighty.cpp MotionBlur.cpp Log.cpp UpdateCheck.cpp tools\oe_offline.cpp tools\oe_gpu_offline.cpp tools\oe_update_test.cpp || exit /b 1
+cl %CFLAGS% %NCNNINC% /Fo"%OBJ%\\" rife\RifeFlow.cpp rife\RifeShutter.cpp || exit /b 1
 
 echo [3/5] Compile CUDA
 "%CUDA_PATH%\bin\nvcc.exe" -c -O3 -std=c++17 -Xcompiler "/MD /EHsc /W3" ^
@@ -39,13 +44,22 @@ echo [4/5] Link offline test tools
 link /nologo /OUT:"%OUT%\oe_offline.exe" "%OBJ%\oe_offline.obj" "%OBJ%\MotionBlur.obj" %CVLIBS% || exit /b 1
 link /nologo /OUT:"%OUT%\oe_update_test.exe" "%OBJ%\oe_update_test.obj" "%OBJ%\UpdateCheck.obj" "%OBJ%\Log.obj" winhttp.lib || exit /b 1
 link /nologo /OUT:"%OUT%\oe_gpu_offline.exe" "%OBJ%\oe_gpu_offline.obj" "%OBJ%\GpuMotionBlur.obj" "%OBJ%\MotionBlur.obj" ^
-   %CVLIBS% %CUDALIBS% || exit /b 1
+   "%OBJ%\RifeFlow.obj" "%OBJ%\RifeShutter.obj" %CVLIBS% %CUDALIBS% %NCNNLIBS% || exit /b 1
+
+rem RIFE model for Quality "Extra High", next to the plugin
+if exist "%~dp0..\deps\rife\rife-v4.6\flownet.bin" (
+    if not exist "%OUT%\rife-v4.6" mkdir "%OUT%\rife-v4.6"
+    copy /y "%~dp0..\deps\rife\rife-v4.6\flownet.*" "%OUT%\rife-v4.6\" >nul || exit /b 1
+) else (
+    echo WARNING: ..\deps\setup_rife.bat not run: Extra High will fall back to High
+)
 
 echo [5/5] Link plugin
 rem CUDA 13's cuda.lib/cudart_static load the NVIDIA driver at runtime (no nvcuda.dll import),
 rem so the plugin still loads, CPU-only, on machines without NVIDIA.
 link /nologo /DLL /OUT:"%OUT%\OneEighty.aex" /IMPLIB:"%OBJ%\OneEighty.lib" ^
    "%OBJ%\OneEighty.obj" "%OBJ%\MotionBlur.obj" "%OBJ%\Log.obj" "%OBJ%\UpdateCheck.obj" "%OBJ%\GpuMotionBlur.obj" ^
-   "%OBJ%\OneEightyPiPL.res" %CVLIBS% %CUDALIBS% kernel32.lib user32.lib shell32.lib winhttp.lib || exit /b 1
+   "%OBJ%\RifeFlow.obj" "%OBJ%\RifeShutter.obj" "%OBJ%\OneEightyPiPL.res" %CVLIBS% %CUDALIBS% %NCNNLIBS% ^
+   kernel32.lib user32.lib shell32.lib winhttp.lib || exit /b 1
 
 echo BUILD OK: %OUT%\OneEighty.aex

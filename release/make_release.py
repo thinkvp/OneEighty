@@ -4,8 +4,8 @@
     python release/make_release.py
 
 -> dist/OneEighty-v<version>-setup.exe   Inno Setup installer (needs Inno Setup 6)
--> dist/OneEighty-v<version>-win64.zip   manual install: .aex + install/uninstall
-                                         scripts, README.txt, LICENSE, notices
+-> dist/OneEighty-v<version>-win64.zip   manual install: .aex + RIFE model + install/
+                                         uninstall scripts, README.txt, LICENSE, notices
 The version is read from plugin/OneEightyParams.h.
 """
 import os
@@ -18,11 +18,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 REL = ROOT / "release"
 AEX = ROOT / "plugin" / "build" / "OneEighty.aex"
+MODEL = ROOT / "plugin" / "build" / "rife-v4.6"  # Quality "Extra High" (deps/setup_rife.bat, copied by build.bat)
 
 params = (ROOT / "plugin" / "OneEightyParams.h").read_text(encoding="utf-8")
 ver = ".".join(re.search(rf"#define {k}\s+(\d+)", params).group(1) for k in ("MAJOR_VERSION", "MINOR_VERSION", "BUG_VERSION"))
 if not AEX.exists():
     raise SystemExit(f"{AEX} not found - run plugin\\build.bat first")
+if not (MODEL / "flownet.bin").exists() or not (MODEL / "flownet.param").exists():
+    raise SystemExit(f"{MODEL} incomplete - run deps\\setup_rife.bat, then plugin\\build.bat")
 
 dist = ROOT / "dist"
 dist.mkdir(exist_ok=True)
@@ -34,6 +37,8 @@ out = dist / f"OneEighty-v{ver}-win64.zip"
 folder = f"OneEighty-v{ver}"
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     z.write(AEX, f"{folder}/OneEighty.aex")
+    for name in ("flownet.param", "flownet.bin"):
+        z.write(MODEL / name, f"{folder}/rife-v4.6/{name}")
     for name in ("Install OneEighty.bat", "Uninstall OneEighty.bat"):
         z.write(REL / name, f"{folder}/{name}")
     z.write(dist / "README.txt", f"{folder}/README.txt")

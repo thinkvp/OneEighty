@@ -20,7 +20,7 @@ enum
 {
     OE_INPUT = 0,
     OE_TARGET_SHUTTER, // "Shutter angle": the look to simulate at the timeline rate
-    OE_QUALITY,        // Normal / High
+    OE_QUALITY,        // Normal / High / Extra High
     OE_EXACT_TIMING,
     OE_ADV_START,      // ---- "Advanced" (collapsed)
     OE_SRC_SHUTTER,
@@ -72,11 +72,14 @@ enum
 {
     OE_QUALITY_NORMAL = 1,
     OE_QUALITY_HIGH,
-    OE_QUALITY_COUNT = OE_QUALITY_HIGH
+    OE_QUALITY_EXTRA,
+    OE_QUALITY_COUNT = OE_QUALITY_EXTRA
 };
-// Motion estimated on the CPU (OpenCV DIS at 960 px): Normal = FAST preset,
-// High = MEDIUM preset (cleaner edges, slower).
-#define OE_QUALITY_CHOICES "Normal|High"
+// Normal / High: motion estimated on the CPU (OpenCV DIS at 960 px, FAST /
+// MEDIUM preset), blur on the GPU. Extra High: the shutter integrated from RIFE
+// in-between frames (GPU via Vulkan + CUDA); falls back to High without them.
+// Appended last so projects saved with Normal / High keep their setting.
+#define OE_QUALITY_CHOICES "Normal|High|Extra High"
 
 namespace oe
 {

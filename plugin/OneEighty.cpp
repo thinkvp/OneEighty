@@ -23,6 +23,7 @@
 #include "MotionBlur.h"
 #include "gpu/GpuMotionBlur.h"
 #include "UpdateCheck.h"
+#include "rife/RifeShutter.h"
 
 #include <opencv2/video/tracking.hpp> // DIS presets
 
@@ -259,6 +260,28 @@ oe::gpu::Engine* HybridEngine()
     return gEngine.get();
 }
 
+// Quality Extra High: RIFE on the GPU through Vulkan (rife/RifeFlow.h), model
+// in rife-v4.6 next to the plugin. Created on first use; a failure is
+// remembered (Extra High then renders as High).
+std::unique_ptr<oe::rife::Engine> gRife;
+bool gRifeTried = false;
+
+oe::rife::Engine* RifeEngine()
+{
+    std::lock_guard<std::mutex> lock(gEngineMutex);
+    if (!gRifeTried)
+    {
+        gRifeTried = true;
+        std::string err;
+        gRife = oe::rife::Engine::Create(oe::rife::DefaultModelDir(), &err);
+        if (gRife)
+            Log("[extra] RIFE ready");
+        else
+            Log("[extra] RIFE unavailable (%s) -> Extra High renders as High", err.c_str());
+    }
+    return gRife.get();
+}
+
 bool SameOrder(const oe::ChannelOrder& a, const oe::ChannelOrder& b)
 {
     return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
@@ -419,7 +442,7 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         unsigned fc = 0;
         cv::Mat m;
     };
-    Fetched pool[4];
+    Fetched pool[6]; // A, B, an anchor probe, and Extra High's frames before A / after B
     int nPool = 0;
     double fetchMs = 0;
     auto fetch = [&](long long t) -> Fetched* {
@@ -493,11 +516,13 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     const int q = params[OE_QUALITY]->u.pd.value;
     const bool vectors = view == OE_VIEW_VECTORS;
 
-    // Motion from OpenCV DIS on the CPU (copes with fine repeating patterns);
-    // the blur on the GPU when there is one (the expensive part at UHD), else CPU.
+    // Normal / High: motion from OpenCV DIS on the CPU (copes with fine repeating
+    // patterns); the blur on the GPU when there is one (the expensive part at
+    // UHD), else CPU. Extra High: the shutter from RIFE in-between frames on the
+    // GPU (rife/RifeShutter.h); it falls back to High without RIFE or CUDA.
     // Normal: DIS FAST preset (17 ms/pair at UHD, -0.4 dB on the synthetic test);
     // High: DIS MEDIUM (41 ms/pair; cleaner edges where people cross the background).
-    const int disPreset = q == OE_QUALITY_HIGH ? cv::DISOpticalFlow::PRESET_MEDIUM : cv::DISOpticalFlow::PRESET_FAST;
+    const int disPreset = q == OE_QUALITY_NORMAL ? cv::DISOpticalFlow::PRESET_FAST : cv::DISOpticalFlow::PRESET_MEDIUM;
     constexpr int kFlowWidth = 960; // motion analysis width
     oe::gpu::Engine* eng = nullptr;
     const bool bgra = order.b == 0 && order.g == 1 && order.r == 2;
@@ -516,9 +541,50 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     std::string gerr;
     bool done = false;
     const bool pair = pairPlan && have1 && have2;
+    oe::rife::ShutterStats rstats;
     try
     {
-        if (eng)
+        if (q == OE_QUALITY_EXTRA && eng && have2)
+        {
+            if (oe::rife::Engine* rife = RifeEngine())
+            {
+                oe::rife::ShutterFrames sf;
+                double t = 0;
+                if (pair) // exact timing: the output time lies `phase` of the way from A to B
+                {
+                    sf.A = &m1;
+                    sf.B = &m2;
+                    t = phase;
+                    if (oe::rife::NeedsPrev(t, hw))
+                    {
+                        const Fetched* fp = fetch(at(-1.0 - phase + 0.25 + offs.k));
+                        if (fp->ok)
+                            sf.P = &fp->m;
+                    }
+                    if (oe::rife::NeedsNext(t, hw))
+                    {
+                        const Fetched* fn = fetch(at(2.0 - phase + 0.25 + offs.k));
+                        if (fn->ok)
+                            sf.N = &fn->m;
+                    }
+                }
+                else // Premiere's frame with its neighbours
+                {
+                    sf.A = &cur;
+                    sf.B = &m2;
+                    if (have1)
+                        sf.P = &m1;
+                }
+                constexpr int kSamples = 8;           // validated offline (8 = 40.5 dB on the 50p test)
+                constexpr int kRifePixels = 2100000;  // RIFE analysis size: about 1920 x 1080
+                done = oe::rife::RenderShutter(*rife, *eng, sf, order, argb && !outFloat, t, hw, kSamples, kRifePixels,
+                                               vectors, out.data, out.step, &rstats, &gerr);
+                path = done ? "extra" : "hybrid (extra failed)";
+            }
+            else
+                path = "hybrid (no RIFE)";
+        }
+        if (eng && !done)
         {
             oe::gpu::Settings gs;
             gs.halfWidth = hw;
@@ -619,15 +685,19 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     if (log)
     {
         const double totalMs = std::chrono::duration<double, std::milli>(Clock::now() - tStart).count();
+        char extraInfo[96] = "";
+        if (rstats.samples)
+            snprintf(extraInfo, sizeof(extraInfo), " | extra: %d samples from %d pair(s), RIFE %.0fms, warp %.1fms",
+                     rstats.samples, rstats.pairs, rstats.rifeMs, rstats.gpuMs);
         Log("[%s] render%s%s%s forceCpu=%d t=%d/%u view=%d %dx%d %s | srcFps=%.3f (%s) speed=%.2f timeline=%.3f "
             "(src frames/out %.2f; host orig=%.3f media=%.3f) | "
             "timing=%s p=%.3f a=%.3f d1:%s d2:%s | halfWidth=%.3f q=%d | fetch=%.1fms (d1 %.1fms, d2 %.1fms) compute=%.1fms "
-            "(cpu motion %.1fms) total=%.1fms%s%s%s",
+            "(cpu motion %.1fms) total=%.1fms%s%s%s%s",
             path, *why ? " (" : "", why, *why ? ")" : "", forceCpu ? 1 : 0, in_data->current_time, in_data->time_scale, view,
             output->width, output->height, fmts, si.fps, si.source, si.speed, timelineFps, srcRate / timelineFps,
             si.origFps, si.mediaFps, pair ? "exact-pair" : "nearest", p, pair ? phase : 0.0,
             have1 ? "ok" : "MISSING", have2 ? "ok" : "MISSING", hw, q, fetchMs, fetch1Ms, fetch2Ms,
-            computeMs, disMs, totalMs, diag, gerr.empty() ? "" : " gpu error: ", gerr.c_str());
+            computeMs, disMs, totalMs, extraInfo, diag, gerr.empty() ? "" : " gpu error: ", gerr.c_str());
     }
     return err ? err : err2;
 }

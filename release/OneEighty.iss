@@ -48,11 +48,14 @@ UninstallDisplayIcon={app}\unins000.exe
 
 [Files]
 Source: "{#RootDir}\plugin\build\OneEighty.aex"; DestDir: "{#PluginDir}"; Flags: ignoreversion
+; RIFE model for Quality "Extra High"
+Source: "{#RootDir}\plugin\build\rife-v4.6\*"; DestDir: "{#PluginDir}\rife-v4.6"; Flags: ignoreversion
 Source: "{#RootDir}\dist\README.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "{#RootDir}\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "{#RootDir}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [UninstallDelete]
+Type: dirifempty; Name: "{#PluginDir}\rife-v4.6"
 Type: dirifempty; Name: "{#PluginDir}"
 
 [Messages]

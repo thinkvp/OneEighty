@@ -11,13 +11,13 @@ whenever Premiere would drop frames: clips at 100% speed, and slowed-down files
 | Control | Meaning |
 |---|---|
 | **Shutter angle** | Look to simulate at the timeline rate (default 180°; 360° = maximum smear). Slider 90–360 (typed 0–720): at or below the footage's own exposure (source angle × timeline fps ÷ source frames per timeline second) `BlurHalfWidth` returns 0. |
-| **Quality** | Motion is estimated on the CPU with OpenCV DIS at 960 px wide; the blur runs on the GPU. **Normal** (default): DIS FAST preset. **High**: DIS MEDIUM preset; ~2.4× the motion time, cleaner edges where people pass in front of the background. |
+| **Quality** | **Normal** (default) / **High**: motion estimated on the CPU with OpenCV DIS at 960 px wide (FAST / MEDIUM preset; High ~2.4× the motion time, cleaner edges where people pass in front of the background), blur on the GPU. **Extra High**: the shutter integrated from 8 RIFE in-between frames (see below); falls back to High without CUDA, Vulkan or the model. Appended to the popup, so saved Normal / High settings are unchanged. |
 | **Exact frame timing** | On (default): each output frame is built at its exact timeline moment from the two source frames either side, so motion advances evenly (removes the 2/3-frame judder of 59.94p → 25p). Off: Premiere's own frame choice, blur only. No visible difference for 50p → 25p. |
 | *Advanced* ▸ Source shutter angle | Shutter the footage was shot with (default 180°). |
 | *Advanced* ▸ Source fps (0 = auto) | The clip's frame rate before any speed change; auto reads Premiere's original clip rate. |
 | *Advanced* ▸ View | Result · Motion vectors (hue = direction, colour strength = speed, full at 1% of frame width per source frame; still areas grey). Shows why a shot artefacts. |
 | *Advanced* ▸ Force CPU | Do everything on the CPU (troubleshooting). |
-| *Advanced* ▸ Write debug log | One line per rendered frame in `%TEMP%\OneEighty.log`: path (`hybrid` = CPU motion + GPU blur, `cpu`), frame formats, the frame rate / speed Premiere reports and source frames per output frame, timing plan and frame offset, how the fetched frames compare with Premiere's own, the fetch times, motion and total ms. |
+| *Advanced* ▸ Write debug log | One line per rendered frame in `%TEMP%\OneEighty.log`: path (`hybrid` = CPU motion + GPU blur, `extra` = RIFE, `cpu`), frame formats, the frame rate / speed Premiere reports and source frames per output frame, timing plan and frame offset, how the fetched frames compare with Premiere's own, the fetch times, motion and total ms. |
 | *Advanced* ▸ Updates [Check for updates] | Checks now and shows the result in a Windows message box (offers to open the release page if newer). When a newer release is known, the Advanced group and this button are renamed ("Advanced - update available", "Update vX available") via `PF_UpdateParamUI`. |
 
 "Advanced" is a twirl-down group; Premiere ignores the start-collapsed flag, so
@@ -37,6 +37,19 @@ button always works).
 
 The GPU is used automatically when an NVIDIA GPU (RTX 20-series / Turing or
 newer) and driver are present; otherwise everything runs on the CPU.
+
+**Extra High** (`rife/`): for each output frame, 8 samples are spread evenly
+over the shutter window around the output time; each sample is an in-between
+frame from the RIFE v4.6 network (Practical-RIFE, MIT) between the two source
+frames around its time (the frame before A / after B are fetched when the
+window reaches them), and the samples are averaged. The network runs with ncnn
+on the GPU through Vulkan (`RifeFlow.cpp`, which also carries RIFE's custom
+Warp layer). It only supplies the motion and the blend mask (the network's own
+last step is `mask × warp(frame0) + (1 − mask) × warp(frame1)`): the warping and
+blending are done in CUDA on the original frames (`KRifeAccum`), so 10-bit /
+log / 32-bit float footage keeps full precision and values above 1.0 pass
+through (float and 8-bit renders agree to 102 dB; input ×1.5 → output max
+1.500). RIFE sees an RGB copy clamped to 0..1, scaled to at most ~2.1 MP.
 
 ## How it works
 
@@ -93,9 +106,11 @@ Synthetic clips with a known-correct answer (`../prototype`), PSNR vs a real
 | Blur only (exact timing off) | 30.5 dB | 26.0 dB | 9.8 px |
 | Exact timing, Normal | 38.1 dB | 35.0 dB | 0.16 px |
 | Exact timing, High | 38.6 dB | 35.4 dB | 0.14 px |
+| Exact timing, Extra High | 40.4 dB | 37.4 dB | 0.24 px |
 
-50p → 25p: Premiere 28.1 dB, Normal 38.8 dB, High 39.2 dB. GPU and CPU paths
-agree (`validate_cadence.py`).
+50p → 25p: Premiere 28.1 dB, Normal 38.8 dB, High 39.2 dB, Extra High 40.5 dB.
+GPU and CPU paths agree (`validate_cadence.py`). Extra High offline at UHD
+(RTX 4070): ~0.34 s RIFE + 0.035 s warping per frame (High: ~0.08 s).
 
 Premiere 26, RTX 4070, UHD on a 25p timeline, per frame:
 
@@ -123,19 +138,25 @@ the two directions in parallel gave no gain (DIS already uses all cores).
 - *Edge reconstruction filters* (McGuire 2012 style): 0.3–1.7 dB *worse* than
   the plain gather; gated to motion boundaries only +0.1–0.2 dB
   (`../prototype/validate_edges.py`). Proper edge handling needs to know which
-  object is in front (RSMB Pro asks for a matte); an effect mask is the
-  practical workaround.
+  object is in front (RSMB Pro asks for a matte); Extra High handles it
+  instead by building real in-between frames.
+- *Three-frame motion with occlusion handling* (motion from the frame before A
+  too, for a two-sided blur and for background hidden on one side): a fast
+  object's streak ended in a hard edge wherever a pixel's motion switched;
+  per-pixel motion can't draw an object's streak over a sharp background.
 
 ## Build / install
 
 ```
-..\deps\setup_opencv.bat   # once: vcpkg + static OpenCV (core/imgproc/video)
+..\deps\setup_opencv.bat   # once: vcpkg + static OpenCV (core/imgproc/video) + ncnn (Vulkan)
+..\deps\setup_rife.bat     # once: RIFE v4.6 model -> ..\deps\rife (build.bat copies it next to the .aex)
 build.bat                  # -> build\OneEighty.aex + offline test tools
 install.bat                # once, as admin: junction Adobe\Common\Plug-ins\7.0\MediaCore\OneEighty -> build\
 ```
 Needs the VS 2022 Build Tools, the CUDA toolkit (v13.4 or `CUDA_PATH`) and the
 After Effects SDK in `..\sdk\ae`. At runtime only the NVIDIA driver is needed
-for the GPU path; the plugin loads and runs CPU-only without it. Close Premiere
+for the GPU path (Vulkan for Extra High comes with it); the plugin loads and
+runs CPU-only without it. Close Premiere
 before rebuilding (it locks the .aex); restart it to load the new build.
 
 ## Offline tests
@@ -146,7 +167,8 @@ Raw BGRA frames in and out, processed as the effect does (`build\`):
 - `oe_gpu_offline in.bgra W H srcFps outFps out.bgra [mipThreshold]`: GPU path (DIS motion, CUDA blur)
 - `oe_update_test`: the update check against GitHub
 
-Environment: `OE_EXACT=0` exact frame timing off; `OE_QUALITY=high`; `OE_EDGEFIX=0`
+Environment: `OE_EXACT=0` exact frame timing off; `OE_QUALITY=high` / `extra`
+(`OE_SAMPLES=n`, `OE_RIFE_MODEL=dir`); `OE_EDGEFIX=0`
 skip the motion-boundary clean-up; `OE_FLOAT=1`
 32-bit float (`2` on the GPU tool: input ×1.5 to check values above 1.0 pass
 through); GPU tool only: `OE_ARGB=1` ARGB bytes, `OE_VIEW=1` motion-vector view.

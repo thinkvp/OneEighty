@@ -64,6 +64,7 @@ methods = {
     "GPU, exact timing off": run("oe_gpu_offline.exe", False),
     "GPU, exact timing, Normal": run("oe_gpu_offline.exe", True),
     "GPU, exact timing, High": run("oe_gpu_offline.exe", True, "high"),
+    "GPU, exact timing, Extra High": run("oe_gpu_offline.exe", True, "extra"),
 }
 
 def tpsnr(frames, i):

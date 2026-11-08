@@ -1,6 +1,7 @@
 @echo off
 rem Installs OneEighty Motion Blur for Premiere Pro / After Effects (all users).
-rem Copies OneEighty.aex into Adobe's shared plug-in folder. Needs administrator
+rem Copies OneEighty.aex and its RIFE model (rife-v4.6, for Quality Extra High)
+rem into Adobe's shared plug-in folder. Needs administrator
 rem rights (asks for them).
 setlocal
 
@@ -33,6 +34,10 @@ fsutil reparsepoint query "%DEST%" >nul 2>&1 && (
 
 if not exist "%DEST%" mkdir "%DEST%" || goto :fail
 copy /y "%SRC%" "%DEST%\OneEighty.aex" >nul || goto :fail
+if exist "%~dp0rife-v4.6\flownet.bin" (
+    if not exist "%DEST%\rife-v4.6" mkdir "%DEST%\rife-v4.6" || goto :fail
+    copy /y "%~dp0rife-v4.6\flownet.*" "%DEST%\rife-v4.6\" >nul || goto :fail
+)
 
 echo.
 echo OneEighty Motion Blur installed to:

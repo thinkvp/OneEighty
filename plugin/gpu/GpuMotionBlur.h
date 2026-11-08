@@ -44,6 +44,25 @@ struct HostFlow
     int width = 0, height = 0;
 };
 
+// Interpolation field for one time sample (from RIFE, rife/RifeFlow.h), at a
+// reduced size: flow = 4 x float32 (f0x, f0y, f1x, f1y) in field pixels,
+// mask = 1 x float32 (weight of frame0).
+struct HostField
+{
+    const void* flow = nullptr;
+    size_t flowRowBytes = 0;
+    const void* mask = nullptr;
+    size_t maskRowBytes = 0;
+    int width = 0, height = 0;
+};
+
+struct TimeSample
+{
+    int frame0 = 0, frame1 = 1; // indices into the frames passed to ProcessSamples
+    float weight = 1.0f;
+    HostField field;
+};
+
 class Engine
 {
 public:
@@ -66,6 +85,15 @@ public:
     // Single frame with its motion v (exact frame timing off).
     virtual bool Process(const HostImage& cur, const HostFlow& v, void* out, size_t outRowBytes, const Settings& s,
                          Stats* stats, std::string* err) = 0;
+
+    // Temporal supersampling (Quality Extra High): the output is the weighted
+    // sum over samples of  mask * frame0(x + f0) + (1 - mask) * frame1(x + f1),
+    // each sample's field upsampled to the frame size, i.e. the shutter
+    // integrated from interpolated in-between frames. Works on the frames as
+    // given (8-bit or float, no clamping). nFrames <= 4, all the same size.
+    // showVectors: draw sample 0's frame0 motion instead.
+    virtual bool ProcessSamples(const HostImage* frames, int nFrames, const TimeSample* samples, int nSamples,
+                                void* out, size_t outRowBytes, bool showVectors, Stats* stats, std::string* err) = 0;
 };
 
 } // namespace oe::gpu

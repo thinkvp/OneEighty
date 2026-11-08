@@ -6,6 +6,9 @@
 //   OE_EXACT=0     exact frame timing off: Premiere's frame round(k*r) plus its
 //                  neighbours (default: on, two-frame interpolation)
 //   OE_QUALITY=high  DIS MEDIUM preset (default: Normal, DIS FAST)
+//   OE_QUALITY=extra Extra High: shutter from RIFE in-between frames
+//                  (model: OE_RIFE_MODEL or rife-v4.6 next to this exe)
+//   OE_SAMPLES=n   Extra High samples per output frame (default 8)
 //   OE_FLOAT=1     run as 32-bit float (Premiere 32-bit); 2 = input x1.5 to
 //                  check values above 1.0 pass through unclipped
 //   OE_ARGB=1      feed ARGB bytes instead of BGRA (After Effects order)
@@ -13,10 +16,13 @@
 //   OE_EDGEFIX=0   skip the motion-boundary clean-up (RefineFlowEdges)
 #include "../MotionBlur.h"
 #include "../gpu/GpuMotionBlur.h"
+#include "../rife/RifeShutter.h"
 
 #include <opencv2/video/tracking.hpp> // DIS presets
 
+#include <algorithm>
 #include <chrono>
+#include <memory>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +65,15 @@ int main(int argc, char** argv)
     s.showVectors = Env("OE_VIEW") == '1';
     const bool exact = Env("OE_EXACT") != '0';
     const int preset = Env("OE_QUALITY") == 'h' ? cv::DISOpticalFlow::PRESET_MEDIUM : cv::DISOpticalFlow::PRESET_FAST;
+    const bool extra = Env("OE_QUALITY") == 'e';
+    int nSamples = 8;
+    {
+        char v[8] = {0};
+        size_t len = 0;
+        getenv_s(&len, v, sizeof(v), "OE_SAMPLES");
+        if (v[0])
+            nSamples = std::max(1, std::atoi(v));
+    }
     const bool argb = Env("OE_ARGB") == '1';
     const bool edgeFix = Env("OE_EDGEFIX") != '0';
     const char fl = Env("OE_FLOAT");
@@ -72,6 +87,22 @@ int main(int argc, char** argv)
     {
         std::fprintf(stderr, "GPU engine: %s\n", err.c_str());
         return 1;
+    }
+    std::unique_ptr<oe::rife::Engine> rife;
+    if (extra)
+    {
+        wchar_t model[260] = {0};
+        size_t len = 0;
+        _wgetenv_s(&len, model, 260, L"OE_RIFE_MODEL");
+        const auto tr = std::chrono::steady_clock::now();
+        rife = oe::rife::Engine::Create(model[0] ? std::wstring(model) : oe::rife::DefaultModelDir(), &err);
+        if (!rife)
+        {
+            std::fprintf(stderr, "RIFE: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("RIFE ready in %.0f ms\n",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr).count());
     }
 
     const size_t frameBytes = (size_t)W * H * 4;
@@ -92,7 +123,8 @@ int main(int argc, char** argv)
     }
     std::fclose(fi);
     std::printf("%zu source frames, halfWidth=%.4f, %s timing, %s, %s\n", src.size(), s.halfWidth,
-                exact ? "exact" : "nearest", preset == cv::DISOpticalFlow::PRESET_MEDIUM ? "High" : "Normal",
+                exact ? "exact" : "nearest",
+                extra ? "Extra High" : preset == cv::DISOpticalFlow::PRESET_MEDIUM ? "High" : "Normal",
                 useFloat ? "float" : argb ? "8-bit ARGB" : "8-bit BGRA");
 
     FILE* fo = nullptr;
@@ -111,7 +143,27 @@ int main(int argc, char** argv)
         bool ok;
         const auto t0 = std::chrono::steady_clock::now();
         double tFlow = 0;
-        if (exact)
+        if (extra)
+        {
+            // frame A and the output time t relative to it, as the effect does
+            const long A = exact ? (long)std::floor(k * r + 1e-9) : std::lround(k * r);
+            const double t = exact ? k * r - (double)A : 0.0;
+            if (A + 1 >= (long)src.size())
+                break;
+            oe::rife::ShutterFrames f;
+            f.A = &src[A];
+            f.B = &src[A + 1];
+            if (A > 0 && oe::rife::NeedsPrev(t, s.halfWidth))
+                f.P = &src[A - 1];
+            if (A + 2 < (long)src.size() && oe::rife::NeedsNext(t, s.halfWidth))
+                f.N = &src[A + 2];
+            oe::rife::ShutterStats rs;
+            ok = oe::rife::RenderShutter(*rife, *eng, f, order, argb && !useFloat, t, s.halfWidth, nSamples, 2100000,
+                                         s.showVectors, out.data, out.step, &rs, &err);
+            tFlow = rs.rifeMs;
+            st.gpuMs = rs.gpuMs;
+        }
+        else if (exact)
         {
             const long A = (long)std::floor(k * r + 1e-9);
             if (A + 1 >= (long)src.size())

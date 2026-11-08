@@ -206,6 +206,50 @@ __global__ void KBlurPair(MipSet ma, MipSet mb, FlowField fa, FlowField fb, char
     Store(out, outP, x, y, r);
 }
 
+// One time sample of the temporal supersampling (Extra High): warp both frames
+// by the sample's field (bilinear from the reduced field grid), blend by its
+// mask and add weight * result to acc (first sample: overwrite).
+__global__ void KRifeAccum(const char* f0, size_t p0, const char* f1, size_t p1, int W, int H, const float4* flow,
+                           size_t flowP, const float* mask, size_t maskP, int aw, int ah, float weight, char* acc,
+                           size_t accP, int first, int vectors)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H)
+        return;
+    float gx = (x + 0.5f) * ((float)aw / W) - 0.5f, gy = (y + 0.5f) * ((float)ah / H) - 0.5f;
+    gx = fminf(fmaxf(gx, 0.0f), (float)(aw - 1));
+    gy = fminf(fmaxf(gy, 0.0f), (float)(ah - 1));
+    const int ix = min((int)gx, max(0, aw - 2)), iy = min((int)gy, max(0, ah - 2));
+    const int ix1 = min(ix + 1, aw - 1), iy1 = min(iy + 1, ah - 1);
+    const float tx = gx - ix, ty = gy - iy;
+    const float w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
+    auto F = [&](int a, int b) { return reinterpret_cast<const float4*>(reinterpret_cast<const char*>(flow) + b * flowP)[a]; };
+    auto M = [&](int a, int b) { return reinterpret_cast<const float*>(reinterpret_cast<const char*>(mask) + b * maskP)[a]; };
+    const float4 q00 = F(ix, iy), q10 = F(ix1, iy), q01 = F(ix, iy1), q11 = F(ix1, iy1);
+    const float4 f = make_float4(w00 * q00.x + w10 * q10.x + w01 * q01.x + w11 * q11.x,
+                                 w00 * q00.y + w10 * q10.y + w01 * q01.y + w11 * q11.y,
+                                 w00 * q00.z + w10 * q10.z + w01 * q01.z + w11 * q11.z,
+                                 w00 * q00.w + w10 * q10.w + w01 * q01.w + w11 * q11.w);
+    const float m = fminf(fmaxf(w00 * M(ix, iy) + w10 * M(ix1, iy) + w01 * M(ix, iy1) + w11 * M(ix1, iy1), 0.0f), 1.0f);
+    const float sx = (float)W / aw, sy = (float)H / ah;
+    float4 r;
+    if (vectors)
+    {
+        const Mip L0 = {f0, p0, W, H};
+        r = VectorPixel(L0, x, y, -f.x * sx, -f.y * sy);
+    }
+    else
+    {
+        const float4 v0 = Bilinear(f0, p0, W, H, x + f.x * sx, y + f.y * sy);
+        const float4 v1 = Bilinear(f1, p1, W, H, x + f.z * sx, y + f.w * sy);
+        r = make_float4(m * v0.x + (1 - m) * v1.x, m * v0.y + (1 - m) * v1.y, m * v0.z + (1 - m) * v1.z,
+                        m * v0.w + (1 - m) * v1.w);
+    }
+    float4 a = first ? make_float4(0, 0, 0, 0) : Load(acc, accP, x, y);
+    Store(acc, accP, x, y,
+          make_float4(a.x + weight * r.x, a.y + weight * r.y, a.z + weight * r.z, a.w + weight * r.w));
+}
+
 // 8-bit -> float4 (B,G,R,A order internally). argb: source bytes are A,R,G,B.
 __global__ void KU8ToF4(const unsigned char* src, size_t sp, char* dst, size_t dp, int w, int h, int argb)
 {
@@ -283,8 +327,13 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (ctx_ && cuCtxPushCurrent(ctx_) == CUDA_SUCCESS)
         {
-            for (DevBuf* b : {&flowA_, &flowB_, &frame_[0], &frame_[1], &out_, &stage_[0], &stage_[1], &stageOut_})
+            for (DevBuf* b : {&flowA_, &flowB_, &out_, &stageOut_, &fieldFlow_, &fieldMask_})
                 b->Release();
+            for (int i = 0; i < kMaxFrames; ++i)
+            {
+                frame_[i].Release();
+                stage_[i].Release();
+            }
             for (auto& m : mipA_)
                 m.Release();
             for (auto& m : mipB_)
@@ -373,7 +422,69 @@ public:
         return ok;
     }
 
+    bool ProcessSamples(const HostImage* frames, int nFrames, const TimeSample* samples, int nSamples, void* out,
+                        size_t outRowBytes, bool showVectors, Stats* stats, std::string* err) override
+    {
+        if (nFrames < 1 || nFrames > kMaxFrames || nSamples < 1)
+            return Fail(err, "bad sample setup");
+        for (int i = 1; i < nFrames; ++i)
+            if (frames[i].width != frames[0].width || frames[i].height != frames[0].height ||
+                frames[i].isFloat != frames[0].isFloat)
+                return Fail(err, "frame size/format mismatch");
+        std::lock_guard<std::mutex> lock(mu_);
+        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
+            return Fail(err, "cuCtxPushCurrent failed");
+        const int W = frames[0].width, H = frames[0].height;
+        bool ok = EnsureOut(W, H, err);
+        for (int i = 0; i < nFrames && ok; ++i)
+            ok = Upload(frames[i], i, err);
+        if (ok)
+            cudaEventRecord(ev_[0], nullptr);
+        const dim3 b(16, 16), g = Grid(W, H, b);
+        for (int i = 0; i < nSamples && ok; ++i)
+        {
+            const TimeSample& s = samples[i];
+            const HostField& f = s.field;
+            if (s.frame0 < 0 || s.frame0 >= nFrames || s.frame1 < 0 || s.frame1 >= nFrames || !f.flow || !f.mask ||
+                f.width < 2 || f.height < 2)
+            {
+                ok = Fail(err, "bad time sample");
+                break;
+            }
+            ok = fieldFlow_.Ensure(f.width, f.height, 16) && fieldMask_.Ensure(f.width, f.height, 4);
+            if (!ok)
+            {
+                Fail(err, "out of GPU memory (field)");
+                break;
+            }
+            ok = cudaMemcpy2D(fieldFlow_.ptr, fieldFlow_.pitch, f.flow, f.flowRowBytes, (size_t)f.width * 16, f.height,
+                              cudaMemcpyHostToDevice) == cudaSuccess &&
+                 cudaMemcpy2D(fieldMask_.ptr, fieldMask_.pitch, f.mask, f.maskRowBytes, (size_t)f.width * 4, f.height,
+                              cudaMemcpyHostToDevice) == cudaSuccess;
+            if (!ok)
+            {
+                Fail(err, "field upload failed");
+                break;
+            }
+            const DevBuf& a = frame_[s.frame0];
+            const DevBuf& c = frame_[s.frame1];
+            KRifeAccum<<<g, b>>>((const char*)a.ptr, a.pitch, (const char*)c.ptr, c.pitch, W, H,
+                                 (const float4*)fieldFlow_.ptr, fieldFlow_.pitch, (const float*)fieldMask_.ptr,
+                                 fieldMask_.pitch, f.width, f.height, showVectors ? 1.0f : s.weight, (char*)out_.ptr,
+                                 out_.pitch, i == 0 ? 1 : 0, showVectors ? 1 : 0);
+            if (showVectors)
+                break;
+        }
+        ok = ok && Finish(stats, err);
+        ok = ok && Download(out, outRowBytes, frames[0].argb, frames[0].isFloat, err);
+        CUcontext dummy;
+        cuCtxPopCurrent(&dummy);
+        return ok;
+    }
+
 private:
+    static constexpr int kMaxFrames = 4;
+
     static bool Fail(std::string* err, const char* msg)
     {
         if (err)
@@ -488,7 +599,8 @@ private:
 
     std::mutex mu_;
     CUcontext ctx_ = nullptr;
-    DevBuf frame_[2], out_, stage_[2], stageOut_; // float frames, output, 8-bit staging
+    DevBuf frame_[kMaxFrames], out_, stage_[kMaxFrames], stageOut_; // float frames, output, 8-bit staging
+    DevBuf fieldFlow_, fieldMask_;                                   // Extra High: one sample's field
     DevBuf flowA_, flowB_, mipA_[3], mipB_[3];
     cudaEvent_t ev_[2] = {};
 };

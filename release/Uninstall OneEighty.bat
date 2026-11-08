@@ -26,6 +26,7 @@ fsutil reparsepoint query "%DEST%" >nul 2>&1 && (
 )
 
 if exist "%DEST%\OneEighty.aex" del /f "%DEST%\OneEighty.aex"
+if exist "%DEST%\rife-v4.6" rmdir /s /q "%DEST%\rife-v4.6"
 if exist "%DEST%" rmdir "%DEST%" 2>nul
 
 echo OneEighty Motion Blur removed.
