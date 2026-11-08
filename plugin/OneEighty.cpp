@@ -3,13 +3,14 @@
 
     Premiere lets this effect check out its input at sub-frame times, so it can
     read the in-between source frames (Premiere's GPU filter API can't: it only
-    delivers whole timeline frames). Frames are fetched here and processed on
-    the CUDA engine when an NVIDIA GPU is available ("hybrid"), otherwise with
-    OpenCV on the CPU. Quality Fast = NVIDIA optical-flow hardware for motion;
-    Normal/High = OpenCV DIS motion on the CPU, blur on the GPU.
+    delivers whole timeline frames). Frames are fetched here, motion is
+    estimated with OpenCV DIS on the CPU (Quality Normal / High = FAST / MEDIUM
+    preset) and the blur runs on the CUDA engine when an NVIDIA GPU is
+    available ("hybrid"), otherwise with OpenCV on the CPU.
 
-    When high-frame-rate footage (50p, 59.94p) plays at 100% speed on a lower
-    rate timeline (25p), Premiere just drops frames, leaving each frame with far
+    When high-frame-rate footage (50p, 59.94p) plays at 100% speed (or a
+    slowed-down file is sped back up) on a lower rate timeline (25p), Premiere
+    just drops frames, leaving each frame with far
     less motion blur than a normal 180 deg shutter. This effect reads the
     neighbouring source frames (Premiere supports checking out the layer at
     sub-frame times), estimates per-pixel motion with optical flow and smears
@@ -191,7 +192,9 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_
 
     // ---- main controls (order must match the OE_* indices)
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Shutter angle", 0, 720, 0, 360, 180, PF_Precision_INTEGER, 0, 0, OE_TARGET_SHUTTER_DISK_ID);
+    // Slider 90-360: at or below the footage's own exposure (90 deg for 50p shot at 180,
+    // 75 for 59.94p) there is no blur to add. Typed values 0-720 are still accepted.
+    PF_ADD_FLOAT_SLIDERX("Shutter angle", 0, 720, 90, 360, 180, PF_Precision_INTEGER, 0, 0, OE_TARGET_SHUTTER_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("Quality", OE_QUALITY_COUNT, OE_QUALITY_NORMAL, OE_QUALITY_CHOICES, OE_QUALITY_DISK_ID);
@@ -229,8 +232,8 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_
 }
 
 // ---------------------------------------------------------------- GPU engine
-// Hybrid path: one CUDA/NVOF engine for the CPU effect (primary context of
-// device 0). Created on first use; a failure is remembered (CPU maths then).
+// Hybrid path: one CUDA engine for the CPU effect (primary context of device
+// 0). Created on first use; a failure is remembered (CPU maths then).
 std::mutex gEngineMutex;
 std::unique_ptr<oe::gpu::Engine> gEngine;
 bool gEngineTried = false;
@@ -242,9 +245,9 @@ oe::gpu::Engine* HybridEngine()
     {
         gEngineTried = true;
         std::string err;
-        gEngine = oe::gpu::Engine::Create(nullptr, &err);
+        gEngine = oe::gpu::Engine::Create(&err);
         if (gEngine)
-            Log("[hybrid] CUDA + NVIDIA optical flow engine ready");
+            Log("[hybrid] CUDA engine ready");
         else
             Log("[hybrid] GPU engine unavailable (%s) -> CPU maths", err.c_str());
     }
@@ -319,7 +322,14 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
 
     const SourceInfo si = GetSourceInfo(in_data, params);
     const double timelineFps = (double)in_data->time_scale / std::max<A_long>(1, in_data->time_step);
-    const double srcRate = si.fps * si.speed; // source frames per second of clip time
+    // Premiere gives an effect on a speed-changed clip its times in the clip's
+    // own (media) time: at 200% each timeline frame advances the effect's clock
+    // by two source frames (measured: S&Q 25p file at 200% -> current_time
+    // steps of 2 frames while time_step stays one frame). So:
+    //  - frame requests are spaced by the source rate alone (clipRate), and
+    //  - the blur uses source frames per timeline second (srcRate = rate x speed).
+    const double clipRate = si.fps;           // source frames per second of effect time
+    const double srcRate = si.fps * si.speed; // source frames per second of timeline time
 
     // Times on a finer scale so sub-frame offsets are representable
     // (timeline scale 25: half a frame is 0.5 units).
@@ -329,22 +339,22 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         mult /= 10;
     const long long S = (long long)in_data->time_scale * mult;
     const long long T = (long long)in_data->current_time * mult;
-    const long long dt = std::max<long long>(1, std::llround((double)S / srcRate));
+    const long long dt = std::max<long long>(1, std::llround((double)S / clipRate));
 
     // Frame plan. Exact: interpolate between source frames A = floor(p) and
     // B = A+1 around the output time p (source frames of clip time; assumes the
     // clip's in-point sits on a source frame - otherwise the whole clip shifts
     // by a constant < 1 frame, which keeps the cadence even).
     // Otherwise: Premiere's frame plus neighbours one source interval away.
-    const double p = (double)in_data->current_time / in_data->time_scale * srcRate;
+    const double p = (double)in_data->current_time / in_data->time_scale * clipRate;
     const double phase = p - std::floor(p + 1e-6);
     const bool pairPlan = exactTiming;
     long long t1, t2; // checkout times (units of S)
     if (pairPlan)
     {
         // a quarter frame past each frame's timestamp: robust to round/floor
-        t1 = T + std::llround((-phase + 0.25) * (double)S / srcRate);
-        t2 = T + std::llround((1.0 - phase + 0.25) * (double)S / srcRate);
+        t1 = T + std::llround((-phase + 0.25) * (double)S / clipRate);
+        t2 = T + std::llround((1.0 - phase + 0.25) * (double)S / clipRate);
     }
     else
     {
@@ -357,8 +367,12 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     AEFX_CLR_STRUCT(d2);
     const auto tFetch0 = Clock::now();
     const PF_Err e1 = PF_CHECKOUT_PARAM(in_data, OE_INPUT, (A_long)t1, (A_long)dt, (A_u_long)S, &d1);
+    const auto tFetch1 = Clock::now();
     const PF_Err e2 = PF_CHECKOUT_PARAM(in_data, OE_INPUT, (A_long)t2, (A_long)dt, (A_u_long)S, &d2);
-    const double fetchMs = std::chrono::duration<double, std::milli>(Clock::now() - tFetch0).count();
+    const auto tFetch2 = Clock::now();
+    const double fetch1Ms = std::chrono::duration<double, std::milli>(tFetch1 - tFetch0).count();
+    const double fetch2Ms = std::chrono::duration<double, std::milli>(tFetch2 - tFetch1).count();
+    const double fetchMs = fetch1Ms + fetch2Ms;
     const bool have1 = !e1 && Valid(&d1.u.ld) && SameSize(&d1.u.ld, curW);
     const bool have2 = !e2 && Valid(&d2.u.ld) && SameSize(&d2.u.ld, curW);
 
@@ -387,7 +401,12 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     const int q = params[OE_QUALITY]->u.pd.value;
     const bool vectors = view == OE_VIEW_VECTORS;
 
-    // GPU engine for Auto when pixels are BGRA (Premiere); CPU maths otherwise.
+    // Motion from OpenCV DIS on the CPU (copes with fine repeating patterns);
+    // the blur on the GPU when there is one (the expensive part at UHD), else CPU.
+    // Normal: DIS FAST preset (17 ms/pair at UHD, -0.4 dB on the synthetic test);
+    // High: DIS MEDIUM (41 ms/pair; cleaner edges where people cross the background).
+    const int disPreset = q == OE_QUALITY_HIGH ? cv::DISOpticalFlow::PRESET_MEDIUM : cv::DISOpticalFlow::PRESET_FAST;
+    constexpr int kFlowWidth = 960; // motion analysis width
     oe::gpu::Engine* eng = nullptr;
     const bool bgra = order.b == 0 && order.g == 1 && order.r == 2;
     const bool argb = order.a == 0 && order.r == 1 && order.g == 2 && order.b == 3;
@@ -400,7 +419,7 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         why = "GPU engine unavailable";
 
     const auto tCompute0 = Clock::now();
-    double disMs = 0; // CPU motion estimation time (hybrid-dis)
+    double disMs = 0; // CPU motion estimation time (hybrid path)
     const char* path = eng ? "hybrid" : "cpu";
     std::string gerr;
     bool done = false;
@@ -412,72 +431,49 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
             oe::gpu::Settings gs;
             gs.halfWidth = hw;
             gs.showVectors = vectors;
-            // analysis resolution relative to the frame (validated: half-res, grid 2 best)
-            gs.flowWidth = q == OE_QUALITY_FAST ? std::max(256, cur.cols / 4) : std::max(512, cur.cols / 2);
-            gs.flowGrid = q == OE_QUALITY_FAST ? 4 : q == OE_QUALITY_HIGH ? 1 : 2;
             const bool a8 = argb && !outFloat;
-            const oe::gpu::Engine::HostImage hc{cur.data, cur.step, cur.cols, cur.rows, a8, outFloat};
-            const oe::gpu::Engine::HostImage h1{m1.data, m1.step, m1.cols, m1.rows, a8, outFloat};
-            const oe::gpu::Engine::HostImage h2{m2.data, m2.step, m2.cols, m2.rows, a8, outFloat};
+            const oe::gpu::HostImage hc{cur.data, cur.step, cur.cols, cur.rows, a8, outFloat};
+            const oe::gpu::HostImage h1{m1.data, m1.step, m1.cols, m1.rows, a8, outFloat};
+            const oe::gpu::HostImage h2{m2.data, m2.step, m2.cols, m2.rows, a8, outFloat};
             oe::gpu::Stats gst;
-            if (q == OE_QUALITY_FAST)
+            const auto tFlow0 = Clock::now();
+            if (pair)
             {
-                // motion from the NVIDIA optical-flow hardware: fastest, but its
-                // block matching can lock onto the wrong repeat of a fine pattern
-                path = "hybrid-nvof";
-                done = pair ? eng->ProcessHostPair(h1, h2, phase, out.data, out.step, gs, &gst, &gerr)
-                            : eng->ProcessHost(have1 ? &h1 : nullptr, hc, have2 ? &h2 : nullptr, out.data, out.step,
-                                               gs, &gst, &gerr);
+                cv::Mat fa, fbBack;
+                oe::EstimateFlowPair(m1, m2, order, kFlowWidth, fa, fbBack, disPreset); // A->B and B->A
+                const cv::Mat fb = -fbBack;                                               // B's forward motion
+                disMs = std::chrono::duration<double, std::milli>(Clock::now() - tFlow0).count();
+                const oe::gpu::HostFlow hfa{fa.data, fa.step, fa.cols, fa.rows};
+                const oe::gpu::HostFlow hfb{fb.data, fb.step, fb.cols, fb.rows};
+                done = eng->ProcessPair(h1, h2, phase, hfa, hfb, out.data, out.step, gs, &gst, &gerr);
             }
             else
             {
-                // motion from OpenCV DIS on the CPU (copes with repeating
-                // patterns), blur on the GPU (the expensive part at UHD)
-                path = "hybrid-dis";
-                // Normal: DIS FAST preset (17 ms/pair at UHD, -0.4 dB on the synthetic test);
-                // High: DIS MEDIUM (41 ms/pair; the setting that kept a fine checked shirt clean)
-                const int fw = 960;
-                const int preset = q == OE_QUALITY_HIGH ? cv::DISOpticalFlow::PRESET_MEDIUM
-                                                        : cv::DISOpticalFlow::PRESET_FAST;
-                const auto tFlow0 = Clock::now();
-                if (pair)
+                cv::Mat v;
+                int nv = 0;
+                if (have2)
                 {
-                    cv::Mat fa, fbBack;
-                    oe::EstimateFlowPair(m1, m2, order, fw, fa, fbBack, preset); // A->B and B->A
-                    const cv::Mat fb = -fbBack;                          // B's forward motion
-                    disMs = std::chrono::duration<double, std::milli>(Clock::now() - tFlow0).count();
-                    const oe::gpu::Engine::HostFlow hfa{fa.data, fa.step, fa.cols, fa.rows};
-                    const oe::gpu::Engine::HostFlow hfb{fb.data, fb.step, fb.cols, fb.rows};
-                    done = eng->ProcessHostPairFlow(h1, h2, phase, hfa, hfb, out.data, out.step, gs, &gst, &gerr);
+                    v = oe::EstimateFlow(cur, m2, order, kFlowWidth, disPreset);
+                    ++nv;
+                }
+                if (have1)
+                {
+                    const cv::Mat b = oe::EstimateFlow(cur, m1, order, kFlowWidth, disPreset);
+                    v = v.empty() ? cv::Mat(-b) : cv::Mat(v - b);
+                    ++nv;
+                }
+                disMs = std::chrono::duration<double, std::milli>(Clock::now() - tFlow0).count();
+                if (nv == 2)
+                    v *= 0.5;
+                if (nv == 0)
+                {
+                    cur.copyTo(out);
+                    done = true;
                 }
                 else
                 {
-                    cv::Mat v;
-                    int nv = 0;
-                    if (have2)
-                    {
-                        v = oe::EstimateFlow(cur, m2, order, fw, preset);
-                        ++nv;
-                    }
-                    if (have1)
-                    {
-                        const cv::Mat b = oe::EstimateFlow(cur, m1, order, fw, preset);
-                        v = v.empty() ? cv::Mat(-b) : cv::Mat(v - b);
-                        ++nv;
-                    }
-                    disMs = std::chrono::duration<double, std::milli>(Clock::now() - tFlow0).count();
-                    if (nv == 2)
-                        v *= 0.5;
-                    if (nv == 0)
-                    {
-                        cur.copyTo(out);
-                        done = true;
-                    }
-                    else
-                    {
-                        const oe::gpu::Engine::HostFlow hv{v.data, v.step, v.cols, v.rows};
-                        done = eng->ProcessHostFlow(hc, hv, out.data, out.step, gs, &gst, &gerr);
-                    }
+                    const oe::gpu::HostFlow hv{v.data, v.step, v.cols, v.rows};
+                    done = eng->Process(hc, hv, out.data, out.step, gs, &gst, &gerr);
                 }
             }
             if (!done)
@@ -487,8 +483,8 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         {
             oe::BlurSettings bs;
             bs.halfWidth = hw;
-            bs.flowWidth = q == OE_QUALITY_FAST ? 480 : 960;
-            bs.disPreset = q == OE_QUALITY_HIGH ? cv::DISOpticalFlow::PRESET_MEDIUM : cv::DISOpticalFlow::PRESET_FAST;
+            bs.flowWidth = kFlowWidth;
+            bs.disPreset = disPreset;
             bs.showVectors = vectors;
             if (pair && !vectors && phase > 1e-3)
             {
@@ -531,14 +527,15 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     if (log)
     {
         const double totalMs = std::chrono::duration<double, std::milli>(Clock::now() - tStart).count();
-        Log("[%s] render%s%s%s forceCpu=%d t=%d/%u view=%d %dx%d %s | srcFps=%.3f (%s) speed=%.2f timeline=%.3f | "
-            "timing=%s p=%.3f a=%.3f d1:%s d2:%s | halfWidth=%.3f q=%d | fetch=%.1fms compute=%.1fms (cpu motion %.1fms) total=%.1fms%s%s%s",
+        Log("[%s] render%s%s%s forceCpu=%d t=%d/%u view=%d %dx%d %s | srcFps=%.3f (%s) speed=%.2f timeline=%.3f "
+            "(src frames/out %.2f; host orig=%.3f media=%.3f) | "
+            "timing=%s p=%.3f a=%.3f d1:%s d2:%s | halfWidth=%.3f q=%d | fetch=%.1fms (d1 %.1fms, d2 %.1fms) compute=%.1fms "
+            "(cpu motion %.1fms) total=%.1fms%s%s%s",
             path, *why ? " (" : "", why, *why ? ")" : "", forceCpu ? 1 : 0, in_data->current_time, in_data->time_scale, view,
-            output->width, output->height,
-            fmts, si.fps, si.source,
-            si.speed, timelineFps, pair ? "exact-pair" : "nearest", p, pair ? phase : 0.0, have1 ? "ok" : "MISSING",
-            have2 ? "ok" : "MISSING", hw, q, fetchMs, computeMs, disMs, totalMs, diag, gerr.empty() ? "" : " gpu error: ",
-            gerr.c_str());
+            output->width, output->height, fmts, si.fps, si.source, si.speed, timelineFps, srcRate / timelineFps,
+            si.origFps, si.mediaFps, pair ? "exact-pair" : "nearest", p, pair ? phase : 0.0,
+            have1 ? "ok" : "MISSING", have2 ? "ok" : "MISSING", hw, q, fetchMs, fetch1Ms, fetch2Ms,
+            computeMs, disMs, totalMs, diag, gerr.empty() ? "" : " gpu error: ", gerr.c_str());
     }
     return err ? err : err2;
 }

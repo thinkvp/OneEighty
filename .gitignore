@@ -1,9 +1,8 @@
 # Adobe After Effects / Premiere SDKs (Adobe licence; download from developer.adobe.com)
 /sdk/
 
-# Third-party dependencies, fetched by deps/setup_*.bat
+# Third-party dependencies, fetched by deps/setup_opencv.bat
 /deps/vcpkg/
-/deps/nvof/
 
 # Build output
 /plugin/build/

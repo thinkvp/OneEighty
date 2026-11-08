@@ -2,7 +2,7 @@ OneEighty Motion Blur {VERSION}
 ==============================
 
 Adds the motion blur of a 180-degree shutter to high-frame-rate footage
-(50p, 59.94p) played at 100% speed on a lower-rate timeline (25p), and evens
+(50p, 59.94p) played at normal speed on a lower-rate timeline (25p), and evens
 out the stutter of uneven conversions like 59.94p -> 25p.
 
 https://github.com/thinkvp/OneEighty
@@ -28,13 +28,14 @@ INSTALL
 
 USING IT
   Drop the effect on a 50p / 59.94p clip in a 25p sequence (clip at 100%).
+  Sped-up clips work too, e.g. a slow-motion (S&Q) 25p file at 200%.
 
   Shutter angle       Amount of blur to simulate (180 = normal film look).
+                      The slider starts at 90: below that the footage
+                      already has the blur, so nothing changes.
   Quality             Normal (default): best balance.
                       High: cleaner edges where people pass in front of the
                       background; slower.
-                      Fast: quickest (all on the GPU), but can shimmer on fine
-                      repeating patterns such as checked shirts.
   Exact frame timing  On (default): even motion for 59.94p -> 25p.
   Advanced            Source shutter angle / frame rate, motion-vector view,
                       Force CPU, debug log (%TEMP%\OneEighty.log), updates.

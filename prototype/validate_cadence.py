@@ -2,8 +2,8 @@
 
 59.94/25 = 2.4 source frames per output frame, so Premiere shows source frames
 0, 2, 5, 7, 10, 12, ... : motion advances in uneven 2- and 3-frame steps
-(33 ms / 50 ms) = judder. OE_CADENCE=1 makes the plugin build each output
-frame at its exact time instead.
+(33 ms / 50 ms) = judder. Exact frame timing (the default) builds each output
+frame at its exact time from the source frames either side instead.
 
 Reports, per method:
   PSNR vs ground truth (real 25p camera, 180 deg)    higher = better
@@ -39,10 +39,10 @@ def pan_steps(frames):
     return np.array([cv2.phaseCorrelate(g[i], g[i + 1], win)[0][0] for i in range(len(g) - 1)])
 
 
-def run(exe, cadence, extra=()):
-    env = dict(os.environ, OE_CADENCE=cadence if isinstance(cadence, str) else ("1" if cadence else "0"))
-    r = subprocess.run([str(BUILD / exe), str(raw_in), str(W), str(H), f"{SRC_FPS:.8f}", "25", str(raw_out),
-                        *extra], capture_output=True, text=True, env=env)
+def run(exe, exact, quality="normal"):
+    env = dict(os.environ, OE_EXACT="1" if exact else "0", OE_QUALITY=quality)
+    r = subprocess.run([str(BUILD / exe), str(raw_in), str(W), str(H), f"{SRC_FPS:.8f}", "25", str(raw_out)],
+                       capture_output=True, text=True, env=env)
     if r.returncode:
         raise RuntimeError(r.stdout + r.stderr)
     return list(np.fromfile(raw_out, np.uint8).reshape(-1, H, W, 4)[..., :3])
@@ -59,14 +59,11 @@ drop = [src[int(round(k * r))] for k in range(len(gt)) if round(k * r) < len(src
 methods = {
     "ground truth (25p camera)": gt,
     "Premiere (nearest frame)": drop,
-    "CPU blur, nearest timing": run("oe_offline.exe", False),
-    "CPU blur, exact timing": run("oe_offline.exe", True),
-    "CPU two-frame (CPU only)": run("oe_offline.exe", "2"),
-    "GPU blur, nearest timing": run("oe_gpu_offline.exe", False, ["640", "2", "5"]),
-    "GPU blur, exact timing": run("oe_gpu_offline.exe", True, ["640", "2", "5"]),
-    "GPU two-frame interp": run("oe_gpu_offline.exe", "2", ["640", "2", "5"]),
-    "hybrid (host frames, GPU)": run("oe_gpu_offline.exe", "3", ["640", "2", "5"]),
-    "hybrid, DIS motion + GPU blur": run("oe_gpu_offline.exe", "4", ["640", "2", "5"]),
+    "CPU, exact timing off": run("oe_offline.exe", False),
+    "CPU, exact timing": run("oe_offline.exe", True),
+    "GPU, exact timing off": run("oe_gpu_offline.exe", False),
+    "GPU, exact timing, Normal": run("oe_gpu_offline.exe", True),
+    "GPU, exact timing, High": run("oe_gpu_offline.exe", True, "high"),
 }
 
 def tpsnr(frames, i):

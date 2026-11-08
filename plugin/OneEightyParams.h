@@ -9,7 +9,7 @@
 
 // Keep in sync with AE_Effect_Version in OneEightyPiPL.r
 #define MAJOR_VERSION 0
-#define MINOR_VERSION 7
+#define MINOR_VERSION 8
 #define BUG_VERSION   0
 #define STAGE_VERSION PF_Stage_DEVELOP
 #define BUILD_VERSION 1
@@ -20,7 +20,7 @@ enum
 {
     OE_INPUT = 0,
     OE_TARGET_SHUTTER, // "Shutter angle": the look to simulate at the timeline rate
-    OE_QUALITY,        // Fast (GPU motion) / Normal / High
+    OE_QUALITY,        // Normal / High
     OE_EXACT_TIMING,
     OE_ADV_START,      // ---- "Advanced" (collapsed)
     OE_SRC_SHUTTER,
@@ -34,29 +34,30 @@ enum
 };
 
 // Disk IDs identify parameters in saved projects: never reuse a retired ID
-// (1 = v0.1-v0.3 "Mode" popup, 9 = v0.4 "Render" popup, 13 = test-build
-// "Check for updates automatically" checkbox).
+// (1 = v0.1-v0.3 "Mode" popup, 6 = v0.4-v0.7 "Quality" popup with Fast,
+// 9 = v0.4 "Render" popup, 13 = test-build "Check for updates automatically"
+// checkbox). Projects saved with a retired ID open with that control's default.
 enum
 {
     OE_SRC_FPS_DISK_ID = 2,
     OE_LOG_DISK_ID = 3,
     OE_SRC_SHUTTER_DISK_ID = 4,
     OE_TARGET_SHUTTER_DISK_ID = 5,
-    OE_QUALITY_DISK_ID = 6,
     OE_VIEW_DISK_ID = 7,
     OE_EXACT_TIMING_DISK_ID = 8,
     OE_FORCE_CPU_DISK_ID = 10,
     OE_ADV_START_DISK_ID = 11,
     OE_ADV_END_DISK_ID = 12,
     OE_UPDATE_BUTTON_DISK_ID = 14,
+    OE_QUALITY_DISK_ID = 15,
 };
 
 // Rendering: Premiere's GPU filter API only delivers whole timeline frames
 // (requests are floored to the timeline grid), so it can't see the in-between
 // source frames. The effect therefore fetches frames through the AE API
-// (sub-frame layer checkout works) and processes them on the GPU when an
-// NVIDIA GPU is available ("hybrid"), otherwise on the CPU. "Force CPU" is for
-// troubleshooting.
+// (sub-frame layer checkout works), estimates motion on the CPU and blurs on
+// the GPU when an NVIDIA GPU is available ("hybrid"), otherwise on the CPU.
+// "Force CPU" is for troubleshooting.
 
 // Popup entries are 1-based
 enum
@@ -69,16 +70,13 @@ enum
 
 enum
 {
-    OE_QUALITY_FAST = 1,
-    OE_QUALITY_NORMAL,
+    OE_QUALITY_NORMAL = 1,
     OE_QUALITY_HIGH,
     OE_QUALITY_COUNT = OE_QUALITY_HIGH
 };
-// Fast: motion and blur on the GPU (NVIDIA optical-flow hardware); quickest,
-//       but can mis-track fine repeating patterns.
-// Normal / High: motion estimated on the CPU (OpenCV DIS at 960 px, FAST / MEDIUM
-//       preset), blur on the GPU.
-#define OE_QUALITY_CHOICES "Fast|Normal|High"
+// Motion estimated on the CPU (OpenCV DIS at 960 px): Normal = FAST preset,
+// High = MEDIUM preset (cleaner edges, slower).
+#define OE_QUALITY_CHOICES "Normal|High"
 
 namespace oe
 {

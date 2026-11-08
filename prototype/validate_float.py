@@ -23,9 +23,9 @@ def psnr(a, b):
     return 10 * np.log10(255 ** 2 / max(mse, 1e-9))
 
 
-def run(exe, cadence, flt, extra=()):
-    env = dict(os.environ, OE_CADENCE=cadence, OE_FLOAT=flt)
-    r = subprocess.run([str(BUILD / exe), str(raw_in), str(W), str(H), f"{FPS:.8f}", "25", str(raw_out), *extra],
+def run(exe, flt):
+    env = dict(os.environ, OE_EXACT="1", OE_FLOAT=flt)
+    r = subprocess.run([str(BUILD / exe), str(raw_in), str(W), str(H), f"{FPS:.8f}", "25", str(raw_out)],
                        capture_output=True, text=True, env=env)
     if r.returncode:
         raise RuntimeError(r.stdout + r.stderr)
@@ -40,14 +40,13 @@ subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(SRC), "-f", "rawvideo",
 gt = list(read_frames(str(GT)))
 
 cases = [
-    ("GPU hybrid, Normal (DIS motion)", "oe_gpu_offline.exe", "4", ["640", "2", "5"]),
-    ("GPU hybrid, Fast (NVIDIA motion)", "oe_gpu_offline.exe", "3", ["640", "2", "5"]),
-    ("CPU only (two-frame)", "oe_offline.exe", "2", []),
+    ("GPU (Normal)", "oe_gpu_offline.exe"),
+    ("CPU only", "oe_offline.exe"),
 ]
 print(f"{'path':34s} {'8-bit vs GT':>11s} {'float vs GT':>11s} {'float vs 8-bit':>15s} {'max |diff|':>10s}")
-for name, exe, cad, extra in cases:
-    a, _ = run(exe, cad, "0", extra)
-    b, _ = run(exe, cad, "1", extra)
+for name, exe in cases:
+    a, _ = run(exe, "0")
+    b, _ = run(exe, "1")
     n = min(len(a), len(b), len(gt))
     pa = np.mean([psnr(a[i], gt[i]) for i in range(1, n - 1)])
     pb = np.mean([psnr(b[i], gt[i]) for i in range(1, n - 1)])
@@ -55,7 +54,7 @@ for name, exe, cad, extra in cases:
     mx = int(np.abs(a[:n].astype(int) - b[:n]).max())
     print(f"{name:34s} {pa:11.2f} {pb:11.2f} {pab:15.2f} {mx:10d}")
 
-_, stats = run("oe_gpu_offline.exe", "4", "2", ["640", "2", "5"])
-print("\nHDR check (input x1.5, GPU hybrid Normal):", stats)
+_, stats = run("oe_gpu_offline.exe", "2")
+print("\nHDR check (input x1.5, GPU Normal):", stats)
 raw_in.unlink(missing_ok=True)
 raw_out.unlink(missing_ok=True)

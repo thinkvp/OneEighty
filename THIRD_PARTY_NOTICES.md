@@ -9,10 +9,9 @@ compiled in statically:
 | [OpenCV](https://opencv.org) 4 (core, imgproc, video) | DIS optical flow, CPU blur | Apache 2.0 (+ notices below) |
 | [zlib](https://zlib.net) | dependency of OpenCV core | zlib licence |
 | NVIDIA CUDA Runtime (`cudart_static`) | GPU processing | NVIDIA CUDA Toolkit EULA (redistributable component) |
-| [NVIDIA Optical Flow SDK](https://github.com/NVIDIA/NVIDIAOpticalFlowSDK) headers | hardware optical flow ("Fast" quality) | BSD 3-clause |
 
-The NVIDIA Optical Flow runtime (`nvofapi64.dll`) and the CUDA driver are part
-of the NVIDIA display driver and are not distributed with OneEighty.
+The CUDA driver is part of the NVIDIA display driver and is not distributed
+with OneEighty.
 
 Building from source also needs the Adobe After Effects SDK, which is
 licensed separately by Adobe and is not included in this repository or in
@@ -25,39 +24,6 @@ the release.
 This software contains the NVIDIA CUDA Runtime library, a redistributable
 component of the NVIDIA CUDA Toolkit, distributed under the NVIDIA CUDA
 Toolkit End User License Agreement: https://docs.nvidia.com/cuda/eula/
-
----
-
-## NVIDIA Optical Flow SDK (headers)
-
-```
-Copyright(c) 2020, NVIDIA CORPORATION.All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met :
-
-1. Redistributions of source code must retain the above copyright notice, this
-list of conditions and the following disclaimer.
-
-2. Redistributions in binary form must reproduce the above copyright notice,
-this list of conditions and the following disclaimer in the documentation
-and / or other materials provided with the distribution.
-
-3. Neither the name of the copyright holder nor the names of its
-contributors may be used to endorse or promote products derived from
-this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED.IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
 
 ---
 

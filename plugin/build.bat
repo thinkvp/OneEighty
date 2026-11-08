@@ -1,17 +1,15 @@
 @echo off
 rem Builds build\OneEighty.aex (x64 Release) plus the offline test tools, with
 rem the VS 2022 Build Tools and the CUDA toolkit.
-rem One-time setup: ..\deps\setup_opencv.bat and ..\deps\setup_nvof.bat.
+rem One-time setup: ..\deps\setup_opencv.bat.
 setlocal
 cd /d "%~dp0"
 set "PATH=%PATH%;C:\Program Files (x86)\Microsoft Visual Studio\Installer"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 
-rem Adobe SDKs (not in git): sdk\ae = After Effects SDK 26.5, sdk\premiere = Premiere Pro 26.0 C++ SDK
+rem Adobe After Effects SDK (not in git, Adobe licence): sdk\ae
 set "SDK=%~dp0..\sdk\ae\Examples"
-set "PRSDK=%~dp0..\sdk\premiere\Examples"
 set "CV=%~dp0..\deps\vcpkg\installed\x64-windows-static-md"
-set "NVOF=%~dp0..\deps\nvof"
 if not defined CUDA_PATH set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
 set "OUT=%~dp0build"
 set "OBJ=%~dp0build\obj"
@@ -32,7 +30,7 @@ echo [2/5] Compile C++
 cl %CFLAGS% %AEINC% /Fo"%OBJ%\\" OneEighty.cpp MotionBlur.cpp Log.cpp UpdateCheck.cpp tools\oe_offline.cpp tools\oe_gpu_offline.cpp tools\oe_update_test.cpp || exit /b 1
 
 echo [3/5] Compile CUDA
-"%CUDA_PATH%\bin\nvcc.exe" -c -O3 -std=c++17 -Xcompiler "/MD /EHsc /W3" -I "%NVOF%" ^
+"%CUDA_PATH%\bin\nvcc.exe" -c -O3 -std=c++17 -Xcompiler "/MD /EHsc /W3" ^
    -gencode arch=compute_75,code=sm_75 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 ^
    -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120 ^
    -o "%OBJ%\GpuMotionBlur.obj" gpu\GpuMotionBlur.cu || exit /b 1

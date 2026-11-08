@@ -3,6 +3,7 @@
 Runs the same synthetic clip as validate.py through the C++ code and prints PSNR
 next to the Python prototype's result, so we know the port is faithful.
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,8 +30,9 @@ def to_raw(src, dst):
 
 raw_in, raw_out = HERE / "_src.bgra", HERE / "_out.bgra"
 to_raw(SRC, raw_in)
+# exact timing off: Premiere's frame plus neighbours, as the Python "flow" mode
 r = subprocess.run([str(EXE), str(raw_in), str(W), str(H), "50", "25", str(raw_out)],
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, env=dict(os.environ, OE_EXACT="0"))
 print(r.stdout.strip(), r.stderr.strip())
 if r.returncode:
     sys.exit(r.returncode)
