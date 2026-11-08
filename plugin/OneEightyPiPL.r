@@ -22,11 +22,11 @@ resource 'PiPL' (16000) {
 #endif
 		AE_PiPL_Version { 2, 0 },
 		AE_Effect_Spec_Version { PF_PLUG_IN_VERSION, PF_PLUG_IN_SUBVERS },
-		/* PF_VERSION(0,6,0,DEVELOP,1) = (6<<15)|1 */
-		AE_Effect_Version { 196609 },
+		/* PF_VERSION(0,7,0,DEVELOP,1) = (7<<15)|1 */
+		AE_Effect_Version { 229377 },
 		AE_Effect_Info_Flags { 0 },
-		/* PF_OutFlag_WIDE_TIME_INPUT */
-		AE_Effect_Global_OutFlags { 0x00000002 },
+		/* PF_OutFlag_WIDE_TIME_INPUT | PF_OutFlag_SEND_UPDATE_PARAMS_UI */
+		AE_Effect_Global_OutFlags { 0x04000002 },
 		/* PF_OutFlag2_SUPPORTS_THREADED_RENDERING */
 		AE_Effect_Global_OutFlags_2 { 0x08000000 },
 		AE_Effect_Match_Name { "OneEighty MotionBlur" },

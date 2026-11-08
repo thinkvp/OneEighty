@@ -9,7 +9,7 @@
 
 // Keep in sync with AE_Effect_Version in OneEightyPiPL.r
 #define MAJOR_VERSION 0
-#define MINOR_VERSION 6
+#define MINOR_VERSION 7
 #define BUG_VERSION   0
 #define STAGE_VERSION PF_Stage_DEVELOP
 #define BUILD_VERSION 1
@@ -28,12 +28,14 @@ enum
     OE_VIEW,
     OE_FORCE_CPU,
     OE_LOG,
+    OE_UPDATE_BUTTON,  // "Check for updates" button (label shows when one is available)
     OE_ADV_END,        // ----
     OE_NUM_PARAMS
 };
 
 // Disk IDs identify parameters in saved projects: never reuse a retired ID
-// (1 = v0.1-v0.3 "Mode" popup, 9 = v0.4 "Render" popup).
+// (1 = v0.1-v0.3 "Mode" popup, 9 = v0.4 "Render" popup, 13 = test-build
+// "Check for updates automatically" checkbox).
 enum
 {
     OE_SRC_FPS_DISK_ID = 2,
@@ -46,6 +48,7 @@ enum
     OE_FORCE_CPU_DISK_ID = 10,
     OE_ADV_START_DISK_ID = 11,
     OE_ADV_END_DISK_ID = 12,
+    OE_UPDATE_BUTTON_DISK_ID = 14,
 };
 
 // Rendering: Premiere's GPU filter API only delivers whole timeline frames

@@ -29,7 +29,7 @@ cl /nologo /D "MSWindows" /EP "%OBJ%\OneEightyPiPL.rrc" > "%OBJ%\OneEightyPiPL.r
 rc /nologo /fo "%OBJ%\OneEightyPiPL.res" "%OBJ%\OneEightyPiPL.rc" || exit /b 1
 
 echo [2/5] Compile C++
-cl %CFLAGS% %AEINC% /Fo"%OBJ%\\" OneEighty.cpp MotionBlur.cpp Log.cpp tools\oe_offline.cpp tools\oe_gpu_offline.cpp || exit /b 1
+cl %CFLAGS% %AEINC% /Fo"%OBJ%\\" OneEighty.cpp MotionBlur.cpp Log.cpp UpdateCheck.cpp tools\oe_offline.cpp tools\oe_gpu_offline.cpp tools\oe_update_test.cpp || exit /b 1
 
 echo [3/5] Compile CUDA
 "%CUDA_PATH%\bin\nvcc.exe" -c -O3 -std=c++17 -Xcompiler "/MD /EHsc /W3" -I "%NVOF%" ^
@@ -39,6 +39,7 @@ echo [3/5] Compile CUDA
 
 echo [4/5] Link offline test tools
 link /nologo /OUT:"%OUT%\oe_offline.exe" "%OBJ%\oe_offline.obj" "%OBJ%\MotionBlur.obj" %CVLIBS% || exit /b 1
+link /nologo /OUT:"%OUT%\oe_update_test.exe" "%OBJ%\oe_update_test.obj" "%OBJ%\UpdateCheck.obj" "%OBJ%\Log.obj" winhttp.lib || exit /b 1
 link /nologo /OUT:"%OUT%\oe_gpu_offline.exe" "%OBJ%\oe_gpu_offline.obj" "%OBJ%\GpuMotionBlur.obj" "%OBJ%\MotionBlur.obj" ^
    %CVLIBS% %CUDALIBS% || exit /b 1
 
@@ -46,7 +47,7 @@ echo [5/5] Link plugin
 rem CUDA 13's cuda.lib/cudart_static load the NVIDIA driver at runtime (no nvcuda.dll import),
 rem so the plugin still loads, CPU-only, on machines without NVIDIA.
 link /nologo /DLL /OUT:"%OUT%\OneEighty.aex" /IMPLIB:"%OBJ%\OneEighty.lib" ^
-   "%OBJ%\OneEighty.obj" "%OBJ%\MotionBlur.obj" "%OBJ%\Log.obj" "%OBJ%\GpuMotionBlur.obj" ^
-   "%OBJ%\OneEightyPiPL.res" %CVLIBS% %CUDALIBS% kernel32.lib user32.lib || exit /b 1
+   "%OBJ%\OneEighty.obj" "%OBJ%\MotionBlur.obj" "%OBJ%\Log.obj" "%OBJ%\UpdateCheck.obj" "%OBJ%\GpuMotionBlur.obj" ^
+   "%OBJ%\OneEightyPiPL.res" %CVLIBS% %CUDALIBS% kernel32.lib user32.lib shell32.lib winhttp.lib || exit /b 1
 
 echo BUILD OK: %OUT%\OneEighty.aex

@@ -19,10 +19,21 @@ each output frame at its true 1/25 s moment, so motion advances evenly.
 
 ## Install
 
-1. Download `OneEighty-v…-win64.zip` from [Releases](https://github.com/thinkvp/OneEighty/releases) and unzip it.
-2. Close Premiere Pro, After Effects and Media Encoder.
-3. Double-click **Install OneEighty.bat** and allow it to make changes.
-4. In Premiere: **Effects › Video Effects › OneEighty › OneEighty Motion Blur**.
+1. Download **`OneEighty-v…-setup.exe`** from [Releases](https://github.com/thinkvp/OneEighty/releases).
+2. Close Premiere Pro, After Effects and Media Encoder, then run the installer.
+   It isn't code-signed yet, so Windows SmartScreen may warn: *More info › Run anyway*.
+3. In Premiere: **Effects › Video Effects › OneEighty › OneEighty Motion Blur**.
+
+Uninstall from Windows *Settings › Apps*. A `.zip` with install/uninstall scripts
+is also attached to each release for manual installs.
+
+**Updates:** the effect checks GitHub for a newer release about once a day (one
+anonymous request to the public releases page; nothing about you or your machine
+is sent). When one exists, the *Advanced* group and the *Updates* button say so;
+**Check for updates** checks immediately and offers to open the download page.
+Studios can switch the automatic check off with the environment variable
+`ONEEIGHTY_DISABLE_UPDATE_CHECK=1` or the registry value `DisableUpdateCheck=1`
+(DWORD) under `HKEY_CURRENT_USER` or `HKEY_LOCAL_MACHINE\Software\thinkvp\OneEighty`.
 
 **Requirements:** Windows 10/11 64-bit and Premiere Pro (tested with Premiere Pro
 2026 / 26.x). An NVIDIA GeForce RTX 20-series or newer GPU is strongly recommended;
@@ -37,7 +48,7 @@ Drop the effect on a 50p / 59.94p clip (at 100% speed) in a 25p sequence.
 | **Shutter angle** | The blur to simulate at the timeline rate. 180° is the classic film look; 360° is the maximum smear. |
 | **Quality** | **Normal** (default): best balance. **High**: cleaner edges where people pass in front of the background, slower. **Fast**: quickest (all on the GPU) but can shimmer on fine repeating patterns such as checked shirts. |
 | **Exact frame timing** | On (default): even motion for 59.94p → 25p. Makes no difference for 50p → 25p. |
-| *Advanced* | Source shutter angle and frame rate (auto by default), a **motion-vector view** that shows what the effect is tracking, Force CPU, and a debug log (`%TEMP%\OneEighty.log`). |
+| *Advanced* | Source shutter angle and frame rate (auto by default), a **motion-vector view** that shows what the effect is tracking, Force CPU, a debug log (`%TEMP%\OneEighty.log`), and update checks. |
 
 **Tips**
 
@@ -94,7 +105,8 @@ In short:
 4. `plugin\build.bat` → `plugin\build\OneEighty.aex`. For development,
    `plugin\install.bat` (once, as admin) links Premiere's plug-in folder to the
    build folder.
-5. Release zip: `python release\make_release.py` → `dist\`.
+5. Release: `python release\make_release.py` → `dist\` (Inno Setup installer, needs
+   Inno Setup 6, plus the zip).
 
 | Folder | |
 |---|---|

@@ -14,6 +14,7 @@
 #include "AE_EffectCB.h"
 #include "AE_Macros.h"
 #include "AE_EffectCBSuites.h"
+#include "AE_EffectSuites.h" // PF_ParamUtilsSuite3 (PF_UpdateParamUI)
 #include "Param_Utils.h"
 #include "SPBasic.h" // defines SPAPI, needed by PrSDKAESupport.h
 #include "PrSDKAESupport.h"
@@ -22,6 +23,6 @@
 
 extern "C"
 {
-    DllExport PF_Err EffectMain(
-        PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output);
+    DllExport PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[],
+                                PF_LayerDef* output, void* extra);
 }

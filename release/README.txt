@@ -17,12 +17,13 @@ REQUIREMENTS
 
 
 INSTALL
+  Installer: run OneEighty-v...-setup.exe (uninstall from Windows Settings >
+  Apps). Or, from the zip:
   1. Close Premiere Pro, After Effects and Media Encoder.
   2. Double-click "Install OneEighty.bat" and allow it to make changes.
   3. Start Premiere Pro: Effects > Video Effects > OneEighty >
      OneEighty Motion Blur.
-
-  To remove it, run "Uninstall OneEighty.bat".
+  To remove a zip install, run "Uninstall OneEighty.bat".
 
 
 USING IT
@@ -36,7 +37,18 @@ USING IT
                       repeating patterns such as checked shirts.
   Exact frame timing  On (default): even motion for 59.94p -> 25p.
   Advanced            Source shutter angle / frame rate, motion-vector view,
-                      Force CPU, debug log (%TEMP%\OneEighty.log).
+                      Force CPU, debug log (%TEMP%\OneEighty.log), updates.
+
+
+UPDATES
+  About once a day the effect asks GitHub whether a newer release exists (one
+  anonymous request to the public releases page; nothing about you or your
+  machine is sent). If there is one, the Advanced group and the Updates button
+  say so. "Check for updates" checks now and offers to open the download page.
+  To switch the automatic check off (studios / IT): set the environment
+  variable ONEEIGHTY_DISABLE_UPDATE_CHECK=1, or the DWORD registry value
+  DisableUpdateCheck=1 under HKEY_CURRENT_USER or HKEY_LOCAL_MACHINE
+  \Software\thinkvp\OneEighty.
 
 
 TIPS

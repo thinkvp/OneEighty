@@ -1,6 +1,6 @@
 # OneEighty Motion Blur (Premiere Pro / After Effects effect)
 
-v0.6. Gives high-frame-rate footage (50p, 59.94p) played at 100% speed on a
+v0.7. Gives high-frame-rate footage (50p, 59.94p) played at 100% speed on a
 lower-rate timeline (25p) the motion blur a 180° shutter at the timeline rate
 would have recorded, and (optionally) evens out the uneven frame steps of
 non-integer conversions like 59.94p → 25p.
@@ -16,9 +16,19 @@ non-integer conversions like 59.94p → 25p.
 | *Advanced* ▸ Source fps (0 = auto) | Clip's real frame rate; auto reads the original clip rate from Premiere. |
 | *Advanced* ▸ View | Result · Motion vectors (hue = direction, colour strength = speed, full at 1% of frame width per source frame; still areas grey). Shows why a shot artefacts. |
 | *Advanced* ▸ Force CPU | Do everything on the CPU (troubleshooting). |
+| *Advanced* ▸ Updates [Check for updates] | Checks now and shows the result in a Windows message box (offers to open the release page if newer). When a newer release is known, the Advanced group and this button are renamed ("Advanced - update available", "Update vX available") via `PF_UpdateParamUI`. |
 | *Advanced* ▸ Write debug log | One line per rendered frame in `%TEMP%\OneEighty.log`: path (`hybrid-dis`, `hybrid-nvof`, `cpu`), frame formats, timing plan, fetch / motion / total ms. |
 
 "Advanced" is a twirl-down group; Premiere ignores the start-collapsed flag, so it shows open there.
+
+**Update check** (`UpdateCheck.cpp`): about once a day, one anonymous GET of
+`api.github.com/repos/thinkvp/OneEighty/releases/latest` on a background thread
+(User-Agent `OneEighty-UpdateCheck/<version>`, nothing else sent); the result is
+cached in `%LOCALAPPDATA%\OneEighty\update.txt`. Opt-out for studios / IT:
+environment variable `ONEEIGHTY_DISABLE_UPDATE_CHECK=1`, or DWORD
+`DisableUpdateCheck=1` under `HKCU` or `HKLM\Software\thinkvp\OneEighty` (the
+button always works). Parameter names are limited to 31 characters, hence the
+short labels.
 
 The GPU is used automatically when an NVIDIA GPU with optical-flow hardware
 (Turing or newer) and driver are present; otherwise everything runs on the CPU.

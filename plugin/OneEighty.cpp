@@ -21,6 +21,7 @@
 #include "OneEighty.h"
 #include "MotionBlur.h"
 #include "gpu/GpuMotionBlur.h"
+#include "UpdateCheck.h"
 
 #include <opencv2/video/tracking.hpp> // DIS presets
 
@@ -132,14 +133,22 @@ bool SameSize(const PF_LayerDef* a, const PF_LayerDef* b) { return a->width == b
 // ------------------------------------------------------------- PF commands
 PF_Err About(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*)
 {
-    PF_SPRINTF(out_data->return_msg, "%s v%d.%d\r%s", OE_NAME, MAJOR_VERSION, MINOR_VERSION, OE_DESCRIPTION);
+    const oe::update::Status u = oe::update::Current();
+    const char* upd = u.state == oe::update::State::Available ? "Update available: v"
+                      : u.state == oe::update::State::UpToDate ? "Up to date (latest v"
+                                                                : "Updates: not checked yet";
+    const std::string tail = u.state == oe::update::State::Available ? u.latest
+                             : u.state == oe::update::State::UpToDate ? u.latest + ")"
+                                                                       : "";
+    PF_SPRINTF(out_data->return_msg, "%s v%s\r%s\r\r%s%s\rgithub.com/thinkvp/OneEighty", OE_NAME,
+               oe::update::CurrentVersion().c_str(), OE_DESCRIPTION, upd, tail.c_str());
     return PF_Err_NONE;
 }
 
 PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*)
 {
     out_data->my_version = PF_VERSION(MAJOR_VERSION, MINOR_VERSION, BUG_VERSION, STAGE_VERSION, BUILD_VERSION);
-    out_data->out_flags = PF_OutFlag_WIDE_TIME_INPUT;
+    out_data->out_flags = PF_OutFlag_WIDE_TIME_INPUT | PF_OutFlag_SEND_UPDATE_PARAMS_UI;
     out_data->out_flags2 = PF_OutFlag2_SUPPORTS_THREADED_RENDERING;
     // Premiere: formats in order of preference. 32-bit float BGRA keeps the
     // clip in Premiere's 32-bit pipeline (no 8-bit banding on log/graded
@@ -209,6 +218,8 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Write debug log", FALSE, 0, OE_LOG_DISK_ID);
+
+    PF_ADD_BUTTON("Updates", "Check for updates", 0, PF_ParamFlag_SUPERVISE, OE_UPDATE_BUTTON_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OE_ADV_END_DISK_ID);
@@ -301,6 +312,7 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     const bool exactTiming = params[OE_EXACT_TIMING]->u.bd.value != 0;
     const bool log = params[OE_LOG]->u.bd.value != 0;
     PF_LayerDef* curW = &params[OE_INPUT]->u.ld;
+    oe::update::MaybeCheckInBackground(); // daily, background, never blocks (opt-out: see UpdateCheck.cpp)
 
     if (!Valid(curW) || !SameSize(curW, output))
         return PF_COPY(curW, output, NULL, NULL);
@@ -533,6 +545,96 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
 
 } // namespace
 
+namespace
+{
+
+// Shows update status in Effect Controls by renaming the "Advanced" group and
+// the Updates button (PF_UpdateParamUI may change a parameter's name; allowed
+// during PF_Cmd_UPDATE_PARAMS_UI and PF_Cmd_USER_CHANGED_PARAM).
+std::atomic<int> gLabelLogCount{0};
+
+void ApplyUpdateLabels(PF_InData* in_data, PF_ParamDef* params[])
+{
+    const oe::update::Status u = oe::update::Current();
+    const bool avail = u.state == oe::update::State::Available;
+    // Param names are capped at 31 characters (PF_MAX_EFFECT_PARAM_NAME_LEN): keep the version on the button label.
+    const std::string group = avail ? "Advanced - update available" : "Advanced";
+    const std::string button = avail ? "Update v" + u.latest + " available" : "Updates";
+
+    const void* p = nullptr;
+    if (!in_data->pica_basicP ||
+        in_data->pica_basicP->AcquireSuite(kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, &p) != kSPNoError || !p)
+    {
+        if (gLabelLogCount.fetch_add(1) < 20)
+            Log("[update] PF Param Utils Suite unavailable: can't rename controls");
+        return;
+    }
+    const PF_ParamUtilsSuite3* pu = static_cast<const PF_ParamUtilsSuite3*>(p);
+    const struct
+    {
+        int index;
+        const std::string* name;
+    } items[] = {{OE_ADV_START, &group}, {OE_UPDATE_BUTTON, &button}};
+    for (const auto& it : items)
+    {
+        if (!params[it.index] || *it.name == params[it.index]->PF_DEF_NAME)
+            continue;
+        PF_ParamDef def = *params[it.index];
+        PF_STRNNCPY(def.PF_DEF_NAME, it.name->c_str(), sizeof(def.PF_DEF_NAME));
+        const PF_Err e = pu->PF_UpdateParamUI(in_data->effect_ref, it.index, &def);
+        if (gLabelLogCount.fetch_add(1) < 20)
+            Log("[update] rename param %d to '%s': %s (err %d)", it.index, it.name->c_str(), e ? "FAILED" : "ok", (int)e);
+    }
+    in_data->pica_basicP->ReleaseSuite(kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3);
+}
+
+std::atomic<int> gUpdateUiCount{0};
+
+PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData*, PF_ParamDef* params[])
+{
+    if (gUpdateUiCount.fetch_add(1) < 10)
+        Log("[update] PF_Cmd_UPDATE_PARAMS_UI received");
+    oe::update::MaybeCheckInBackground();
+    ApplyUpdateLabels(in_data, params);
+    return PF_Err_NONE;
+}
+
+PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], void* extra)
+{
+    const PF_UserChangedParamExtra* ex = static_cast<const PF_UserChangedParamExtra*>(extra);
+    if (!ex || ex->param_index != OE_UPDATE_BUTTON)
+        return PF_Err_NONE;
+    const oe::update::Status u = oe::update::CheckNow(6000);
+    const std::string cur = oe::update::CurrentVersion();
+    // A normal Windows message box: Premiere's own effect message (PF_OutFlag_DISPLAY_ERROR_MESSAGE)
+    // is styled as a red error, which reads wrong for "you're up to date".
+    HWND owner = GetActiveWindow();
+    char msg[512];
+    if (u.state == oe::update::State::Available)
+    {
+        snprintf(msg, sizeof(msg),
+                 "OneEighty Motion Blur v%s is available (you have v%s).\n\nOpen the download page?", u.latest.c_str(),
+                 cur.c_str());
+        if (MessageBoxA(owner, msg, "OneEighty Motion Blur", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+            ShellExecuteA(nullptr, "open", u.pageUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    else if (u.state == oe::update::State::UpToDate)
+    {
+        snprintf(msg, sizeof(msg), "OneEighty Motion Blur v%s is up to date.", cur.c_str());
+        MessageBoxA(owner, msg, "OneEighty Motion Blur", MB_OK | MB_ICONINFORMATION);
+    }
+    else
+    {
+        snprintf(msg, sizeof(msg), "Couldn't check for updates (%s).\n\nReleases: github.com/thinkvp/OneEighty/releases",
+                 u.error.c_str());
+        MessageBoxA(owner, msg, "OneEighty Motion Blur", MB_OK | MB_ICONWARNING);
+    }
+    ApplyUpdateLabels(in_data, params);
+    return PF_Err_NONE;
+}
+
+} // namespace
+
 extern "C" DllExport PF_Err PluginDataEntryFunction2(PF_PluginDataPtr inPtr, PF_PluginDataCB2 inPluginDataCallBackPtr,
                                                      SPBasicSuite* inSPBasicSuitePtr, const char* inHostName,
                                                      const char* inHostVersion)
@@ -543,7 +645,8 @@ extern "C" DllExport PF_Err PluginDataEntryFunction2(PF_PluginDataPtr inPtr, PF_
     return result;
 }
 
-PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output)
+PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output,
+                  void* extra)
 {
     PF_Err err = PF_Err_NONE;
     try
@@ -554,6 +657,8 @@ PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data, PF_Param
         case PF_Cmd_GLOBAL_SETUP: err = GlobalSetup(in_data, out_data, params, output); break;
         case PF_Cmd_PARAMS_SETUP: err = ParamsSetup(in_data, out_data, params, output); break;
         case PF_Cmd_RENDER: err = Render(in_data, out_data, params, output); break;
+        case PF_Cmd_UPDATE_PARAMS_UI: err = UpdateParamsUI(in_data, out_data, params); break;
+        case PF_Cmd_USER_CHANGED_PARAM: err = UserChangedParam(in_data, out_data, params, extra); break;
         default: break;
         }
     }
