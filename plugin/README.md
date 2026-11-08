@@ -11,7 +11,7 @@ whenever Premiere would drop frames: clips at 100% speed, and slowed-down files
 | Control | Meaning |
 |---|---|
 | **Shutter angle** | Look to simulate at the timeline rate (default 180°; 360° = maximum smear). Slider 90–360 (typed 0–720): at or below the footage's own exposure (source angle × timeline fps ÷ source frames per timeline second) `BlurHalfWidth` returns 0. |
-| **Quality** | **Normal** (default) / **High**: motion estimated on the CPU with OpenCV DIS at 960 px wide (FAST / MEDIUM preset; High ~2.4× the motion time, cleaner edges where people pass in front of the background), blur on the GPU. **Extra High**: the shutter integrated from 8 RIFE in-between frames (see below); falls back to High without CUDA, Vulkan or the model. Appended to the popup, so saved Normal / High settings are unchanged. |
+| **Quality** | **Normal** (default) / **High**: motion estimated on the CPU with OpenCV DIS at 960 px wide (FAST / MEDIUM preset; High ~2.4× the motion time, cleaner edges where people pass in front of the background), blur on the GPU. **Extra High**: the shutter integrated from 6 RIFE in-between frames (see below); falls back to High without CUDA, Vulkan or the model. Appended to the popup, so saved Normal / High settings are unchanged. |
 | **Exact frame timing** | On (default): each output frame is built at its exact timeline moment from the two source frames either side, so motion advances evenly (removes the 2/3-frame judder of 59.94p → 25p). Off: Premiere's own frame choice, blur only. No visible difference for 50p → 25p. |
 | *Advanced* ▸ Source shutter angle | Shutter the footage was shot with (default 180°). |
 | *Advanced* ▸ Source fps (0 = auto) | The clip's frame rate before any speed change; auto reads Premiere's original clip rate. |
@@ -38,7 +38,7 @@ button always works).
 The GPU is used automatically when an NVIDIA GPU (RTX 20-series / Turing or
 newer) and driver are present; otherwise everything runs on the CPU.
 
-**Extra High** (`rife/`): for each output frame, 8 samples are spread evenly
+**Extra High** (`rife/`): for each output frame, 6 samples are spread evenly
 over the shutter window around the output time; each sample is an in-between
 frame from the RIFE v4.6 network (Practical-RIFE, MIT) between the two source
 frames around its time (the frame before A / after B are fetched when the
@@ -106,11 +106,17 @@ Synthetic clips with a known-correct answer (`../prototype`), PSNR vs a real
 | Blur only (exact timing off) | 30.5 dB | 26.0 dB | 9.8 px |
 | Exact timing, Normal | 38.1 dB | 35.0 dB | 0.16 px |
 | Exact timing, High | 38.6 dB | 35.4 dB | 0.14 px |
-| Exact timing, Extra High | 40.4 dB | 37.4 dB | 0.24 px |
+| Exact timing, Extra High | 40.2 dB | 37.2 dB | 0.24 px |
 
 50p → 25p: Premiere 28.1 dB, Normal 38.8 dB, High 39.2 dB, Extra High 40.5 dB.
 GPU and CPU paths agree (`validate_cadence.py`). Extra High offline at UHD
-(RTX 4070): ~0.34 s RIFE + 0.035 s warping per frame (High: ~0.08 s).
+(RTX 4070): ~0.20 s RIFE + 0.03 s warping per frame (High: ~0.08 s). Samples:
+8 scored 40.4 / 40.5 dB (59.94p / 50p) and look the same as 6 on a fast ball; 4
+drop to 39.8 dB on 59.94p. Shrinking RIFE's analysis size below ~2 MP at UHD
+costs 0.9-1.5 dB, so it stays. Speed-ups that didn't change the output: RIFE's
+time inputs are cached on the GPU, the motion map goes to CUDA in ncnn's own
+layout (no conversion), input preparation runs on all cores and outside the
+GPU lock (Premiere renders frames in parallel).
 
 Premiere 26, RTX 4070, UHD on a 25p timeline, per frame:
 

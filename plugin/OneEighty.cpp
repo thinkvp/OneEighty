@@ -575,7 +575,9 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
                     if (have1)
                         sf.P = &m1;
                 }
-                constexpr int kSamples = 8;           // validated offline (8 = 40.5 dB on the 50p test)
+                // 6 samples: same look as 8 on a fast ball at 2x zoom; -0.2 dB on the 59.94p test,
+                // +0.0 on 50p; ~20% faster (8: 40.4 / 40.5 dB, 4: 39.8 / 40.4 dB)
+                constexpr int kSamples = 6;
                 constexpr int kRifePixels = 2100000;  // RIFE analysis size: about 1920 x 1080
                 done = oe::rife::RenderShutter(*rife, *eng, sf, order, argb && !outFloat, t, hw, kSamples, kRifePixels,
                                                vectors, out.data, out.step, &rstats, &gerr);

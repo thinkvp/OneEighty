@@ -48,7 +48,7 @@ Drop the effect on a 50p / 59.94p clip (at 100% speed) in a 25p sequence. Sped-u
 | Control | |
 |---|---|
 | **Shutter angle** | The blur to simulate at the timeline rate. 180° is the classic film look; 360° is the maximum smear. The slider starts at 90°: the footage already has that much blur (50p shot at 180° = 90° at 25p; 75° for 59.94p), so lower settings add nothing. You can still type 0–720. |
-| **Quality** | **Normal** (default): best balance. **High**: cleaner edges where people pass in front of the background, slower. **Extra High**: builds 8 in-between frames per output frame with the RIFE neural network and averages them, like a real shutter: clean backgrounds next to fast objects (no smudged court lines beside a bouncing ball) and a natural streak on the object. About 4× slower than High. Works on 10-bit / log / 32-bit footage at full precision. |
+| **Quality** | **Normal** (default): best balance. **High**: cleaner edges where people pass in front of the background, slower. **Extra High**: builds 6 in-between frames per output frame with the RIFE neural network and averages them, like a real shutter: clean backgrounds next to fast objects (no smudged court lines beside a bouncing ball) and a natural streak on the object. About 3× slower than High. Works on 10-bit / log / 32-bit footage at full precision. |
 | **Exact frame timing** | On (default): even motion for 59.94p → 25p. Makes no difference for 50p → 25p. |
 | *Advanced* | Source shutter angle and frame rate (auto by default), a **motion-vector view** that shows what the effect is tracking, Force CPU, a debug log (`%TEMP%\OneEighty.log`), and update checks. |
 
@@ -65,7 +65,7 @@ Drop the effect on a 50p / 59.94p clip (at 100% speed) in a 25p sequence. Sped-u
 
 **Speed** (RTX 4070, UHD 59.94p on a 25p timeline, per frame): about **0.27 s**
 with ProRes source at Normal quality, about 1.2 s with long-GOP camera files.
-Extra High adds about 0.3 s per frame (UHD, measured offline).
+Extra High adds about 0.15 s per frame (UHD, measured offline).
 
 ## How well does it work?
 
@@ -78,7 +78,7 @@ at 180° records), PSNR, higher is better:
 | OneEighty, exact frame timing off | 30.5 dB | 9.8 px |
 | **OneEighty, Normal, exact timing on** | **38.1 dB** | **0.16 px** |
 | OneEighty, High, exact timing on | 38.6 dB | 0.14 px |
-| OneEighty, Extra High, exact timing on | 40.4 dB | 0.24 px |
+| OneEighty, Extra High, exact timing on | 40.2 dB | 0.24 px |
 
 | 50p → 25p | Accuracy |
 |---|---|

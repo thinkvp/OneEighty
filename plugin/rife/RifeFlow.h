@@ -23,6 +23,7 @@ struct Field
 {
     cv::Mat flow; // CV_32FC4 at the analysis size: (f0x, f0y, f1x, f1y) in analysis pixels; sample frame0 at x + f0
     cv::Mat mask; // CV_32FC1 at the analysis size: weight of frame0 (frame1 gets 1 - mask)
+    std::shared_ptr<void> keep; // owns the buffers flow / mask may point into
 };
 
 class Engine

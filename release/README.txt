@@ -38,7 +38,7 @@ USING IT
                       background; slower.
                       Extra High: in-between frames from the RIFE neural
                       network, averaged like a real shutter: clean
-                      backgrounds next to fast objects. About 4x slower than
+                      backgrounds next to fast objects. About 3x slower than
                       High; needs the NVIDIA GPU (otherwise renders as High).
   Exact frame timing  On (default): even motion for 59.94p -> 25p.
   Advanced            Source shutter angle / frame rate, motion-vector view,

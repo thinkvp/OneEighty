@@ -8,7 +8,8 @@
 //   OE_QUALITY=high  DIS MEDIUM preset (default: Normal, DIS FAST)
 //   OE_QUALITY=extra Extra High: shutter from RIFE in-between frames
 //                  (model: OE_RIFE_MODEL or rife-v4.6 next to this exe)
-//   OE_SAMPLES=n   Extra High samples per output frame (default 8)
+//   OE_SAMPLES=n   Extra High samples per output frame (default 6, as the effect)
+//   OE_RIFE_PIXELS=n  Extra High RIFE analysis size limit in pixels (default 2100000)
 //   OE_FLOAT=1     run as 32-bit float (Premiere 32-bit); 2 = input x1.5 to
 //                  check values above 1.0 pass through unclipped
 //   OE_ARGB=1      feed ARGB bytes instead of BGRA (After Effects order)
@@ -66,13 +67,21 @@ int main(int argc, char** argv)
     const bool exact = Env("OE_EXACT") != '0';
     const int preset = Env("OE_QUALITY") == 'h' ? cv::DISOpticalFlow::PRESET_MEDIUM : cv::DISOpticalFlow::PRESET_FAST;
     const bool extra = Env("OE_QUALITY") == 'e';
-    int nSamples = 8;
+    int nSamples = 6;
     {
         char v[8] = {0};
         size_t len = 0;
         getenv_s(&len, v, sizeof(v), "OE_SAMPLES");
         if (v[0])
             nSamples = std::max(1, std::atoi(v));
+    }
+    int rifePixels = 2100000;
+    {
+        char v[16] = {0};
+        size_t len = 0;
+        getenv_s(&len, v, sizeof(v), "OE_RIFE_PIXELS");
+        if (v[0])
+            rifePixels = std::max(4096, std::atoi(v));
     }
     const bool argb = Env("OE_ARGB") == '1';
     const bool edgeFix = Env("OE_EDGEFIX") != '0';
@@ -158,7 +167,7 @@ int main(int argc, char** argv)
             if (A + 2 < (long)src.size() && oe::rife::NeedsNext(t, s.halfWidth))
                 f.N = &src[A + 2];
             oe::rife::ShutterStats rs;
-            ok = oe::rife::RenderShutter(*rife, *eng, f, order, argb && !useFloat, t, s.halfWidth, nSamples, 2100000,
+            ok = oe::rife::RenderShutter(*rife, *eng, f, order, argb && !useFloat, t, s.halfWidth, nSamples, rifePixels,
                                          s.showVectors, out.data, out.step, &rs, &err);
             tFlow = rs.rifeMs;
             st.gpuMs = rs.gpuMs;

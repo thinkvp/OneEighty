@@ -146,26 +146,28 @@ ncnn::Mat ToInput(const cv::Mat& small, const ChannelOrder& o, int wp, int hp)
     m.fill(0.0f);
     const bool isFloat = small.depth() == CV_32F;
     const int ch[3] = {o.r, o.g, o.b};
-    for (int q = 0; q < 3; ++q)
-    {
-        float* dst = m.channel(q);
-        for (int y = 0; y < small.rows; ++y)
+    cv::parallel_for_(cv::Range(0, small.rows), [&](const cv::Range& rows) {
+        for (int q = 0; q < 3; ++q)
         {
-            float* d = dst + (size_t)y * wp;
-            if (isFloat)
+            float* dst = m.channel(q);
+            for (int y = rows.start; y < rows.end; ++y)
             {
-                const float* s = small.ptr<float>(y) + ch[q];
-                for (int x = 0; x < small.cols; ++x, s += 4)
-                    d[x] = std::clamp(*s, 0.0f, 1.0f);
-            }
-            else
-            {
-                const uchar* s = small.ptr<uchar>(y) + ch[q];
-                for (int x = 0; x < small.cols; ++x, s += 4)
-                    d[x] = *s * (1.0f / 255.0f);
+                float* d = dst + (size_t)y * wp;
+                if (isFloat)
+                {
+                    const float* s = small.ptr<float>(y) + ch[q];
+                    for (int x = 0; x < small.cols; ++x, s += 4)
+                        d[x] = std::clamp(*s, 0.0f, 1.0f);
+                }
+                else
+                {
+                    const uchar* s = small.ptr<uchar>(y) + ch[q];
+                    for (int x = 0; x < small.cols; ++x, s += 4)
+                        d[x] = *s * (1.0f / 255.0f);
+                }
             }
         }
-    }
+    });
     return m;
 }
 
@@ -228,7 +230,6 @@ public:
     {
         if (a.empty() || b.empty() || a.size() != b.size() || a.type() != b.type())
             return Fail(err, "RIFE: frames differ in size or type");
-        std::lock_guard<std::mutex> lock(mu_);
         const int W = a.cols, H = a.rows;
         const double s = std::min(1.0, std::sqrt((double)maxPixels / ((double)W * H)));
         const int aw = std::max(32, (int)std::lround(W * s)), ah = std::max(32, (int)std::lround(H * s));
@@ -240,6 +241,9 @@ public:
         }
         const int wp = (aw + 31) / 32 * 32, hp = (ah + 31) / 32 * 32;
         const ncnn::Mat in0 = ToInput(sa, order, wp, hp), in1 = ToInput(sb, order, wp, hp);
+        // only the GPU part is serialised: the CPU preparation above overlaps
+        // with another render's inference (Premiere renders frames in parallel)
+        std::lock_guard<std::mutex> lock(mu_);
 
         ncnn::VkAllocator* blob = vkdev_->acquire_blob_allocator();
         ncnn::VkAllocator* staging = vkdev_->acquire_staging_allocator();
@@ -256,10 +260,8 @@ public:
             cmd.record_upload(in1, in1g, opt);
             for (size_t i = 0; i < ts.size() && ok; ++i)
             {
-                ncnn::Mat tm(wp, hp, 1);
-                tm.fill(std::clamp(ts[i], 0.0f, 1.0f));
-                ncnn::VkMat tg, fg, mg;
-                cmd.record_upload(tm, tg, opt);
+                ncnn::VkMat fg, mg;
+                const ncnn::VkMat tg = Timestep(ts[i], wp, hp, cmd, opt);
                 ncnn::Extractor ex = net_.create_extractor();
                 ex.set_blob_vkallocator(blob);
                 ex.set_workspace_vkallocator(blob);
@@ -284,13 +286,23 @@ public:
                     break;
                 }
                 cmd.reset();
-                const ncnn::Mat f = Unpack(fc, opt), m = Unpack(mc, opt);
+                Field& fld = (*out)[i];
+                if (fc.c == 1 && fc.elempack == 4 && fc.elembits() == 32 && mc.c == 1 && mc.elempack == 1 &&
+                    mc.elembits() == 32 && fc.w >= aw && fc.h >= ah && mc.w >= aw && mc.h >= ah)
+                {
+                    // the 4 flow channels arrive packed per pixel: exactly the float4 field the
+                    // CUDA side wants, so hand the downloaded buffers over without converting
+                    fld.flow = cv::Mat(ah, aw, CV_32FC4, fc.data, (size_t)fc.w * fc.elemsize);
+                    fld.mask = cv::Mat(ah, aw, CV_32FC1, mc.data, (size_t)mc.w * mc.elemsize);
+                    fld.keep = std::make_shared<std::pair<ncnn::Mat, ncnn::Mat>>(fc, mc);
+                    continue;
+                }
+                const ncnn::Mat f = Unpack(fc, opt), m = Unpack(mc, opt); // other layouts: convert
                 if (f.c < 4 || m.c < 1 || f.w < aw || f.h < ah)
                 {
                     ok = Fail(err, "RIFE: unexpected output shape");
                     break;
                 }
-                Field& fld = (*out)[i];
                 fld.flow.create(ah, aw, CV_32FC4);
                 fld.mask.create(ah, aw, CV_32FC1);
                 for (int y = 0; y < ah; ++y)
@@ -317,6 +329,33 @@ public:
     }
 
 private:
+    // RIFE's time input is a constant map the size of the frame. Sample times
+    // repeat from frame to frame (one set for 2:1 cadences, a short cycle for
+    // 59.94p -> 25p), so the uploaded maps are kept on the GPU and reused.
+    ncnn::VkMat Timestep(float t, int wp, int hp, ncnn::VkCompute& cmd, const ncnn::Option& opt)
+    {
+        t = std::clamp(t, 0.0f, 1.0f);
+        const long long key = ((long long)wp << 40) ^ ((long long)hp << 20) ^ (long long)std::lround(t * 100000.0f);
+        for (auto& e : timesteps_)
+            if (e.first == key)
+                return e.second;
+        if (!timestepAlloc_)
+            timestepAlloc_ = std::make_unique<ncnn::VkBlobAllocator>(vkdev_);
+        ncnn::Mat tm(wp, hp, 1);
+        tm.fill(t);
+        ncnn::Option o = opt;
+        o.blob_vkallocator = timestepAlloc_.get();
+        ncnn::VkMat g;
+        cmd.record_upload(tm, g, o);
+        if (timesteps_.size() >= kMaxTimesteps)
+            timesteps_.erase(timesteps_.begin()); // oldest first
+        timesteps_.emplace_back(key, g);
+        return g;
+    }
+
+    static constexpr size_t kMaxTimesteps = 48; // ~4 MB each at 2 MP (fp16)
+    std::unique_ptr<ncnn::VkBlobAllocator> timestepAlloc_;    // declared first: outlives the maps below
+    std::vector<std::pair<long long, ncnn::VkMat>> timesteps_;
     std::mutex mu_;
     const ncnn::VulkanDevice* vkdev_ = nullptr;
     ncnn::Net net_;
