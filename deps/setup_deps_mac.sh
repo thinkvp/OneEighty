@@ -62,20 +62,23 @@ echo "NCNN READY"
 MVK_VER=v1.4.2
 MVK_SHA256=f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
 if [ ! -f moltenvk/libMoltenVK.dylib ]; then
-    rm -rf moltenvk MoltenVK
-    $CURL -o moltenvk.tar "https://github.com/KhronosGroup/MoltenVK/releases/download/$MVK_VER/MoltenVK-macos.tar"
-    echo "$MVK_SHA256  moltenvk.tar" | shasum -a 256 -c -
-    tar -xf moltenvk.tar MoltenVK/LICENSE MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
+    # extracted into its own folder: the tar's MoltenVK/ is the same folder as
+    # moltenvk/ on macOS's case-insensitive file system
+    rm -rf moltenvk mvk-tmp
+    mkdir mvk-tmp
+    $CURL -o mvk-tmp/moltenvk.tar "https://github.com/KhronosGroup/MoltenVK/releases/download/$MVK_VER/MoltenVK-macos.tar"
+    echo "$MVK_SHA256  mvk-tmp/moltenvk.tar" | shasum -a 256 -c -
+    tar -xf mvk-tmp/moltenvk.tar -C mvk-tmp MoltenVK/LICENSE MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
     mkdir moltenvk
-    LIB=MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
+    LIB=mvk-tmp/MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
     # arm64 only, like the plugin
     if lipo -archs "$LIB" | grep -q x86_64; then
         lipo "$LIB" -thin arm64 -output moltenvk/libMoltenVK.dylib
     else
         cp "$LIB" moltenvk/libMoltenVK.dylib
     fi
-    cp MoltenVK/LICENSE moltenvk/LICENSE
-    rm -rf MoltenVK moltenvk.tar
+    cp mvk-tmp/MoltenVK/LICENSE moltenvk/LICENSE
+    rm -rf mvk-tmp
     codesign --force --sign - --timestamp=none moltenvk/libMoltenVK.dylib # thinned: re-sign (ad hoc)
 fi
 echo "MOLTENVK READY"
