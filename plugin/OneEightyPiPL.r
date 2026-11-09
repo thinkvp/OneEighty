@@ -17,7 +17,7 @@ resource 'PiPL' (16000) {
 		CodeWinARM64 {"EffectMain"},
 	#endif
 #elif defined(AE_OS_MAC)
-		CodeMacIntel64 {"EffectMain"},
+		/* Apple Silicon only: the bundle has no x86_64 slice */
 		CodeMacARM64 {"EffectMain"},
 #endif
 		AE_PiPL_Version { 2, 0 },

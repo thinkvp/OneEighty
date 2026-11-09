@@ -20,10 +20,25 @@ namespace
 {
 char Env(const char* name)
 {
+#ifdef _WIN32
     char v[8] = {0};
     size_t len = 0;
     getenv_s(&len, v, sizeof(v), name);
     return v[0];
+#else
+    const char* v = std::getenv(name);
+    return v ? v[0] : 0;
+#endif
+}
+
+FILE* Open(const char* path, const char* mode)
+{
+#ifdef _WIN32
+    FILE* f = nullptr;
+    return fopen_s(&f, path, mode) == 0 ? f : nullptr;
+#else
+    return std::fopen(path, mode);
+#endif
 }
 } // namespace
 
@@ -41,8 +56,8 @@ int main(int argc, char** argv)
     const bool useFloat = Env("OE_FLOAT") == '1';
     const size_t frameBytes = (size_t)W * H * 4;
 
-    FILE* fi = nullptr;
-    if (fopen_s(&fi, argv[1], "rb") || !fi)
+    FILE* fi = Open(argv[1], "rb");
+    if (!fi)
         return 1;
     std::vector<cv::Mat> src;
     for (;;)
@@ -65,7 +80,7 @@ int main(int argc, char** argv)
     std::printf("%zu source frames, halfWidth=%.4f, %s timing\n", src.size(), s.halfWidth, exact ? "exact" : "nearest");
 
     FILE* fo = nullptr;
-    if (fopen_s(&fo, argv[6], "wb") || !fo)
+    if (!(fo = Open(argv[6], "wb")))
         return 1;
     const int type = useFloat ? CV_32FC4 : CV_8UC4;
     cv::Mat out(H, W, type), outA(H, W, type), outB(H, W, type), out8(H, W, CV_8UC4);

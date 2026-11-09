@@ -16,13 +16,14 @@
     sub-frame times), estimates per-pixel motion with optical flow and smears
     each pixel along its path to add the missing shutter time.
 
-    Debug log: %TEMP%\OneEighty.log
+    Debug log: %TEMP%\OneEighty.log (Windows), ~/Library/Logs/OneEighty.log (macOS)
 */
 
 #include "OneEighty.h"
 #include "MotionBlur.h"
 #include "gpu/GpuMotionBlur.h"
 #include "UpdateCheck.h"
+#include "Platform.h"
 #include "rife/RifeShutter.h"
 
 #include <opencv2/video/tracking.hpp> // DIS presets
@@ -767,28 +768,28 @@ PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
         return PF_Err_NONE;
     const oe::update::Status u = oe::update::CheckNow(6000);
     const std::string cur = oe::update::CurrentVersion();
-    // A normal Windows message box: Premiere's own effect message (PF_OutFlag_DISPLAY_ERROR_MESSAGE)
+    // A normal system message box: Premiere's own effect message (PF_OutFlag_DISPLAY_ERROR_MESSAGE)
     // is styled as a red error, which reads wrong for "you're up to date".
-    HWND owner = GetActiveWindow();
+    const char* title = "OneEighty Motion Blur";
     char msg[512];
     if (u.state == oe::update::State::Available)
     {
         snprintf(msg, sizeof(msg),
                  "OneEighty Motion Blur v%s is available (you have v%s).\n\nOpen the download page?", u.latest.c_str(),
                  cur.c_str());
-        if (MessageBoxA(owner, msg, "OneEighty Motion Blur", MB_YESNO | MB_ICONINFORMATION) == IDYES)
-            ShellExecuteA(nullptr, "open", u.pageUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        if (oe::platform::AskYesNo(title, msg))
+            oe::platform::OpenUrl(u.pageUrl);
     }
     else if (u.state == oe::update::State::UpToDate)
     {
         snprintf(msg, sizeof(msg), "OneEighty Motion Blur v%s is up to date.", cur.c_str());
-        MessageBoxA(owner, msg, "OneEighty Motion Blur", MB_OK | MB_ICONINFORMATION);
+        oe::platform::ShowMessage(title, msg, false);
     }
     else
     {
         snprintf(msg, sizeof(msg), "Couldn't check for updates (%s).\n\nReleases: github.com/thinkvp/OneEighty/releases",
                  u.error.c_str());
-        MessageBoxA(owner, msg, "OneEighty Motion Blur", MB_OK | MB_ICONWARNING);
+        oe::platform::ShowMessage(title, msg, true);
     }
     ApplyUpdateLabels(in_data, params);
     return PF_Err_NONE;

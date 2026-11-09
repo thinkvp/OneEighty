@@ -1,0 +1,79 @@
+# Builds the macOS plugin (Apple Silicon) on GitHub's Mac runners and uploads
+# OneEighty.plugin as a build artifact.
+#
+# The After Effects SDK can't live in this public repo (Adobe licence), so it
+# is checked out from a private repo: set the repository secret AE_SDK_TOKEN
+# (a fine-grained token with read access to that repo's contents) and, if the
+# repo isn't thinkvp/OneEighty-sdk, the repository variable AE_SDK_REPO. The
+# private repo holds the SDK as ae/Examples/... (the same layout as sdk/ here).
+name: macOS build
+
+on:
+  push:
+    branches: [main, "mac**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check SDK access
+        env:
+          AE_SDK_TOKEN: ${{ secrets.AE_SDK_TOKEN }}
+        run: |
+          if [ -z "$AE_SDK_TOKEN" ]; then
+            echo "::error::Repository secret AE_SDK_TOKEN is not set (see the comment at the top of .github/workflows/macos.yml)"
+            exit 1
+          fi
+
+      - name: Check out After Effects SDK (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.AE_SDK_REPO || 'thinkvp/OneEighty-sdk' }}
+          token: ${{ secrets.AE_SDK_TOKEN }}
+          path: sdk
+
+      # vcpkg's binary cache: OpenCV builds once (~15 min), then restores in seconds.
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-macos-arm64-${{ hashFiles('deps/setup_deps_mac.sh', 'deps/triplets/**') }}
+
+      - name: Dependencies (OpenCV)
+        run: sh deps/setup_deps_mac.sh
+
+      - name: Build
+        run: |
+          cmake -S plugin -B plugin/build-mac -DCMAKE_BUILD_TYPE=Release
+          cmake --build plugin/build-mac --parallel
+
+      - name: Check the bundle
+        run: |
+          B=plugin/build-mac/OneEighty.plugin
+          ls -R "$B"
+          file "$B/Contents/MacOS/OneEighty"
+          echo "Exported symbols:"
+          nm -gU "$B/Contents/MacOS/OneEighty" | grep -E "EffectMain|PluginDataEntryFunction2"
+          test -s "$B/Contents/Resources/OneEighty.rsrc"
+          codesign --verify --verbose "$B"
+          echo "Linked libraries (system only expected):"
+          otool -L "$B/Contents/MacOS/OneEighty"
+
+      - name: Update check test
+        run: plugin/build-mac/oe_update_test
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent plugin/build-mac/OneEighty.plugin dist/OneEighty-mac-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OneEighty-mac-arm64
+          path: |
+            dist/OneEighty-mac-arm64.zip
+            plugin/build-mac/oe_offline

@@ -88,6 +88,6 @@ constexpr double kPrTicksPerSecond = 254016000000.0;
 // Defined in MotionBlur.cpp (see MotionBlur.h).
 double BlurHalfWidth(double srcFps, double outFps, double srcShutterDeg, double targetShutterDeg);
 
-// Appends a line to %TEMP%\OneEighty.log (Log.cpp).
+// Appends a line to the debug log (Log.cpp; path in Platform.h).
 void Log(const char* fmt, ...);
 } // namespace oe

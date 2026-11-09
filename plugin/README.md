@@ -165,6 +165,36 @@ for the GPU path (Vulkan for Extra High comes with it); the plugin loads and
 runs CPU-only without it. Close Premiere
 before rebuilding (it locks the .aex); restart it to load the new build.
 
+## macOS (in progress)
+
+Apple Silicon only. Stage 1 (now): CPU only, through `gpu/NoGpu.cpp`, so the
+effect behaves as on a Windows PC without NVIDIA and Extra High renders as
+High. Next: a Metal engine in place of `gpu/GpuMotionBlur.cu`, then Extra High
+(ncnn through MoltenVK, warping in Metal).
+
+OS-specific code lives in `Platform.h` (`Platform_win.cpp` / `Platform_mac.mm`):
+log path (`~/Library/Logs/OneEighty.log` on macOS), update cache
+(`~/Library/Application Support/OneEighty/update.txt`), HTTPS (NSURLSession),
+message boxes (NSAlert) and the update-check opt-out
+(`defaults write com.thinkvp.OneEighty DisableUpdateCheck -bool true`, or the
+same key in a managed profile, besides the environment variable).
+
+Build on a Mac:
+```
+deps/setup_deps_mac.sh          # once: vcpkg + static OpenCV (arm64, macOS 12+)
+cmake -S plugin -B plugin/build-mac -DCMAKE_BUILD_TYPE=Release
+cmake --build plugin/build-mac  # -> plugin/build-mac/OneEighty.plugin (ad-hoc signed)
+```
+Needs the Xcode command line tools and CMake. GitHub Actions builds the same on
+every push (`.github/workflows/macos.yml`; the SDK comes from a private repo,
+see the comment at the top of that file) and attaches `OneEighty-mac-arm64.zip`.
+
+Install for testing (Premiere closed):
+```
+xattr -dr com.apple.quarantine OneEighty.plugin   # if it was downloaded
+sudo cp -R OneEighty.plugin "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/"
+```
+
 ## Offline tests
 
 Raw BGRA frames in and out, processed as the effect does (`build\`):

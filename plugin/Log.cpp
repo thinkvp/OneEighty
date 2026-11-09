@@ -1,13 +1,8 @@
-#ifndef NOMINMAX
-    #define NOMINMAX
-#endif
-#include <windows.h>
-
 #include "OneEightyParams.h"
+#include "Platform.h"
 
 #include <cstdarg>
 #include <cstdio>
-#include <cstring>
 #include <mutex>
 
 namespace oe
@@ -17,6 +12,16 @@ namespace
 std::mutex gLogMutex;
 int gLogLines = 0;
 constexpr int kMaxLogLines = 5000;
+
+FILE* OpenAppend(const std::filesystem::path& p)
+{
+#ifdef _WIN32
+    FILE* f = nullptr;
+    return _wfopen_s(&f, p.c_str(), L"a") == 0 ? f : nullptr;
+#else
+    return std::fopen(p.c_str(), "a");
+#endif
+}
 } // namespace
 
 void Log(const char* fmt, ...)
@@ -24,18 +29,15 @@ void Log(const char* fmt, ...)
     std::lock_guard<std::mutex> lock(gLogMutex);
     if (gLogLines >= kMaxLogLines)
         return;
-    char path[MAX_PATH] = {0};
-    DWORD n = GetTempPathA(MAX_PATH, path);
-    if (n == 0 || n > MAX_PATH - 20)
+    static const std::filesystem::path path = platform::LogPath();
+    if (path.empty())
         return;
-    strcat_s(path, "OneEighty.log");
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "a") != 0 || !f)
+    FILE* f = OpenAppend(path);
+    if (!f)
         return;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(f, "%02d:%02d:%02d.%03d [t%05lu] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-            GetCurrentThreadId() % 100000);
+    int h, m, s, ms;
+    platform::LocalTime(&h, &m, &s, &ms);
+    fprintf(f, "%02d:%02d:%02d.%03d [t%05lu] ", h, m, s, ms, platform::ThreadId() % 100000);
     va_list ap;
     va_start(ap, fmt);
     vfprintf(f, fmt, ap);

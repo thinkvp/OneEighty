@@ -1,19 +1,10 @@
-#ifndef NOMINMAX
-    #define NOMINMAX
-#endif
-#include <windows.h>
-#include <shlobj.h>
-#include <winhttp.h>
-
-#pragma comment(lib, "winhttp.lib")  // update request
-#pragma comment(lib, "shell32.lib")  // SHGetKnownFolderPath
-#pragma comment(lib, "ole32.lib")    // CoTaskMemFree
-#pragma comment(lib, "advapi32.lib") // RegGetValueW (opt-out)
-
 #include "UpdateCheck.h"
 #include "OneEightyParams.h"
+#include "Platform.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstdio>
 #include <ctime>
 #include <fstream>
@@ -27,8 +18,8 @@ namespace oe::update
 namespace
 {
 
-constexpr wchar_t kHost[] = L"api.github.com";
-constexpr wchar_t kPath[] = L"/repos/thinkvp/OneEighty/releases/latest";
+constexpr char kHost[] = "api.github.com";
+constexpr char kPath[] = "/repos/thinkvp/OneEighty/releases/latest";
 constexpr char kReleasesPage[] = "https://github.com/thinkvp/OneEighty/releases/latest";
 constexpr long long kCheckIntervalSec = 24 * 3600;
 
@@ -38,30 +29,11 @@ bool gLoadedCache = false;
 std::atomic<bool> gBackgroundStarted{false};
 long long gLastCheck = 0; // unix seconds
 
-// %LOCALAPPDATA%\OneEighty\update.txt, via the Known Folders API (the
-// LOCALAPPDATA environment variable isn't reliable inside host processes).
-std::wstring CachePath()
+// update.txt in the per-user data folder (Platform.h).
+std::filesystem::path CachePath()
 {
-    PWSTR base = nullptr;
-    std::wstring path;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &base)) && base)
-    {
-        const std::wstring dir = std::wstring(base) + L"\\OneEighty";
-        CreateDirectoryW(dir.c_str(), nullptr);
-        path = dir + L"\\update.txt";
-    }
-    CoTaskMemFree(base);
-    return path;
-}
-
-std::string Narrow(const std::wstring& w)
-{
-    if (w.empty())
-        return "";
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
-    return s;
+    const std::filesystem::path dir = platform::DataDir();
+    return dir.empty() ? dir : dir / "update.txt";
 }
 
 std::string Trim(std::string s)
@@ -77,7 +49,7 @@ void LoadCacheLocked()
     if (gLoadedCache)
         return;
     gLoadedCache = true;
-    const std::wstring path = CachePath();
+    const std::filesystem::path path = CachePath();
     std::ifstream f(path);
     long long t = 0;
     std::string latest, url;
@@ -98,17 +70,17 @@ void LoadCacheLocked()
             gStatus.state = CompareVersions(latest, CurrentVersion()) > 0 ? State::Available : State::UpToDate;
         }
     }
-    Log("[update] cache %s: %s (last check %lld, latest '%s')", Narrow(path).c_str(), loaded ? "loaded" : "not found",
+    Log("[update] cache %s: %s (last check %lld, latest '%s')", path.u8string().c_str(), loaded ? "loaded" : "not found",
         gLastCheck, gStatus.latest.c_str());
 }
 
 void SaveCacheLocked()
 {
-    const std::wstring path = CachePath();
+    const std::filesystem::path path = CachePath();
     std::ofstream f(path, std::ios::out | std::ios::trunc);
     f << gLastCheck << "\n" << gStatus.latest << "\n" << gStatus.pageUrl << "\n";
     f.close();
-    Log("[update] cache saved to %s: %s", Narrow(path).c_str(), f.fail() ? "FAILED" : "ok");
+    Log("[update] cache saved to %s: %s", path.u8string().c_str(), f.fail() ? "FAILED" : "ok");
 }
 
 // Value of a top-level JSON string field ("key":"value"); enough for this API.
@@ -130,52 +102,16 @@ std::string JsonString(const std::string& json, const char* key)
 
 bool HttpGetLatest(int timeoutMs, std::string* body, std::string* err)
 {
-    const std::string ver = CurrentVersion(); // one string: begin() and end() must come from the same object
-    const std::wstring ua = L"OneEighty-UpdateCheck/" + std::wstring(ver.begin(), ver.end());
-    HINTERNET s = WinHttpOpen(ua.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
-                              WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!s)
-        s = WinHttpOpen(ua.c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
-                        WINHTTP_NO_PROXY_BYPASS, 0); // pre-8.1 fallback
-    if (!s)
+    int code = 0;
+    if (!platform::HttpsGet(kHost, kPath, "OneEighty-UpdateCheck/" + CurrentVersion(), "application/vnd.github+json",
+                            timeoutMs, body, &code, err))
+        return false;
+    if (code != 200)
     {
-        *err = "WinHttpOpen failed";
+        *err = "HTTP " + std::to_string(code);
         return false;
     }
-    WinHttpSetTimeouts(s, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
-    bool ok = false;
-    HINTERNET c = WinHttpConnect(s, kHost, INTERNET_DEFAULT_HTTPS_PORT, 0);
-    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", kPath, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                         WINHTTP_FLAG_SECURE)
-                    : nullptr;
-    if (r && WinHttpSendRequest(r, L"Accept: application/vnd.github+json\r\n", (DWORD)-1L, WINHTTP_NO_REQUEST_DATA,
-                                0, 0, 0) &&
-        WinHttpReceiveResponse(r, nullptr))
-    {
-        DWORD code = 0, len = sizeof(code);
-        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-                            &code, &len, WINHTTP_NO_HEADER_INDEX);
-        DWORD avail = 0;
-        while (WinHttpQueryDataAvailable(r, &avail) && avail > 0 && body->size() < 1 << 20)
-        {
-            std::vector<char> buf(avail);
-            DWORD got = 0;
-            if (!WinHttpReadData(r, buf.data(), avail, &got) || got == 0)
-                break;
-            body->append(buf.data(), got);
-        }
-        ok = code == 200;
-        if (!ok)
-            *err = "HTTP " + std::to_string(code);
-    }
-    else
-        *err = "request failed (" + std::to_string(GetLastError()) + ")";
-    if (r)
-        WinHttpCloseHandle(r);
-    if (c)
-        WinHttpCloseHandle(c);
-    WinHttpCloseHandle(s);
-    return ok;
+    return true;
 }
 
 Status DoCheck(int timeoutMs)
@@ -241,22 +177,22 @@ std::vector<int> Parts(const std::string& v)
 }
 
 // Studio / IT opt-out for the automatic check (the "Check for updates" button
-// always works): environment variable ONEEIGHTY_DISABLE_UPDATE_CHECK=1, or
-// DWORD DisableUpdateCheck=1 under HKCU or HKLM \Software\thinkvp\OneEighty.
+// always works): environment variable ONEEIGHTY_DISABLE_UPDATE_CHECK=1, or the
+// DisableUpdateCheck policy (registry on Windows, defaults on macOS; Platform.h).
 bool AutoCheckDisabled()
 {
+#ifdef _WIN32
     char env[8] = {0};
-    if (GetEnvironmentVariableA("ONEEIGHTY_DISABLE_UPDATE_CHECK", env, sizeof(env)) && env[0] && env[0] != '0')
+    size_t len = 0;
+    getenv_s(&len, env, sizeof(env), "ONEEIGHTY_DISABLE_UPDATE_CHECK");
+#else
+    const char* env = std::getenv("ONEEIGHTY_DISABLE_UPDATE_CHECK");
+    if (!env)
+        return platform::PolicyDisablesUpdateCheck();
+#endif
+    if (env[0] && env[0] != '0')
         return true;
-    for (HKEY root : {HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE})
-    {
-        DWORD v = 0, size = sizeof(v);
-        if (RegGetValueW(root, L"Software\\thinkvp\\OneEighty", L"DisableUpdateCheck", RRF_RT_REG_DWORD, nullptr,
-                         &v, &size) == ERROR_SUCCESS &&
-            v != 0)
-            return true;
-    }
-    return false;
+    return platform::PolicyDisablesUpdateCheck();
 }
 
 } // namespace
