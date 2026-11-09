@@ -1,12 +1,11 @@
 #pragma once
-// Runs a function on a thread with a large stack and waits for it.
+// Runs a function on a thread with a chosen stack size and waits for it.
 //
-// Premiere on macOS renders on threads with 512 KB stacks (measured: 73 of
-// Premiere 2026's threads). ncnn's Vulkan device setup and its glslang shader
-// compiles need more than that, so Quality Extra High crashed Premiere's render
-// thread ("A low-level exception occurred in: OneEighty Motion Blur
-// (AEVideoFilter:11)") on a real Apple GPU. Windows threads get 1 MB or more,
-// and command-line tools run on the 8 MB main thread, so neither showed it.
+// Used by oe_gpu_offline (OE_STACK_KB=512) to run the effect's maths on a
+// stack the size of Premiere's macOS render threads (512 KB, measured on
+// Premiere 2026), which command-line tools on the 8 MB main thread never see.
+// The effect itself runs on Premiere's own thread, where Premiere catches a
+// crash and disables the effect instead of quitting.
 //
 // On macOS fn runs on a fresh thread with kLargeStackBytes of stack (falling
 // back to the calling thread if that thread can't be created); exceptions are

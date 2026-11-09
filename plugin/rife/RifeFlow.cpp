@@ -8,7 +8,6 @@
 #endif
 
 #include "RifeFlow.h"
-#include "../LargeStack.h"
 
 // ncnn: vcpkg ncnn[vulkan] on Windows; on macOS built by deps/setup_deps_mac.sh
 // with its own Vulkan loader (NCNN_SIMPLEVK), pointed at the bundled MoltenVK
@@ -283,19 +282,8 @@ public:
         return true;
     }
 
-    // ncnn may build and compile utility pipelines on first use (upload casts,
-    // packing), so inference gets a large stack too (see LargeStack.h)
     bool Estimate(const cv::Mat& a, const cv::Mat& b, const ChannelOrder& order, int maxPixels,
                   const std::vector<float>& ts, std::vector<Field>* out, std::string* err) override
-    {
-        bool ok = false;
-        RunOnLargeStack([&] { ok = EstimateHere(a, b, order, maxPixels, ts, out, err); });
-        return ok;
-    }
-
-private:
-    bool EstimateHere(const cv::Mat& a, const cv::Mat& b, const ChannelOrder& order, int maxPixels,
-                      const std::vector<float>& ts, std::vector<Field>* out, std::string* err)
     {
         if (a.empty() || b.empty() || a.size() != b.size() || a.type() != b.type())
             return Fail(err, "RIFE: frames differ in size or type");
@@ -436,10 +424,7 @@ private:
 std::unique_ptr<Engine> Engine::Create(const std::wstring& modelDir, std::string* err)
 {
     auto e = std::make_unique<EngineImpl>();
-    // Vulkan device setup, model load and shader compiles: large stack (LargeStack.h)
-    bool ok = false;
-    RunOnLargeStack([&] { ok = e->Init(modelDir, err); });
-    if (!ok)
+    if (!e->Init(modelDir, err))
         return nullptr;
     return e;
 }

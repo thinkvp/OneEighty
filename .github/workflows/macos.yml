@@ -80,8 +80,10 @@ jobs:
           B=plugin/build-mac/OneEighty.plugin
           ls -R "$B"
           file "$B/Contents/MacOS/OneEighty"
-          echo "Exported symbols:"
-          nm -gU "$B/Contents/MacOS/OneEighty" | grep -E "EffectMain|PluginDataEntryFunction2"
+          echo "Exported symbols (exactly the two entry points: anything else, e.g. glslang"
+          echo "from ncnn, binds to Premiere's own copy at load time and crashes):"
+          nm -gU "$B/Contents/MacOS/OneEighty" | tee _exports.txt
+          test "$(awk '{print $NF}' _exports.txt | sort | tr '\n' ' ')" = "_EffectMain _PluginDataEntryFunction2 "
           test -s "$B/Contents/Resources/OneEighty.rsrc"
           codesign --verify --verbose "$B"
           echo "Linked libraries (system only expected):"
