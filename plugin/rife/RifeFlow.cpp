@@ -245,6 +245,12 @@ public:
         const std::string driver = VulkanDriverPath();
         if (ncnn::create_gpu_instance(driver.empty() ? nullptr : driver.c_str()) != 0 || ncnn::get_gpu_count() <= 0)
             return Fail(err, driver.empty() ? "no Vulkan GPU (libMoltenVK.dylib not found)" : "no Vulkan GPU (MoltenVK)");
+        // Apple's paravirtual GPU (macOS virtual machines, e.g. GitHub's Mac
+        // runners) crashes in its driver when MoltenVK fills a texture, which
+        // ncnn's device setup does: no Extra High there (renders as High)
+        if (const char* name = ncnn::get_gpu_info(ncnn::get_default_gpu_index()).device_name();
+            name && std::strstr(name, "Paravirtual"))
+            return Fail(err, std::string("virtual GPU not supported (") + name + ")");
 #else
         if (ncnn::create_gpu_instance() != 0 || ncnn::get_gpu_count() <= 0)
             return Fail(err, "no Vulkan GPU");

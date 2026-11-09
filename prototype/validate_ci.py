@@ -34,6 +34,7 @@ MARGIN = 0.6  # dB allowed below the Windows figure / between CPU and GPU
 
 raw_in, raw_out = HERE / "_ci_src.bgra", HERE / "_ci_out.bgra"
 failures = []
+skipped = []
 
 
 def psnr(a, b):
@@ -86,8 +87,16 @@ for name, (clip, fps, windows_db, extra_db) in CLIPS.items():
     cpu_off, gpu_off = score(run("oe_offline", fps, OE_EXACT=0), gt), score(run("oe_gpu_offline", fps, OE_EXACT=0), gt)
     check(abs(gpu_off - cpu_off) <= MARGIN, f"exact timing off: CPU {cpu_off:.2f} dB, GPU {gpu_off:.2f} dB")
 
-    extra = score(run("oe_gpu_offline", fps, OE_QUALITY="extra"), gt)
-    check(extra >= extra_db - MARGIN, f"GPU Extra High {extra:.2f} dB (Windows: {extra_db} dB)")
+    try:
+        extra = score(run("oe_gpu_offline", fps, OE_QUALITY="extra"), gt)
+        check(extra >= extra_db - MARGIN, f"GPU Extra High {extra:.2f} dB (Windows: {extra_db} dB)")
+    except RuntimeError as e:
+        # RIFE refuses Apple's paravirtual GPU (GitHub's Mac runners): its
+        # driver crashes under MoltenVK. Anything else is a failure.
+        if "virtual GPU not supported" not in str(e):
+            raise
+        print("  skip  GPU Extra High: virtual GPU (macOS VM), RIFE not supported")
+        skipped.append("Extra High")
 
     fl = agree(run("oe_gpu_offline", fps, OE_FLOAT=1), gpu)
     check(fl >= 50, f"32-bit float matches 8-bit: {fl:.1f} dB")
@@ -100,4 +109,6 @@ for name, (clip, fps, windows_db, extra_db) in CLIPS.items():
 raw_in.unlink(missing_ok=True)
 raw_out.unlink(missing_ok=True)
 print(f"\n{len(failures)} check(s) failed" if failures else "\nall checks passed")
+if skipped:
+    print("skipped: " + ", ".join(sorted(set(skipped))))
 sys.exit(1 if failures else 0)
