@@ -608,7 +608,7 @@ private:
     // Mip chain of f (W x H) into bufs; level buffers in lv (level 0 = f itself;
     // unused levels point at f so every binding is valid).
     bool BuildMips(id<MTLComputeCommandEncoder> enc, const Buf& f, int W, int H, Buf* bufs, const Settings& s,
-                   MipDims* d, id<MTLBuffer> lv[4], std::string* err)
+                   MipDims* d, __strong id<MTLBuffer> lv[4], std::string* err)
     {
         for (int l = 0; l < 4; ++l)
         {
