@@ -105,6 +105,20 @@ jobs:
           ../.venv/bin/python make_test_clip.py 5994p 50p gt
           ../.venv/bin/python validate_ci.py
 
+      # On failure: re-run Quality Extra High under lldb for a backtrace (the
+      # input left behind by validate_ci.py is the 59.94p clip, or 50p)
+      - name: Extra High backtrace (on failure)
+        if: failure()
+        working-directory: prototype
+        env:
+          OE_QUALITY: extra
+          MVK_CONFIG_LOG_LEVEL: "3"
+        run: |
+          test -f _ci_src.bgra || exit 0
+          lldb --batch -o run -k "thread backtrace all" -k "image list -b" -k quit -- \
+            ../plugin/build-mac/oe_gpu_offline _ci_src.bgra 1280 720 59.94005994 25 _ci_out.bgra 2>&1 \
+            | grep -v "^	VK_" | head -400
+
       - name: Package
         run: |
           mkdir -p dist
