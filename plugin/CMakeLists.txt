@@ -1,7 +1,7 @@
 # macOS build (Apple Silicon): OneEighty.plugin + offline test tools.
 # Windows builds with build.bat.
 #
-#   ../deps/setup_deps_mac.sh                         # once: vcpkg + static OpenCV
+#   ../deps/setup_deps_mac.sh                         # once: OpenCV, ncnn, MoltenVK, RIFE model
 #   cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build-mac                           # -> build-mac/OneEighty.plugin
 #
@@ -9,8 +9,9 @@
 # ../sdk/ae (the same SDK download as Windows; it carries the Mac headers).
 #
 # GPU: Metal (gpu/MetalMotionBlur.mm, the port of gpu/GpuMotionBlur.cu).
-# Quality Extra High needs RIFE, not ported yet (rife/NoRife.cpp): it renders
-# as High, as on a Windows PC without Vulkan.
+# Quality Extra High: RIFE through ncnn on Vulkan, which MoltenVK runs on Metal;
+# libMoltenVK.dylib and the model ship inside the bundle (Contents/Frameworks,
+# Contents/Resources/rife-v4.6).
 cmake_minimum_required(VERSION 3.21)
 
 if(NOT APPLE)
@@ -60,14 +61,26 @@ endif()
 
 find_package(OpenCV REQUIRED COMPONENTS core imgproc video)
 
+set(OE_DEPS ${CMAKE_CURRENT_SOURCE_DIR}/../deps)
+list(PREPEND CMAKE_PREFIX_PATH ${OE_DEPS}/ncnn-mac)
+find_package(ncnn REQUIRED CONFIG)
+set(OE_MOLTENVK ${OE_DEPS}/moltenvk/libMoltenVK.dylib)
+set(OE_RIFE_MODEL ${OE_DEPS}/rife/rife-v4.6/flownet.param ${OE_DEPS}/rife/rife-v4.6/flownet.bin)
+foreach(f ${OE_MOLTENVK} ${OE_RIFE_MODEL})
+    if(NOT EXISTS ${f})
+        message(FATAL_ERROR "${f} missing: run deps/setup_deps_mac.sh")
+    endif()
+endforeach()
+
 # ---------------------------------------------------------------- shared code
 add_library(oe_motion STATIC MotionBlur.cpp)
 target_link_libraries(oe_motion PUBLIC ${OpenCV_LIBS})
 target_include_directories(oe_motion PUBLIC ${OpenCV_INCLUDE_DIRS})
 
-add_library(oe_metal STATIC gpu/MetalMotionBlur.mm rife/RifeShutter.cpp rife/NoRife.cpp)
-target_compile_options(oe_metal PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
-target_link_libraries(oe_metal PUBLIC oe_motion "-framework Metal" "-framework Foundation")
+# GPU engine (Metal) + RIFE (ncnn)
+add_library(oe_gpu STATIC gpu/MetalMotionBlur.mm rife/RifeFlow.cpp rife/RifeShutter.cpp)
+target_compile_options(oe_gpu PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+target_link_libraries(oe_gpu PUBLIC oe_motion ncnn "-framework Metal" "-framework Foundation")
 
 add_library(oe_platform STATIC Log.cpp UpdateCheck.cpp Platform_mac.mm)
 target_compile_options(oe_platform PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
@@ -93,21 +106,26 @@ configure_file(mac/Info.plist.in ${CMAKE_CURRENT_BINARY_DIR}/Info.plist @ONLY)
 
 add_library(OneEighty MODULE
     OneEighty.cpp
-    ${OE_RSRC})
+    ${OE_RSRC}
+    ${OE_MOLTENVK}
+    ${OE_RIFE_MODEL})
+set_source_files_properties(${OE_MOLTENVK} PROPERTIES MACOSX_PACKAGE_LOCATION Frameworks)
+set_source_files_properties(${OE_RIFE_MODEL} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/rife-v4.6)
 target_include_directories(OneEighty PRIVATE
     ${AE_SDK}/Headers ${AE_SDK}/Headers/SP ${AE_SDK}/Util ${AE_SDK}/Resources)
-target_link_libraries(OneEighty PRIVATE oe_metal oe_motion oe_platform)
+target_link_libraries(OneEighty PRIVATE oe_gpu oe_motion oe_platform)
 target_link_options(OneEighty PRIVATE -Wl,-dead_strip)
 set_target_properties(OneEighty PROPERTIES
     BUNDLE TRUE
     BUNDLE_EXTENSION plugin
     MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_BINARY_DIR}/Info.plist)
 
-# PkgInfo (type + creator, as Xcode writes for the SDK samples), then an ad-hoc
-# signature over the whole bundle: Apple Silicon refuses unsigned code, and
+# PkgInfo (type + creator, as Xcode writes for the SDK samples), then ad-hoc
+# signatures, nested code first: Apple Silicon refuses unsigned code, and
 # releases are deliberately not signed with a Developer ID.
 add_custom_command(TARGET OneEighty POST_BUILD
     COMMAND /bin/sh -c "printf eFKTFXTC > \"$<TARGET_BUNDLE_CONTENT_DIR:OneEighty>/PkgInfo\""
+    COMMAND codesign --force --sign - --timestamp=none $<TARGET_BUNDLE_CONTENT_DIR:OneEighty>/Frameworks/libMoltenVK.dylib
     COMMAND codesign --force --sign - --timestamp=none $<TARGET_BUNDLE_DIR:OneEighty>
     COMMENT "PkgInfo + ad-hoc signature"
     VERBATIM)
@@ -117,7 +135,13 @@ add_executable(oe_offline tools/oe_offline.cpp)
 target_link_libraries(oe_offline PRIVATE oe_motion)
 
 add_executable(oe_gpu_offline tools/oe_gpu_offline.cpp)
-target_link_libraries(oe_gpu_offline PRIVATE oe_metal)
+target_link_libraries(oe_gpu_offline PRIVATE oe_gpu)
+# MoltenVK and the model next to the tool, where RifeFlow.cpp looks outside a bundle
+add_custom_command(TARGET oe_gpu_offline POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OE_MOLTENVK} $<TARGET_FILE_DIR:oe_gpu_offline>/
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:oe_gpu_offline>/rife-v4.6
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OE_RIFE_MODEL} $<TARGET_FILE_DIR:oe_gpu_offline>/rife-v4.6/
+    VERBATIM)
 
 add_executable(oe_update_test tools/oe_update_test.cpp)
 target_link_libraries(oe_update_test PRIVATE oe_platform)

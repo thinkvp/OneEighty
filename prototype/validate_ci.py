@@ -3,7 +3,8 @@
 Runs the CPU path (oe_offline) and the GPU path (oe_gpu_offline: CUDA on
 Windows, Metal on macOS) on the synthetic clips and checks:
   - GPU accuracy vs a real 25p camera at 180 deg (PSNR) is close to the
-    figures measured on Windows (README: 59.94p 38.1 dB, 50p 38.8 dB, Normal)
+    figures measured on Windows (README: 59.94p 38.1 dB, 50p 38.8 dB, Normal;
+    Extra High 40.2 / 40.5 dB, needs the RIFE model and Vulkan / MoltenVK)
   - GPU and CPU paths agree (their PSNRs within 0.6 dB)
   - 32-bit float and ARGB-byte-order runs match the plain 8-bit BGRA run
   - the motion-vector view runs
@@ -26,7 +27,9 @@ BUILD = Path(os.environ.get("OE_BUILD") or HERE.parent / "plugin" / ("build-mac"
 EXE = ".exe" if sys.platform == "win32" else ""
 W, H = 1280, 720
 GT = HERE / "test_gt_25p.mkv"
-CLIPS = {"59.94p": (HERE / "test_src_5994p.mkv", 60000 / 1001, 38.1), "50p": (HERE / "test_src_50p.mkv", 50.0, 38.8)}
+# clip, source fps, Windows accuracy for Normal and Extra High (README)
+CLIPS = {"59.94p": (HERE / "test_src_5994p.mkv", 60000 / 1001, 38.1, 40.2),
+         "50p": (HERE / "test_src_50p.mkv", 50.0, 38.8, 40.5)}
 MARGIN = 0.6  # dB allowed below the Windows figure / between CPU and GPU
 
 raw_in, raw_out = HERE / "_ci_src.bgra", HERE / "_ci_out.bgra"
@@ -45,7 +48,7 @@ def run(tool, fps, **env):
     if r.returncode:
         raise RuntimeError(f"{tool} {env}: exit {r.returncode}\n{r.stdout}{r.stderr}")
     for line in r.stdout.splitlines():
-        if line.startswith(("GPU engine", "wrote", "float output")):
+        if line.startswith(("GPU engine", "RIFE ready", "wrote", "float output")):
             print(f"    {tool} {env or ''}: {line}")
     return np.fromfile(raw_out, np.uint8).reshape(-1, H, W, 4)[..., :3]
 
@@ -67,7 +70,7 @@ def check(ok, msg):
 
 
 gt = np.array(list(read_frames(str(GT))))
-for name, (clip, fps, windows_db) in CLIPS.items():
+for name, (clip, fps, windows_db, extra_db) in CLIPS.items():
     print(f"{name} -> 25p")
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(clip), "-f", "rawvideo", "-pix_fmt", "bgra", str(raw_in)],
                    check=True)
@@ -82,6 +85,9 @@ for name, (clip, fps, windows_db) in CLIPS.items():
 
     cpu_off, gpu_off = score(run("oe_offline", fps, OE_EXACT=0), gt), score(run("oe_gpu_offline", fps, OE_EXACT=0), gt)
     check(abs(gpu_off - cpu_off) <= MARGIN, f"exact timing off: CPU {cpu_off:.2f} dB, GPU {gpu_off:.2f} dB")
+
+    extra = score(run("oe_gpu_offline", fps, OE_QUALITY="extra"), gt)
+    check(extra >= extra_db - MARGIN, f"GPU Extra High {extra:.2f} dB (Windows: {extra_db} dB)")
 
     fl = agree(run("oe_gpu_offline", fps, OE_FLOAT=1), gpu)
     check(fl >= 50, f"32-bit float matches 8-bit: {fl:.1f} dB")

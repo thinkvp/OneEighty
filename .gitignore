@@ -4,6 +4,9 @@
 # Third-party dependencies, fetched by deps/setup_opencv.bat and deps/setup_rife.bat
 /deps/vcpkg/
 /deps/rife/
+/deps/ncnn-src/
+/deps/ncnn-mac/
+/deps/moltenvk/
 
 # Build output
 /plugin/build/

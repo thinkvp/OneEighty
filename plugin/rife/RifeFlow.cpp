@@ -1,11 +1,16 @@
-#ifndef NOMINMAX
-    #define NOMINMAX
+#ifdef _WIN32
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+#else
+    #include <dlfcn.h>
 #endif
-#include <windows.h>
 
 #include "RifeFlow.h"
 
-// ncnn (vcpkg ncnn[vulkan]; include dir ...\include\ncnn)
+// ncnn: vcpkg ncnn[vulkan] on Windows; on macOS built by deps/setup_deps_mac.sh
+// with its own Vulkan loader (NCNN_SIMPLEVK), pointed at the bundled MoltenVK
 #include <command.h>
 #include <gpu.h>
 #include <layer.h>
@@ -17,13 +22,54 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 
 namespace oe::rife
 {
 namespace
 {
+
+FILE* OpenRead(const std::filesystem::path& p)
+{
+#ifdef _WIN32
+    FILE* f = nullptr;
+    return _wfopen_s(&f, p.c_str(), L"rb") == 0 ? f : nullptr;
+#else
+    return std::fopen(p.c_str(), "rb");
+#endif
+}
+
+#ifdef __APPLE__
+// Folder of the binary this code is linked into (the plugin's Contents/MacOS,
+// or an offline tool's folder).
+std::filesystem::path ModuleDir()
+{
+    Dl_info info = {};
+    if (dladdr(reinterpret_cast<const void*>(&ModuleDir), &info) && info.dli_fname)
+        return std::filesystem::path(info.dli_fname).parent_path();
+    return {};
+}
+
+// The Vulkan driver for ncnn: MoltenVK (Vulkan on Metal) shipped in the plugin
+// bundle (Contents/Frameworks) or next to an offline tool; OE_VULKAN_DRIVER
+// overrides. Empty: ncnn tries the system's libvulkan.dylib.
+std::string VulkanDriverPath()
+{
+    if (const char* env = std::getenv("OE_VULKAN_DRIVER"); env && env[0])
+        return env;
+    const std::filesystem::path dir = ModuleDir();
+    for (const auto& p : {dir / ".." / "Frameworks" / "libMoltenVK.dylib", dir / "libMoltenVK.dylib"})
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(p, ec))
+            return std::filesystem::weakly_canonical(p, ec).string();
+    }
+    return {};
+}
+#endif
 
 #include "RifeWarpShaders.inl"
 
@@ -195,8 +241,14 @@ class EngineImpl final : public Engine
 public:
     bool Init(const std::wstring& modelDir, std::string* err)
     {
+#ifdef __APPLE__
+        const std::string driver = VulkanDriverPath();
+        if (ncnn::create_gpu_instance(driver.empty() ? nullptr : driver.c_str()) != 0 || ncnn::get_gpu_count() <= 0)
+            return Fail(err, driver.empty() ? "no Vulkan GPU (libMoltenVK.dylib not found)" : "no Vulkan GPU (MoltenVK)");
+#else
         if (ncnn::create_gpu_instance() != 0 || ncnn::get_gpu_count() <= 0)
             return Fail(err, "no Vulkan GPU");
+#endif
         vkdev_ = ncnn::get_gpu_device(ncnn::get_default_gpu_index());
         if (!vkdev_)
             return Fail(err, "no Vulkan device");
@@ -210,13 +262,12 @@ public:
         net_.opt = opt;
         net_.set_vulkan_device(vkdev_);
         net_.register_custom_layer("rife.Warp", WarpCreator);
-        for (const wchar_t* name : {L"flownet.param", L"flownet.bin"})
+        for (const char* name : {"flownet.param", "flownet.bin"})
         {
-            const std::wstring path = modelDir + L"\\" + name;
-            FILE* fp = nullptr;
-            if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp)
-                return Fail(err, "RIFE model missing (rife-v4.6\\flownet.param / .bin next to the plugin)");
-            const int r = std::wcsstr(name, L".param") ? net_.load_param(fp) : net_.load_model(fp);
+            FILE* fp = OpenRead(std::filesystem::path(modelDir) / name);
+            if (!fp)
+                return Fail(err, "RIFE model missing (rife-v4.6/flownet.param / .bin next to the plugin)");
+            const int r = std::strstr(name, ".param") ? net_.load_param(fp) : net_.load_model(fp);
             std::fclose(fp);
             if (r != 0)
                 return Fail(err, "RIFE model failed to load");
@@ -374,6 +425,7 @@ std::unique_ptr<Engine> Engine::Create(const std::wstring& modelDir, std::string
 
 std::wstring DefaultModelDir()
 {
+#ifdef _WIN32
     HMODULE h = nullptr;
     wchar_t path[MAX_PATH] = {0};
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -387,6 +439,13 @@ std::wstring DefaultModelDir()
         return dir + L"\\rife-v4.6";
     }
     return L"rife-v4.6";
+#else
+    // plugin bundle: Contents/Resources/rife-v4.6; offline tools: next to the binary
+    const std::filesystem::path dir = ModuleDir();
+    std::error_code ec;
+    const std::filesystem::path inBundle = dir / ".." / "Resources" / "rife-v4.6";
+    return (std::filesystem::exists(inBundle, ec) ? inBundle : dir / "rife-v4.6").wstring();
+#endif
 }
 
 } // namespace oe::rife

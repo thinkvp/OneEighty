@@ -36,14 +36,25 @@ jobs:
           token: ${{ secrets.AE_SDK_TOKEN }}
           path: sdk
 
-      # vcpkg's binary cache: OpenCV builds once (~15 min), then restores in seconds.
+      # vcpkg's binary cache: OpenCV builds once, then restores in seconds.
       - name: Cache vcpkg packages
         uses: actions/cache@v4
         with:
           path: ~/.cache/vcpkg/archives
-          key: vcpkg-macos-arm64-${{ hashFiles('deps/setup_deps_mac.sh', 'deps/triplets/**') }}
+          key: vcpkg-macos-arm64-2026.10.16-${{ hashFiles('deps/triplets/**') }}
 
-      - name: Dependencies (OpenCV)
+      # ncnn (built from source), MoltenVK and the RIFE model
+      - name: Cache ncnn, MoltenVK, RIFE model
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/ncnn-src
+            deps/ncnn-mac
+            deps/moltenvk
+            deps/rife
+          key: deps-macos-arm64-${{ hashFiles('deps/setup_deps_mac.sh') }}
+
+      - name: Dependencies (OpenCV, ncnn, MoltenVK, RIFE model)
         run: sh deps/setup_deps_mac.sh
 
       - name: Build
@@ -62,6 +73,8 @@ jobs:
           codesign --verify --verbose "$B"
           echo "Linked libraries (system only expected):"
           otool -L "$B/Contents/MacOS/OneEighty"
+          test -s "$B/Contents/Frameworks/libMoltenVK.dylib"
+          test -s "$B/Contents/Resources/rife-v4.6/flownet.bin"
 
       - name: Update check test
         run: plugin/build-mac/oe_update_test
