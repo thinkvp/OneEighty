@@ -8,8 +8,9 @@
 # Needs the Xcode command line tools, CMake 3.21+, and the After Effects SDK in
 # ../sdk/ae (the same SDK download as Windows; it carries the Mac headers).
 #
-# Stage 1 of the port: CPU only (gpu/NoGpu.cpp). The effect runs exactly as on
-# a Windows PC without NVIDIA; Quality Extra High renders as High.
+# GPU: Metal (gpu/MetalMotionBlur.mm, the port of gpu/GpuMotionBlur.cu).
+# Quality Extra High needs RIFE, not ported yet (rife/NoRife.cpp): it renders
+# as High, as on a Windows PC without Vulkan.
 cmake_minimum_required(VERSION 3.21)
 
 if(NOT APPLE)
@@ -64,6 +65,10 @@ add_library(oe_motion STATIC MotionBlur.cpp)
 target_link_libraries(oe_motion PUBLIC ${OpenCV_LIBS})
 target_include_directories(oe_motion PUBLIC ${OpenCV_INCLUDE_DIRS})
 
+add_library(oe_metal STATIC gpu/MetalMotionBlur.mm rife/RifeShutter.cpp rife/NoRife.cpp)
+target_compile_options(oe_metal PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+target_link_libraries(oe_metal PUBLIC oe_motion "-framework Metal" "-framework Foundation")
+
 add_library(oe_platform STATIC Log.cpp UpdateCheck.cpp Platform_mac.mm)
 target_compile_options(oe_platform PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 target_link_libraries(oe_platform PUBLIC "-framework Foundation" "-framework AppKit")
@@ -88,12 +93,10 @@ configure_file(mac/Info.plist.in ${CMAKE_CURRENT_BINARY_DIR}/Info.plist @ONLY)
 
 add_library(OneEighty MODULE
     OneEighty.cpp
-    rife/RifeShutter.cpp
-    gpu/NoGpu.cpp
     ${OE_RSRC})
 target_include_directories(OneEighty PRIVATE
     ${AE_SDK}/Headers ${AE_SDK}/Headers/SP ${AE_SDK}/Util ${AE_SDK}/Resources)
-target_link_libraries(OneEighty PRIVATE oe_motion oe_platform)
+target_link_libraries(OneEighty PRIVATE oe_metal oe_motion oe_platform)
 target_link_options(OneEighty PRIVATE -Wl,-dead_strip)
 set_target_properties(OneEighty PROPERTIES
     BUNDLE TRUE
@@ -112,6 +115,9 @@ add_custom_command(TARGET OneEighty POST_BUILD
 # ---------------------------------------------------------------- offline tools
 add_executable(oe_offline tools/oe_offline.cpp)
 target_link_libraries(oe_offline PRIVATE oe_motion)
+
+add_executable(oe_gpu_offline tools/oe_gpu_offline.cpp)
+target_link_libraries(oe_gpu_offline PRIVATE oe_metal)
 
 add_executable(oe_update_test tools/oe_update_test.cpp)
 target_link_libraries(oe_update_test PRIVATE oe_platform)

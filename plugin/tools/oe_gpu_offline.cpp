@@ -32,12 +32,46 @@
 
 namespace
 {
-char Env(const char* name)
+std::string EnvStr(const char* name)
 {
-    char v[8] = {0};
+#ifdef _WIN32
+    char v[1024] = {0};
     size_t len = 0;
     getenv_s(&len, v, sizeof(v), name);
-    return v[0];
+    return v;
+#else
+    const char* v = std::getenv(name);
+    return v ? v : "";
+#endif
+}
+
+char Env(const char* name)
+{
+    const std::string v = EnvStr(name);
+    return v.empty() ? 0 : v[0];
+}
+
+FILE* Open(const char* path, const char* mode)
+{
+#ifdef _WIN32
+    FILE* f = nullptr;
+    return fopen_s(&f, path, mode) == 0 ? f : nullptr;
+#else
+    return std::fopen(path, mode);
+#endif
+}
+
+std::wstring ModelDirFromEnv()
+{
+#ifdef _WIN32
+    wchar_t model[260] = {0};
+    size_t len = 0;
+    _wgetenv_s(&len, model, 260, L"OE_RIFE_MODEL");
+    return model;
+#else
+    const std::string m = EnvStr("OE_RIFE_MODEL");
+    return std::wstring(m.begin(), m.end());
+#endif
 }
 
 // B,G,R,A <-> A,R,G,B (reversing the channel order works both ways)
@@ -68,21 +102,11 @@ int main(int argc, char** argv)
     const int preset = Env("OE_QUALITY") == 'h' ? cv::DISOpticalFlow::PRESET_MEDIUM : cv::DISOpticalFlow::PRESET_FAST;
     const bool extra = Env("OE_QUALITY") == 'e';
     int nSamples = 6;
-    {
-        char v[8] = {0};
-        size_t len = 0;
-        getenv_s(&len, v, sizeof(v), "OE_SAMPLES");
-        if (v[0])
-            nSamples = std::max(1, std::atoi(v));
-    }
+    if (const std::string v = EnvStr("OE_SAMPLES"); !v.empty())
+        nSamples = std::max(1, std::atoi(v.c_str()));
     int rifePixels = 2100000;
-    {
-        char v[16] = {0};
-        size_t len = 0;
-        getenv_s(&len, v, sizeof(v), "OE_RIFE_PIXELS");
-        if (v[0])
-            rifePixels = std::max(4096, std::atoi(v));
-    }
+    if (const std::string v = EnvStr("OE_RIFE_PIXELS"); !v.empty())
+        rifePixels = std::max(4096, std::atoi(v.c_str()));
     const bool argb = Env("OE_ARGB") == '1';
     const bool edgeFix = Env("OE_EDGEFIX") != '0';
     const char fl = Env("OE_FLOAT");
@@ -97,14 +121,14 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "GPU engine: %s\n", err.c_str());
         return 1;
     }
+    if (!eng->Describe().empty())
+        std::printf("GPU engine: %s\n", eng->Describe().c_str());
     std::unique_ptr<oe::rife::Engine> rife;
     if (extra)
     {
-        wchar_t model[260] = {0};
-        size_t len = 0;
-        _wgetenv_s(&len, model, 260, L"OE_RIFE_MODEL");
+        const std::wstring model = ModelDirFromEnv();
         const auto tr = std::chrono::steady_clock::now();
-        rife = oe::rife::Engine::Create(model[0] ? std::wstring(model) : oe::rife::DefaultModelDir(), &err);
+        rife = oe::rife::Engine::Create(!model.empty() ? model : oe::rife::DefaultModelDir(), &err);
         if (!rife)
         {
             std::fprintf(stderr, "RIFE: %s\n", err.c_str());
@@ -116,8 +140,8 @@ int main(int argc, char** argv)
 
     const size_t frameBytes = (size_t)W * H * 4;
     std::vector<cv::Mat> src;
-    FILE* fi = nullptr;
-    if (fopen_s(&fi, argv[1], "rb") || !fi)
+    FILE* fi = Open(argv[1], "rb");
+    if (!fi)
         return 1;
     for (;;)
     {
@@ -136,8 +160,8 @@ int main(int argc, char** argv)
                 extra ? "Extra High" : preset == cv::DISOpticalFlow::PRESET_MEDIUM ? "High" : "Normal",
                 useFloat ? "float" : argb ? "8-bit ARGB" : "8-bit BGRA");
 
-    FILE* fo = nullptr;
-    if (fopen_s(&fo, argv[6], "wb") || !fo)
+    FILE* fo = Open(argv[6], "wb");
+    if (!fo)
         return 1;
     cv::Mat out(H, W, useFloat ? CV_32FC4 : CV_8UC4), out8(H, W, CV_8UC4);
     auto host = [&](const cv::Mat& m) {

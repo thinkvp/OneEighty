@@ -1,5 +1,6 @@
 #pragma once
-// GPU motion blur (CUDA). Motion is supplied by the caller (OpenCV DIS on the
+// GPU motion blur (CUDA on Windows: GpuMotionBlur.cu; Metal on macOS:
+// MetalMotionBlur.mm). Motion is supplied by the caller (OpenCV DIS on the
 // CPU, see MotionBlur.h); the GPU does the expensive part at UHD: upload, mip
 // chain, the per-pixel gather along the motion path, and download. Same
 // algorithm as FlowMotionBlur in MotionBlur.cpp (the CPU fallback).
@@ -66,10 +67,13 @@ struct TimeSample
 class Engine
 {
 public:
-    // Primary CUDA context of device 0. Returns nullptr and sets *err when
-    // there is no usable NVIDIA GPU / driver.
+    // CUDA: primary context of device 0; Metal: the system default GPU.
+    // Returns nullptr and sets *err when there is no usable GPU / driver.
     static std::unique_ptr<Engine> Create(std::string* err);
     virtual ~Engine() = default;
+
+    // For the log, e.g. "Metal: Apple M1" (empty when the engine doesn't say).
+    virtual std::string Describe() const { return {}; }
 
     // Calls are thread-safe (serialised per engine). `out` has the layout of
     // the inputs (8-bit with the same byte order, or float).

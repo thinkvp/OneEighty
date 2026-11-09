@@ -66,6 +66,19 @@ jobs:
       - name: Update check test
         run: plugin/build-mac/oe_update_test
 
+      # CPU and Metal paths against ground truth (synthetic clips, ~2 min)
+      - name: Validation tools
+        run: |
+          brew install ffmpeg
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet opencv-python-headless numpy
+
+      - name: Validate CPU and Metal
+        working-directory: prototype
+        run: |
+          ../.venv/bin/python make_test_clip.py 5994p 50p gt
+          ../.venv/bin/python validate_ci.py
+
       - name: Package
         run: |
           mkdir -p dist

@@ -254,7 +254,7 @@ oe::gpu::Engine* HybridEngine()
         std::string err;
         gEngine = oe::gpu::Engine::Create(&err);
         if (gEngine)
-            Log("[hybrid] CUDA engine ready");
+            Log("[hybrid] GPU engine ready (%s)", gEngine->Describe().empty() ? "CUDA" : gEngine->Describe().c_str());
         else
             Log("[hybrid] GPU engine unavailable (%s) -> CPU maths", err.c_str());
     }
