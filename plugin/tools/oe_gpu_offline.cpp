@@ -15,6 +15,9 @@
 //   OE_ARGB=1      feed ARGB bytes instead of BGRA (After Effects order)
 //   OE_VIEW=1      motion-vector view
 //   OE_EDGEFIX=0   skip the motion-boundary clean-up (RefineFlowEdges)
+//   OE_STACK_KB=n  (macOS) run everything on a thread with an n KB stack;
+//                  512 = Premiere's render threads (see LargeStack.h)
+#include "../LargeStack.h"
 #include "../MotionBlur.h"
 #include "../gpu/GpuMotionBlur.h"
 #include "../rife/RifeShutter.h"
@@ -84,7 +87,19 @@ void ReverseChannels(cv::Mat& m)
 }
 } // namespace
 
+int Run(int argc, char** argv);
+
 int main(int argc, char** argv)
+{
+    const std::string kb = EnvStr("OE_STACK_KB");
+    if (kb.empty())
+        return Run(argc, argv);
+    int rc = 1;
+    oe::RunOnLargeStack([&] { rc = Run(argc, argv); }, (size_t)std::max(64, std::atoi(kb.c_str())) * 1024);
+    return rc;
+}
+
+int Run(int argc, char** argv)
 {
     if (argc < 7)
     {

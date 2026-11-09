@@ -274,6 +274,8 @@ oe::rife::Engine* RifeEngine()
     {
         gRifeTried = true;
         std::string err;
+        // logged first so a crash during setup still shows where it happened
+        Log("[extra] starting RIFE (Vulkan)");
         gRife = oe::rife::Engine::Create(oe::rife::DefaultModelDir(), &err);
         if (gRife)
             Log("[extra] RIFE ready");
