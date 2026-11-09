@@ -43,9 +43,11 @@ jobs:
           path: ~/.cache/vcpkg/archives
           key: vcpkg-macos-arm64-2026.10.16-${{ hashFiles('deps/triplets/**') }}
 
-      # ncnn (built from source), MoltenVK and the RIFE model
-      - name: Cache ncnn, MoltenVK, RIFE model
-        uses: actions/cache@v4
+      # ncnn (built from source, ~20 min), MoltenVK and the RIFE model. Restore
+      # and save are split so the cache is saved even if a later step fails.
+      - name: Restore ncnn, MoltenVK, RIFE model
+        id: deps-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             deps/ncnn-src
@@ -57,10 +59,21 @@ jobs:
       - name: Dependencies (OpenCV, ncnn, MoltenVK, RIFE model)
         run: sh deps/setup_deps_mac.sh
 
+      - name: Save ncnn, MoltenVK, RIFE model
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            deps/ncnn-src
+            deps/ncnn-mac
+            deps/moltenvk
+            deps/rife
+          key: deps-macos-arm64-${{ hashFiles('deps/setup_deps_mac.sh') }}
+
       - name: Build
         run: |
           cmake -S plugin -B plugin/build-mac -DCMAKE_BUILD_TYPE=Release
-          cmake --build plugin/build-mac --parallel
+          cmake --build plugin/build-mac --parallel "$(sysctl -n hw.ncpu)"
 
       - name: Check the bundle
         run: |

@@ -7,6 +7,9 @@
 #   rife/rife-v4.6 RIFE v4.6 model (same as deps/setup_rife.bat)
 # Everything is pinned and checked by SHA-256.
 set -e
+JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+# curl: retry transient GitHub errors (502/504)
+CURL="curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors"
 cd "$(dirname "$0")"
 
 # ---------------------------------------------------------------- OpenCV (vcpkg)
@@ -33,7 +36,7 @@ NCNN_VER=20261020
 NCNN_SHA256=699d9acc67489eee0993a551ca1ebc247bbf0f4e33babe1dec810e6a9a52b988
 if [ ! -f ncnn-mac/lib/libncnn.a ]; then
     rm -rf ncnn-src ncnn-mac
-    curl -fsSL -o ncnn-src.zip "https://github.com/Tencent/ncnn/releases/download/$NCNN_VER/ncnn-$NCNN_VER-full-source.zip"
+    $CURL -o ncnn-src.zip "https://github.com/Tencent/ncnn/releases/download/$NCNN_VER/ncnn-$NCNN_VER-full-source.zip"
     echo "$NCNN_SHA256  ncnn-src.zip" | shasum -a 256 -c -
     mkdir ncnn-src
     (cd ncnn-src && unzip -q ../ncnn-src.zip)
@@ -44,7 +47,9 @@ if [ ! -f ncnn-mac/lib/libncnn.a ]; then
         -DNCNN_VULKAN=ON -DNCNN_SIMPLEVK=ON -DNCNN_SYSTEM_GLSLANG=OFF -DNCNN_OPENMP=OFF \
         -DNCNN_SHARED_LIB=OFF -DNCNN_BUILD_TOOLS=OFF -DNCNN_BUILD_EXAMPLES=OFF \
         -DNCNN_BUILD_BENCHMARK=OFF -DNCNN_BUILD_TESTS=OFF -DNCNN_PYTHON=OFF
-    cmake --build ncnn-src/build --parallel
+    # bounded: a bare --parallel means make -j (no limit) and runs hundreds of
+    # compilers at once, swapping an 8 GB Mac for hours
+    cmake --build ncnn-src/build --parallel "$JOBS"
     cmake --install ncnn-src/build
     rm -rf ncnn-src/build
 fi
@@ -55,7 +60,7 @@ MVK_VER=v1.4.2
 MVK_SHA256=f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
 if [ ! -f moltenvk/libMoltenVK.dylib ]; then
     rm -rf moltenvk MoltenVK
-    curl -fsSL -o moltenvk.tar "https://github.com/KhronosGroup/MoltenVK/releases/download/$MVK_VER/MoltenVK-macos.tar"
+    $CURL -o moltenvk.tar "https://github.com/KhronosGroup/MoltenVK/releases/download/$MVK_VER/MoltenVK-macos.tar"
     echo "$MVK_SHA256  moltenvk.tar" | shasum -a 256 -c -
     tar -xf moltenvk.tar MoltenVK/LICENSE MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
     mkdir moltenvk
@@ -79,8 +84,8 @@ RIFE_BIN_SHA256=f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958
 if [ ! -f rife/rife-v4.6/flownet.bin ]; then
     mkdir -p rife/rife-v4.6
     URL="https://raw.githubusercontent.com/nihui/rife-ncnn-vulkan/$RIFE_COMMIT/models/rife-v4.6"
-    curl -fsSL -o rife/rife-v4.6/flownet.param "$URL/flownet.param"
-    curl -fsSL -o rife/rife-v4.6/flownet.bin "$URL/flownet.bin"
+    $CURL -o rife/rife-v4.6/flownet.param "$URL/flownet.param"
+    $CURL -o rife/rife-v4.6/flownet.bin "$URL/flownet.bin"
     echo "$RIFE_BIN_SHA256  rife/rife-v4.6/flownet.bin" | shasum -a 256 -c -
 fi
 echo "RIFE MODEL READY"
