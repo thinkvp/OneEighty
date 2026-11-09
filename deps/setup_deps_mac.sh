@@ -18,9 +18,12 @@ VCPKG_TAG=2026.10.16
 if [ ! -d vcpkg/.git ]; then
     git clone --depth 1 --branch "$VCPKG_TAG" https://github.com/microsoft/vcpkg.git vcpkg
 fi
-if [ ! -x vcpkg/vcpkg ]; then
-    vcpkg/bootstrap-vcpkg.sh -disableMetrics
-fi
+# the bootstrap downloads the vcpkg tool from GitHub without retrying
+for try in 1 2 3 4 5; do
+    [ -x vcpkg/vcpkg ] && break
+    vcpkg/bootstrap-vcpkg.sh -disableMetrics || sleep 10
+done
+[ -x vcpkg/vcpkg ] || { echo "vcpkg bootstrap failed"; exit 1; }
 # [core] = no default features (no codecs, dnn, etc.)
 vcpkg/vcpkg install "opencv4[core]:arm64-osx-oneeighty" --overlay-triplets=triplets --disable-metrics
 echo "OPENCV READY"
