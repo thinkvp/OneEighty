@@ -751,8 +751,8 @@ public:
         p_ = Preset(preset);
         const double scale = std::min(1.0, (double)flowWidth / W);
         scale_ = scale;
-        W_ = W;
-        H_ = H;
+        frameW_ = W;
+        frameH_ = H;
         fw_ = std::max(1, (int)std::lround(W * scale));
         fh_ = std::max(1, (int)std::lround(H * scale));
         const int coarsest = std::min((int)(std::log(std::max(fw_, fh_) / (4.0 * kPsz)) / std::log(2.0) + 0.5),
@@ -935,8 +935,8 @@ private:
     DisArgs Args() const
     {
         DisArgs a = {};
-        a.W = W_;
-        a.H = H_;
+        a.W = frameW_;
+        a.H = frameH_;
         a.fw = fw_;
         a.fh = fh_;
         a.mul = 1.0f;
@@ -996,7 +996,7 @@ private:
     id<MTLComputePipelineState> ps_[kDisKernelCount] = {};
     Params p_ = Preset(1);
     double scale_ = 1.0;
-    int W_ = 0, H_ = 0, fw_ = 0, fh_ = 0, coarsest_ = 0;
+    int frameW_ = 0, frameH_ = 0, fw_ = 0, fh_ = 0, coarsest_ = 0;
     int lw_[kMaxLevels] = {}, lh_[kMaxLevels] = {};
     Slot slot_[kSlots];
     id<MTLBuffer> xx_, yy_, xy_, sx_, sy_;
