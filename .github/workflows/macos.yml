@@ -105,13 +105,13 @@ jobs:
           ../.venv/bin/python make_test_clip.py 5994p 50p gt
           ../.venv/bin/python validate_ci.py
 
-      # On failure: re-run Quality Extra High under lldb for a backtrace (the
+      # On failure: re-run Quality High (RIFE) under lldb for a backtrace (the
       # input left behind by validate_ci.py is the 59.94p clip, or 50p)
-      - name: Extra High backtrace (on failure)
+      - name: Quality High backtrace (on failure)
         if: failure()
         working-directory: prototype
         env:
-          OE_QUALITY: extra
+          OE_QUALITY: high
           MVK_CONFIG_LOG_LEVEL: "3"
         run: |
           test -f _ci_src.bgra || exit 0

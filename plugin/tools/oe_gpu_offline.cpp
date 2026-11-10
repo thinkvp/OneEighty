@@ -5,16 +5,19 @@
 // Environment:
 //   OE_EXACT=0     exact frame timing off: Premiere's frame round(k*r) plus its
 //                  neighbours (default: on, two-frame interpolation)
-//   OE_QUALITY=high  DIS MEDIUM preset (default: Normal, DIS FAST)
-//   OE_QUALITY=extra Extra High: shutter from RIFE in-between frames
-//                  (model: OE_RIFE_MODEL or rife-v4.6 next to this exe)
-//   OE_SAMPLES=n   Extra High samples per output frame (default 6, as the effect)
-//   OE_RIFE_PIXELS=n  Extra High RIFE analysis size limit in pixels (default 2100000)
+//   OE_QUALITY=high  Quality High: shutter from RIFE in-between frames
+//                  (model: OE_RIFE_MODEL or rife-v4.6 next to this exe);
+//                  default: Normal (DIS MEDIUM motion)
+//   OE_DIS=fast    DIS FAST preset instead of MEDIUM (experiments)
+//   OE_SAMPLES=n   High: samples per output frame (default 6, as the effect)
+//   OE_RIFE_PIXELS=n  High: RIFE analysis size limit in pixels (default 2100000)
 //   OE_FLOAT=1     run as 32-bit float (Premiere 32-bit); 2 = input x1.5 to
 //                  check values above 1.0 pass through unclipped
 //   OE_ARGB=1      feed ARGB bytes instead of BGRA (After Effects order)
 //   OE_VIEW=1      motion-vector view
 //   OE_EDGEFIX=0   skip the motion-boundary clean-up (RefineFlowEdges)
+//   OE_GPUFLOW=1   Normal: motion estimated on the GPU (FlowSettings)
+//                  instead of OpenCV DIS on the CPU
 #include "../MotionBlur.h"
 #include "../gpu/GpuMotionBlur.h"
 #include "../rife/RifeShutter.h"
@@ -99,8 +102,8 @@ int main(int argc, char** argv)
         s.mipThreshold = std::atoi(argv[7]);
     s.showVectors = Env("OE_VIEW") == '1';
     const bool exact = Env("OE_EXACT") != '0';
-    const int preset = Env("OE_QUALITY") == 'h' ? cv::DISOpticalFlow::PRESET_MEDIUM : cv::DISOpticalFlow::PRESET_FAST;
-    const bool extra = Env("OE_QUALITY") == 'e';
+    const int preset = Env("OE_DIS") == 'f' ? cv::DISOpticalFlow::PRESET_FAST : cv::DISOpticalFlow::PRESET_MEDIUM;
+    const bool extra = Env("OE_QUALITY") == 'h'; // Quality High (RIFE)
     int nSamples = 6;
     if (const std::string v = EnvStr("OE_SAMPLES"); !v.empty())
         nSamples = std::max(1, std::atoi(v.c_str()));
@@ -109,6 +112,11 @@ int main(int argc, char** argv)
         rifePixels = std::max(4096, std::atoi(v.c_str()));
     const bool argb = Env("OE_ARGB") == '1';
     const bool edgeFix = Env("OE_EDGEFIX") != '0';
+    const bool gpuFlow = Env("OE_GPUFLOW") == '1';
+    oe::gpu::FlowSettings fs;
+    fs.flowWidth = 960;
+    fs.preset = preset;
+    fs.refineEdges = edgeFix;
     const char fl = Env("OE_FLOAT");
     const bool useFloat = fl == '1' || fl == '2';
     const float gain = fl == '2' ? 1.5f : 1.0f;
@@ -155,10 +163,10 @@ int main(int argc, char** argv)
         src.push_back(m);
     }
     std::fclose(fi);
-    std::printf("%zu source frames, halfWidth=%.4f, %s timing, %s, %s\n", src.size(), s.halfWidth,
+    std::printf("%zu source frames, halfWidth=%.4f, %s timing, %s, %s, %s motion\n", src.size(), s.halfWidth,
                 exact ? "exact" : "nearest",
-                extra ? "Extra High" : preset == cv::DISOpticalFlow::PRESET_MEDIUM ? "High" : "Normal",
-                useFloat ? "float" : argb ? "8-bit ARGB" : "8-bit BGRA");
+                extra ? "High (RIFE)" : preset == cv::DISOpticalFlow::PRESET_MEDIUM ? "Normal" : "Normal, DIS FAST",
+                useFloat ? "float" : argb ? "8-bit ARGB" : "8-bit BGRA", extra ? "RIFE" : gpuFlow ? "GPU" : "CPU");
 
     FILE* fo = Open(argv[6], "wb");
     if (!fo)
@@ -195,6 +203,29 @@ int main(int argc, char** argv)
                                          s.showVectors, out.data, out.step, &rs, &err);
             tFlow = rs.rifeMs;
             st.gpuMs = rs.gpuMs;
+        }
+        else if (exact && gpuFlow)
+        {
+            const long A = (long)std::floor(k * r + 1e-9);
+            if (A + 1 >= (long)src.size())
+                break;
+            ok = eng->ProcessPairGpuFlow(host(src[A]), host(src[A + 1]), k * r - (double)A, fs, out.data, out.step, s,
+                                         &st, &err);
+            tFlow = st.flowMs;
+            st.gpuMs -= st.flowMs;
+        }
+        else if (gpuFlow)
+        {
+            const long i = std::lround(k * r);
+            if (i >= (long)src.size())
+                break;
+            const bool hasPrev = i > 0, hasNext = i + 1 < (long)src.size();
+            const oe::gpu::HostImage hp = hasPrev ? host(src[i - 1]) : oe::gpu::HostImage{};
+            const oe::gpu::HostImage hn = hasNext ? host(src[i + 1]) : oe::gpu::HostImage{};
+            ok = eng->ProcessGpuFlow(hasPrev ? &hp : nullptr, host(src[i]), hasNext ? &hn : nullptr, fs, out.data,
+                                     out.step, s, &st, &err);
+            tFlow = st.flowMs;
+            st.gpuMs -= st.flowMs;
         }
         else if (exact)
         {

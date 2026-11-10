@@ -23,7 +23,19 @@ struct Settings
 
 struct Stats
 {
-    double gpuMs = 0; // mip chain + blur (after upload, before download)
+    double gpuMs = 0;  // GPU work after upload, before download (motion + mip chain + blur)
+    double flowMs = 0; // of which motion estimation (the *GpuFlow calls)
+};
+
+// Motion estimated on the GPU (Quality Normal / High): the CPU path
+// (EstimateFlow in MotionBlur.cpp: OpenCV DIS + motion-boundary clean-up)
+// ported to the GPU and run on the uploaded frames, so nothing comes back to
+// the CPU between motion and blur.
+struct FlowSettings
+{
+    int flowWidth = 960;     // analysis width
+    int preset = 1;          // cv::DISOpticalFlow preset: 0 ultrafast, 1 fast (Normal), 2 medium (High)
+    bool refineEdges = true; // motion-boundary clean-up (RefineFlowEdges)
 };
 
 // A frame in host memory, as checked out by the effect.
@@ -90,7 +102,7 @@ public:
     virtual bool Process(const HostImage& cur, const HostFlow& v, void* out, size_t outRowBytes, const Settings& s,
                          Stats* stats, std::string* err) = 0;
 
-    // Temporal supersampling (Quality Extra High): the output is the weighted
+    // Temporal supersampling (Quality High, RIFE): the output is the weighted
     // sum over samples of  mask * frame0(x + f0) + (1 - mask) * frame1(x + f1),
     // each sample's field upsampled to the frame size, i.e. the shutter
     // integrated from interpolated in-between frames. Works on the frames as
@@ -98,6 +110,38 @@ public:
     // showVectors: draw sample 0's frame0 motion instead.
     virtual bool ProcessSamples(const HostImage* frames, int nFrames, const TimeSample* samples, int nSamples,
                                 void* out, size_t outRowBytes, bool showVectors, Stats* stats, std::string* err) = 0;
+
+    // ProcessPair / Process with the motion estimated on the GPU from the
+    // frames themselves (see FlowSettings). prev / next may be null (clip
+    // edges). Engines without it return false and the caller estimates the
+    // motion on the CPU instead.
+    virtual bool ProcessPairGpuFlow(const HostImage& /*A*/, const HostImage& /*B*/, double /*a*/,
+                                    const FlowSettings& /*fs*/, void* /*out*/, size_t /*outRowBytes*/,
+                                    const Settings& /*s*/, Stats* /*stats*/, std::string* err)
+    {
+        if (err)
+            *err = "GPU motion not available";
+        return false;
+    }
+    virtual bool ProcessGpuFlow(const HostImage* /*prev*/, const HostImage& /*cur*/, const HostImage* /*next*/,
+                                const FlowSettings& /*fs*/, void* /*out*/, size_t /*outRowBytes*/,
+                                const Settings& /*s*/, Stats* /*stats*/, std::string* err)
+    {
+        if (err)
+            *err = "GPU motion not available";
+        return false;
+    }
+
+    // Test hook (offline tools): motion a->b and b->a only, downloaded at the
+    // analysis size in full-res pixels (2 x float32), as EstimateFlowPair.
+    virtual bool EstimateFlowPairGpu(const HostImage& /*A*/, const HostImage& /*B*/, const FlowSettings& /*fs*/,
+                                     float* /*fab*/, float* /*fba*/, int* /*fw*/, int* /*fh*/, Stats* /*stats*/,
+                                     std::string* err)
+    {
+        if (err)
+            *err = "GPU motion not available";
+        return false;
+    }
 };
 
 } // namespace oe::gpu

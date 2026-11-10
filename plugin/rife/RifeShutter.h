@@ -1,12 +1,12 @@
 #pragma once
-// Quality "Extra High": the shutter integrated from RIFE in-between frames.
+// Quality "High": the shutter integrated from RIFE in-between frames.
 // For an output time inside the source frames, N samples are spread evenly
 // over the shutter window [t - halfWidth, t + halfWidth] (source-frame units);
 // each sample is an interpolated frame between the two source frames around
 // its time (RIFE motion and blend mask, rife/RifeFlow), warped and blended on
 // the GPU from the original frames (gpu/GpuMotionBlur::ProcessSamples) and the
 // samples are averaged. Validated offline: 40.5 dB on the synthetic 50p -> 25p
-// test (High: 39.2 dB), and clean backgrounds next to a fast ball.
+// test (DIS, Normal: 39.2 dB), and clean backgrounds next to a fast ball.
 
 #include "RifeFlow.h"
 #include "../gpu/GpuMotionBlur.h"

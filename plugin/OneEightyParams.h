@@ -20,9 +20,11 @@ enum
 {
     OE_INPUT = 0,
     OE_TARGET_SHUTTER, // "Shutter angle": the look to simulate at the timeline rate
-    OE_QUALITY,        // Normal / High / Extra High
+    OE_QUALITY,        // Normal / High
     OE_EXACT_TIMING,
     OE_ADV_START,      // ---- "Advanced" (collapsed)
+    OE_RIFE_SAMPLES,   // High: RIFE in-between frames per output frame
+    OE_RIFE_SIZE,      // High: RIFE analysis size
     OE_SRC_SHUTTER,
     OE_SRC_FPS,
     OE_VIEW,
@@ -50,6 +52,8 @@ enum
     OE_ADV_END_DISK_ID = 12,
     OE_UPDATE_BUTTON_DISK_ID = 14,
     OE_QUALITY_DISK_ID = 15,
+    OE_RIFE_SAMPLES_DISK_ID = 16,
+    OE_RIFE_SIZE_DISK_ID = 17,
 };
 
 // Rendering: Premiere's GPU filter API only delivers whole timeline frames
@@ -72,14 +76,51 @@ enum
 {
     OE_QUALITY_NORMAL = 1,
     OE_QUALITY_HIGH,
-    OE_QUALITY_EXTRA,
-    OE_QUALITY_COUNT = OE_QUALITY_EXTRA
+    OE_QUALITY_COUNT = OE_QUALITY_HIGH
 };
-// Normal / High: motion estimated on the CPU (OpenCV DIS at 960 px, FAST /
-// MEDIUM preset), blur on the GPU. Extra High: the shutter integrated from RIFE
-// in-between frames (GPU via Vulkan + CUDA); falls back to High without them.
-// Appended last so projects saved with Normal / High keep their setting.
-#define OE_QUALITY_CHOICES "Normal|High|Extra High"
+// Normal: DIS motion at 960 px (MEDIUM preset), on the GPU with the blur (CPU
+// OpenCV DIS without a GPU engine). High: the shutter integrated from RIFE
+// in-between frames (GPU via Vulkan + CUDA / Metal); falls back to Normal
+// without them. Before v0.10 this was Normal (DIS FAST) / High (DIS MEDIUM) /
+// Extra High (RIFE): with motion on the GPU, FAST saved only ~4 ms per UHD
+// frame for 0.4 dB, so it went. Same disk ID: saved v0.9 clips aren't migrated.
+#define OE_QUALITY_CHOICES "Normal|High"
+
+// High samples: RIFE in-between frames averaged per output frame (one
+// network pass each). 6: same look as 8 on a fast ball at 2x zoom, -0.2 dB on
+// the 59.94p test, +0.0 on 50p, ~20% faster (8: 40.4 / 40.5 dB, 4: 39.8 /
+// 40.4 dB). Fewer = faster but the blur can break into steps on fast motion.
+#define OE_RIFE_SAMPLES_DEFAULT 6
+#define OE_RIFE_SAMPLES_MIN 2
+#define OE_RIFE_SAMPLES_MAX 32
+#define OE_RIFE_SAMPLES_SLIDER_MAX 16
+
+// High analysis size: the frame is scaled down (never up) to at most
+// this many pixels before RIFE sees it; RIFE time scales roughly with pixel
+// count. Below ~2 MP at UHD cost 0.9-1.5 dB on the synthetic tests.
+enum
+{
+    OE_RIFE_SIZE_540 = 1,
+    OE_RIFE_SIZE_720,
+    OE_RIFE_SIZE_1080,
+    OE_RIFE_SIZE_1440,
+    OE_RIFE_SIZE_COUNT = OE_RIFE_SIZE_1440
+};
+#define OE_RIFE_SIZE_CHOICES "540p (fastest)|720p|1080p|1440p (slowest)"
+
+namespace oe
+{
+inline int RifeMaxPixels(int sizeChoice)
+{
+    switch (sizeChoice)
+    {
+        case OE_RIFE_SIZE_540: return 960 * 540;
+        case OE_RIFE_SIZE_720: return 1280 * 720;
+        case OE_RIFE_SIZE_1440: return 2560 * 1440;
+        default: return 2100000; // 1080p (about 1920 x 1080, the pre-0.10 fixed size)
+    }
+}
+} // namespace oe
 
 namespace oe
 {

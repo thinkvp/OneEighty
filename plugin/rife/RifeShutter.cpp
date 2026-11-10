@@ -15,7 +15,7 @@ bool RenderShutter(Engine& rife, gpu::Engine& gpu, const ShutterFrames& f, const
     if (!f.A || !f.B)
     {
         if (err)
-            *err = "Extra High: frames A and B are required";
+            *err = "High (RIFE): frames A and B are required";
         return false;
     }
     const int n = halfWidth > 1e-4 ? std::max(1, nSamples) : 1;

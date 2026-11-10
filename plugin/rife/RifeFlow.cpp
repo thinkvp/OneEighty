@@ -247,7 +247,7 @@ public:
             return Fail(err, driver.empty() ? "no Vulkan GPU (libMoltenVK.dylib not found)" : "no Vulkan GPU (MoltenVK)");
         // Apple's paravirtual GPU (macOS virtual machines, e.g. GitHub's Mac
         // runners) crashes in its driver when MoltenVK fills a texture, which
-        // ncnn's device setup does: no Extra High there (renders as High)
+        // ncnn's device setup does: no Quality High there (renders as Normal)
         if (const char* name = ncnn::get_gpu_info(ncnn::get_default_gpu_index()).device_name();
             name && std::strstr(name, "Paravirtual"))
             return Fail(err, std::string("virtual GPU not supported (") + name + ")");

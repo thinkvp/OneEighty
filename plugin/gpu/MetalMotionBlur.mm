@@ -12,6 +12,8 @@
 //   2. mip chain of each frame (1/2, 1/4, 1/8, box filtered)
 //   3. each pixel: average the frame along +/- halfWidth * v
 //   4. back to 8-bit when the input was 8-bit
+// The *GpuFlow calls also estimate the motion on the GPU first, in their own
+// command buffer (DisFlowMetal.inl, a port of DisFlowCuda.cuh).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -21,7 +23,11 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <initializer_list>
+#include <string>
 #include <vector>
+
+#include "DisFlowMetal.inl"
 
 namespace oe::gpu
 {
@@ -218,7 +224,7 @@ kernel void k_blur_pair(device const float4* a0 [[buffer(0)]], device const floa
     out[y * W + x] = r;
 }
 
-// One time sample of the temporal supersampling (Extra High): warp both frames
+// One time sample of the temporal supersampling (Quality High): warp both frames
 // by the sample's field (bilinear from the reduced field grid), blend by its
 // mask and add weight * result to acc (first sample: overwrite).
 kernel void k_rife_accum(device const float4* f0 [[buffer(0)]], device const float4* f1 [[buffer(1)]],
@@ -355,6 +361,20 @@ public:
                 if (!*k.ps)
                     return Fail(err, (std::string("Metal pipeline ") + k.name + " failed").c_str());
             }
+            // GPU motion: its own library, so if it fails the blur still works (the
+            // effect then estimates motion on the CPU and logs disErr_)
+            {
+                NSError* de = nil;
+                const std::string src = std::string("#include <metal_stdlib>
+using namespace metal;
+") + dis::kDisSource;
+                id<MTLLibrary> dlib = [dev_ newLibraryWithSource:@(src.c_str()) options:opt error:&de];
+                if (!dlib)
+                    disErr_ = "GPU motion kernels didn't compile: " +
+                              std::string(de ? de.localizedDescription.UTF8String : "?");
+                else if (dis_.Init(dev_, dlib, &disErr_))
+                    disOk_ = true;
+            }
             name_ = std::string("Metal: ") + dev_.name.UTF8String;
             return true;
         }
@@ -372,36 +392,9 @@ public:
         {
             id<MTLCommandBuffer> cb = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            BlurArgs args = {};
-            id<MTLBuffer> ma[4], mb[4];
             bool ok = EnsureOut(A.width, A.height, err) && Upload(enc, A, 0, err) && Upload(enc, B, 1, err) &&
                       UploadFlow(fa, flowA_, err) && UploadFlow(fb, flowB_, err) &&
-                      BuildMips(enc, frame_[0], A.width, A.height, mipA_, s, &args.a, ma, err) &&
-                      BuildMips(enc, frame_[1], A.width, A.height, mipB_, s, &args.b, mb, err);
-            if (ok)
-            {
-                args.fw = fa.width;
-                args.fh = fa.height;
-                args.fbw = fb.width;
-                args.fbh = fb.height;
-                args.hw = (float)std::max(0.0, s.halfWidth);
-                args.c0 = (float)std::clamp(a, 0.0, 1.0);
-                args.mode = s.showVectors ? 1 : 0;
-                args.maxS = std::max(2, s.maxSamples);
-                args.mipT = (float)std::max(1, s.mipThreshold);
-                [enc setComputePipelineState:pair_];
-                for (int i = 0; i < 4; ++i)
-                {
-                    [enc setBuffer:ma[i] offset:0 atIndex:i];
-                    [enc setBuffer:mb[i] offset:0 atIndex:4 + i];
-                }
-                [enc setBuffer:flowA_.b offset:0 atIndex:8];
-                [enc setBuffer:flowB_.b offset:0 atIndex:9];
-                [enc setBuffer:out_.b offset:0 atIndex:10];
-                [enc setBytes:&args length:sizeof(args) atIndex:11];
-                Dispatch(enc, pair_, A.width, A.height);
-                EncodeToU8(enc, A);
-            }
+                      EncodePair(enc, A, a, fa.width, fa.height, fb.width, fb.height, s, err);
             [enc endEncoding];
             ok = ok && Finish(cb, stats, err);
             return ok && Download(out, outRowBytes, A, err);
@@ -416,29 +409,8 @@ public:
         {
             id<MTLCommandBuffer> cb = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            BlurArgs args = {};
-            id<MTLBuffer> ms[4];
             bool ok = EnsureOut(cur.width, cur.height, err) && Upload(enc, cur, 0, err) &&
-                      UploadFlow(v, flowA_, err) &&
-                      BuildMips(enc, frame_[0], cur.width, cur.height, mipA_, s, &args.a, ms, err);
-            if (ok)
-            {
-                args.fw = v.width;
-                args.fh = v.height;
-                args.hw = (float)std::max(0.0, s.halfWidth);
-                args.c0 = (float)s.centerOffset;
-                args.mode = s.showVectors ? 1 : 0;
-                args.maxS = std::max(2, s.maxSamples);
-                args.mipT = (float)std::max(1, s.mipThreshold);
-                [enc setComputePipelineState:blur_];
-                for (int i = 0; i < 4; ++i)
-                    [enc setBuffer:ms[i] offset:0 atIndex:i];
-                [enc setBuffer:flowA_.b offset:0 atIndex:8];
-                [enc setBuffer:out_.b offset:0 atIndex:10];
-                [enc setBytes:&args length:sizeof(args) atIndex:11];
-                Dispatch(enc, blur_, cur.width, cur.height);
-                EncodeToU8(enc, cur);
-            }
+                      UploadFlow(v, flowA_, err) && EncodeSingle(enc, cur, v.width, v.height, s, err);
             [enc endEncoding];
             ok = ok && Finish(cb, stats, err);
             return ok && Download(out, outRowBytes, cur, err);
@@ -519,8 +491,193 @@ public:
         }
     }
 
+    bool ProcessPairGpuFlow(const HostImage& A, const HostImage& B, double a, const FlowSettings& fs, void* out,
+                            size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) override
+    {
+        if (B.width != A.width || B.height != A.height || B.isFloat != A.isFloat)
+            return Fail(err, "frame size/format mismatch");
+        std::lock_guard<std::mutex> lock(mu_);
+        @autoreleasepool
+        {
+            // motion in its own command buffer (timed separately), then the blur
+            id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            bool ok = EnsureOut(A.width, A.height, err) && Upload(enc, A, 0, err) && Upload(enc, B, 1, err) &&
+                      SetupFlow(A.width, A.height, fs, err) && dis_.Prepare(enc, 0, frame_[0].b, err) &&
+                      dis_.Prepare(enc, 1, frame_[1].b, err) &&
+                      // A's motion forward (A->B) and B's motion forward (minus B->A)
+                      dis_.Compute(enc, 0, 1, fs.refineEdges, 1.0f, false, flowA_.b, err) &&
+                      dis_.Compute(enc, 1, 0, fs.refineEdges, -1.0f, false, flowB_.b, err);
+            [enc endEncoding];
+            Stats fst, bst;
+            ok = ok && Finish(cb, &fst, err);
+            if (!ok)
+                return false;
+            cb = [queue_ commandBuffer];
+            enc = [cb computeCommandEncoder];
+            ok = EncodePair(enc, A, a, dis_.Fw(), dis_.Fh(), dis_.Fw(), dis_.Fh(), s, err);
+            [enc endEncoding];
+            ok = ok && Finish(cb, &bst, err);
+            if (stats)
+            {
+                stats->flowMs = fst.gpuMs;
+                stats->gpuMs = fst.gpuMs + bst.gpuMs;
+            }
+            return ok && Download(out, outRowBytes, A, err);
+        }
+    }
+
+    bool ProcessGpuFlow(const HostImage* prev, const HostImage& cur, const HostImage* next, const FlowSettings& fs,
+                        void* out, size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) override
+    {
+        for (const HostImage* o : {prev, next})
+            if (o && (o->width != cur.width || o->height != cur.height || o->isFloat != cur.isFloat))
+                return Fail(err, "frame size/format mismatch");
+        std::lock_guard<std::mutex> lock(mu_);
+        @autoreleasepool
+        {
+            // slots: 0 = cur, 1 = next, 2 = prev
+            id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            bool ok = EnsureOut(cur.width, cur.height, err) && Upload(enc, cur, 0, err) &&
+                      (!next || Upload(enc, *next, 1, err)) && (!prev || Upload(enc, *prev, 2, err)) &&
+                      SetupFlow(cur.width, cur.height, fs, err) && dis_.Prepare(enc, 0, frame_[0].b, err) &&
+                      (!next || dis_.Prepare(enc, 1, frame_[1].b, err)) &&
+                      (!prev || dis_.Prepare(enc, 2, frame_[2].b, err));
+            // velocity: mean of (cur->next) and -(cur->prev), whichever exist
+            const float k = next && prev ? 0.5f : 1.0f;
+            if (ok && !next && !prev)
+                dis_.Zero(enc, flowA_.b);
+            if (ok && next)
+                ok = dis_.Compute(enc, 0, 1, fs.refineEdges, k, false, flowA_.b, err);
+            if (ok && prev)
+                ok = dis_.Compute(enc, 0, 2, fs.refineEdges, -k, next != nullptr, flowA_.b, err);
+            [enc endEncoding];
+            Stats fst, bst;
+            ok = ok && Finish(cb, &fst, err);
+            if (!ok)
+                return false;
+            cb = [queue_ commandBuffer];
+            enc = [cb computeCommandEncoder];
+            ok = EncodeSingle(enc, cur, dis_.Fw(), dis_.Fh(), s, err);
+            [enc endEncoding];
+            ok = ok && Finish(cb, &bst, err);
+            if (stats)
+            {
+                stats->flowMs = fst.gpuMs;
+                stats->gpuMs = fst.gpuMs + bst.gpuMs;
+            }
+            return ok && Download(out, outRowBytes, cur, err);
+        }
+    }
+
+    bool EstimateFlowPairGpu(const HostImage& A, const HostImage& B, const FlowSettings& fs, float* fab, float* fba,
+                             int* fw, int* fh, Stats* stats, std::string* err) override
+    {
+        if (B.width != A.width || B.height != A.height || B.isFloat != A.isFloat)
+            return Fail(err, "frame size/format mismatch");
+        std::lock_guard<std::mutex> lock(mu_);
+        @autoreleasepool
+        {
+            id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            bool ok = Upload(enc, A, 0, err) && Upload(enc, B, 1, err) && SetupFlow(A.width, A.height, fs, err) &&
+                      dis_.Prepare(enc, 0, frame_[0].b, err) && dis_.Prepare(enc, 1, frame_[1].b, err) &&
+                      dis_.Compute(enc, 0, 1, fs.refineEdges, 1.0f, false, flowA_.b, err) &&
+                      dis_.Compute(enc, 1, 0, fs.refineEdges, 1.0f, false, flowB_.b, err);
+            [enc endEncoding];
+            Stats st;
+            ok = ok && Finish(cb, &st, err);
+            if (!ok)
+                return false;
+            const size_t bytes = (size_t)dis_.Fw() * dis_.Fh() * 8;
+            std::memcpy(fab, flowA_.Ptr(), bytes);
+            std::memcpy(fba, flowB_.Ptr(), bytes);
+            *fw = dis_.Fw();
+            *fh = dis_.Fh();
+            if (stats)
+            {
+                stats->flowMs = st.gpuMs;
+                stats->gpuMs = st.gpuMs;
+            }
+            return true;
+        }
+    }
+
 private:
     static constexpr int kMaxFrames = 4;
+
+    // Analysis size / pyramid for this frame size, and flow buffers to match.
+    bool SetupFlow(int W, int H, const FlowSettings& fs, std::string* err)
+    {
+        if (!disOk_)
+            return Fail(err, disErr_.c_str());
+        if (!dis_.Setup(W, H, fs.flowWidth, fs.preset))
+            return Fail(err, "frame too small for GPU motion");
+        const size_t bytes = (size_t)dis_.Fw() * dis_.Fh() * 8;
+        if (!flowA_.Ensure(dev_, bytes) || !flowB_.Ensure(dev_, bytes))
+            return Fail(err, "out of GPU memory (flow)");
+        return true;
+    }
+
+    // Two-frame blur of frame_[0] / frame_[1] with flowA_ (faw x fah) / flowB_ into out_ (+ 8-bit conversion).
+    bool EncodePair(id<MTLComputeCommandEncoder> enc, const HostImage& A, double a, int faw, int fah, int fbw, int fbh,
+                    const Settings& s, std::string* err)
+    {
+        BlurArgs args = {};
+        id<MTLBuffer> ma[4], mb[4];
+        if (!BuildMips(enc, frame_[0], A.width, A.height, mipA_, s, &args.a, ma, err) ||
+            !BuildMips(enc, frame_[1], A.width, A.height, mipB_, s, &args.b, mb, err))
+            return false;
+        args.fw = faw;
+        args.fh = fah;
+        args.fbw = fbw;
+        args.fbh = fbh;
+        args.hw = (float)std::max(0.0, s.halfWidth);
+        args.c0 = (float)std::clamp(a, 0.0, 1.0);
+        args.mode = s.showVectors ? 1 : 0;
+        args.maxS = std::max(2, s.maxSamples);
+        args.mipT = (float)std::max(1, s.mipThreshold);
+        [enc setComputePipelineState:pair_];
+        for (int i = 0; i < 4; ++i)
+        {
+            [enc setBuffer:ma[i] offset:0 atIndex:i];
+            [enc setBuffer:mb[i] offset:0 atIndex:4 + i];
+        }
+        [enc setBuffer:flowA_.b offset:0 atIndex:8];
+        [enc setBuffer:flowB_.b offset:0 atIndex:9];
+        [enc setBuffer:out_.b offset:0 atIndex:10];
+        [enc setBytes:&args length:sizeof(args) atIndex:11];
+        Dispatch(enc, pair_, A.width, A.height);
+        EncodeToU8(enc, A);
+        return true;
+    }
+
+    // Single-frame blur of frame_[0] with flowA_ (fw x fh) into out_ (+ 8-bit conversion).
+    bool EncodeSingle(id<MTLComputeCommandEncoder> enc, const HostImage& cur, int fw, int fh, const Settings& s,
+                      std::string* err)
+    {
+        BlurArgs args = {};
+        id<MTLBuffer> ms[4];
+        if (!BuildMips(enc, frame_[0], cur.width, cur.height, mipA_, s, &args.a, ms, err))
+            return false;
+        args.fw = fw;
+        args.fh = fh;
+        args.hw = (float)std::max(0.0, s.halfWidth);
+        args.c0 = (float)s.centerOffset;
+        args.mode = s.showVectors ? 1 : 0;
+        args.maxS = std::max(2, s.maxSamples);
+        args.mipT = (float)std::max(1, s.mipThreshold);
+        [enc setComputePipelineState:blur_];
+        for (int i = 0; i < 4; ++i)
+            [enc setBuffer:ms[i] offset:0 atIndex:i];
+        [enc setBuffer:flowA_.b offset:0 atIndex:8];
+        [enc setBuffer:out_.b offset:0 atIndex:10];
+        [enc setBytes:&args length:sizeof(args) atIndex:11];
+        Dispatch(enc, blur_, cur.width, cur.height);
+        EncodeToU8(enc, cur);
+        return true;
+    }
 
     static bool Fail(std::string* err, const char* msg)
     {
@@ -660,9 +817,12 @@ private:
     id<MTLComputePipelineState> blur_ = nil, pair_ = nil, accum_ = nil, toF4_ = nil, toU8_ = nil, down_ = nil;
     std::string name_;
     Buf frame_[kMaxFrames], stage_[kMaxFrames], out_, stageOut_; // float frames, 8-bit staging, output
-    Buf fieldFlow_, fieldMask_;                                   // Extra High: one sample's field
+    Buf fieldFlow_, fieldMask_;                                   // Quality High: one sample's field
     Buf flowA_, flowB_, mipA_[3], mipB_[3];
     int outW_ = 0, outH_ = 0;
+    dis::MetalDis dis_; // GPU motion (the *GpuFlow calls)
+    bool disOk_ = false;
+    std::string disErr_ = "GPU motion not initialised";
 };
 
 } // namespace

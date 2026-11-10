@@ -7,6 +7,8 @@
 //   3. each pixel: average the frame along +/- halfWidth * v; long smears are
 //      sampled from a mip level so the cost stays bounded
 //   4. download in the input's layout
+// The *GpuFlow calls also estimate the motion here, from the uploaded frames
+// (DisFlowCuda.cuh), instead of taking it from the caller.
 
 #ifndef NOMINMAX
     #define NOMINMAX
@@ -206,7 +208,7 @@ __global__ void KBlurPair(MipSet ma, MipSet mb, FlowField fa, FlowField fb, char
     Store(out, outP, x, y, r);
 }
 
-// One time sample of the temporal supersampling (Extra High): warp both frames
+// One time sample of the temporal supersampling (Quality High): warp both frames
 // by the sample's field (bilinear from the reduced field grid), blend by its
 // mask and add weight * result to acc (first sample: overwrite).
 __global__ void KRifeAccum(const char* f0, size_t p0, const char* f1, size_t p1, int W, int H, const float4* flow,
@@ -289,6 +291,16 @@ __global__ void KF4ToU8(const char* src, size_t sp, unsigned char* dst, size_t d
 
 inline dim3 Grid(int w, int h, dim3 b) { return dim3((w + b.x - 1) / b.x, (h + b.y - 1) / b.y); }
 
+} // namespace
+} // namespace oe::gpu
+
+#include "DisFlowCuda.cuh"
+
+namespace oe::gpu
+{
+namespace
+{
+
 // ------------------------------------------------------------------ engine
 struct DevBuf
 {
@@ -341,6 +353,7 @@ public:
             for (auto& e : ev_)
                 if (e)
                     cudaEventDestroy(e);
+            dis_.Release();
             CUcontext dummy;
             cuCtxPopCurrent(&dummy);
         }
@@ -377,17 +390,8 @@ public:
         if (ok)
         {
             cudaEventRecord(ev_[0], nullptr);
-            MipSet ma = {}, mb = {};
-            ok = BuildMips(frame_[0], mipA_, s, &ma, err) && BuildMips(frame_[1], mipB_, s, &mb, err);
-            if (ok)
-            {
-                const dim3 b(16, 16), g = Grid(A.width, A.height, b);
-                KBlurPair<<<g, b>>>(ma, mb, Field(flowA_), Field(flowB_), (char*)out_.ptr, out_.pitch,
-                                    (float)std::max(0.0, s.halfWidth), (float)std::clamp(a, 0.0, 1.0),
-                                    s.showVectors ? 1 : 0, std::max(2, s.maxSamples),
-                                    (float)std::max(1, s.mipThreshold));
-                ok = Finish(stats, err);
-            }
+            cudaEventRecord(ev_[2], nullptr);
+            ok = BlurPair(a, s, err) && Finish(stats, err);
         }
         ok = ok && Download(out, outRowBytes, A.argb, A.isFloat, err);
         CUcontext dummy;
@@ -405,16 +409,8 @@ public:
         if (ok)
         {
             cudaEventRecord(ev_[0], nullptr);
-            MipSet ms = {};
-            ok = BuildMips(frame_[0], mipA_, s, &ms, err);
-            if (ok)
-            {
-                const dim3 b(16, 16), g = Grid(cur.width, cur.height, b);
-                KBlur<<<g, b>>>(ms, Field(flowA_), (char*)out_.ptr, out_.pitch, (float)std::max(0.0, s.halfWidth),
-                                (float)s.centerOffset, s.showVectors ? 1 : 0, std::max(2, s.maxSamples),
-                                (float)std::max(1, s.mipThreshold));
-                ok = Finish(stats, err);
-            }
+            cudaEventRecord(ev_[2], nullptr);
+            ok = BlurSingle(s, err) && Finish(stats, err);
         }
         ok = ok && Download(out, outRowBytes, cur.argb, cur.isFloat, err);
         CUcontext dummy;
@@ -439,7 +435,10 @@ public:
         for (int i = 0; i < nFrames && ok; ++i)
             ok = Upload(frames[i], i, err);
         if (ok)
+        {
             cudaEventRecord(ev_[0], nullptr);
+            cudaEventRecord(ev_[2], nullptr);
+        }
         const dim3 b(16, 16), g = Grid(W, H, b);
         for (int i = 0; i < nSamples && ok; ++i)
         {
@@ -482,8 +481,139 @@ public:
         return ok;
     }
 
+    bool ProcessPairGpuFlow(const HostImage& A, const HostImage& B, double a, const FlowSettings& fs, void* out,
+                            size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) override
+    {
+        if (B.width != A.width || B.height != A.height || B.isFloat != A.isFloat)
+            return Fail(err, "frame size/format mismatch");
+        std::lock_guard<std::mutex> lock(mu_);
+        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
+            return Fail(err, "cuCtxPushCurrent failed");
+        bool ok = Upload(A, 0, err) && Upload(B, 1, err) && EnsureOut(A.width, A.height, err) &&
+                  SetupFlow(A.width, A.height, fs, err);
+        if (ok)
+        {
+            cudaEventRecord(ev_[0], nullptr);
+            ok = dis_.Prepare(0, (const char*)frame_[0].ptr, frame_[0].pitch, A.width, A.height, err) &&
+                 dis_.Prepare(1, (const char*)frame_[1].ptr, frame_[1].pitch, A.width, A.height, err) &&
+                 // A's motion forward (A->B) and B's motion forward (minus B->A)
+                 dis_.Compute(0, 1, fs.refineEdges, 1.0f, false, (char*)flowA_.ptr, flowA_.pitch, err) &&
+                 dis_.Compute(1, 0, fs.refineEdges, -1.0f, false, (char*)flowB_.ptr, flowB_.pitch, err);
+            cudaEventRecord(ev_[2], nullptr);
+            ok = ok && BlurPair(a, s, err) && Finish(stats, err);
+        }
+        ok = ok && Download(out, outRowBytes, A.argb, A.isFloat, err);
+        CUcontext dummy;
+        cuCtxPopCurrent(&dummy);
+        return ok;
+    }
+
+    bool ProcessGpuFlow(const HostImage* prev, const HostImage& cur, const HostImage* next, const FlowSettings& fs,
+                        void* out, size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) override
+    {
+        for (const HostImage* o : {prev, next})
+            if (o && (o->width != cur.width || o->height != cur.height || o->isFloat != cur.isFloat))
+                return Fail(err, "frame size/format mismatch");
+        std::lock_guard<std::mutex> lock(mu_);
+        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
+            return Fail(err, "cuCtxPushCurrent failed");
+        // slots: 0 = cur, 1 = next, 2 = prev
+        bool ok = Upload(cur, 0, err) && (!next || Upload(*next, 1, err)) && (!prev || Upload(*prev, 2, err)) &&
+                  EnsureOut(cur.width, cur.height, err) && SetupFlow(cur.width, cur.height, fs, err);
+        if (ok)
+        {
+            cudaEventRecord(ev_[0], nullptr);
+            ok = dis_.Prepare(0, (const char*)frame_[0].ptr, frame_[0].pitch, cur.width, cur.height, err) &&
+                 (!next || dis_.Prepare(1, (const char*)frame_[1].ptr, frame_[1].pitch, cur.width, cur.height, err)) &&
+                 (!prev || dis_.Prepare(2, (const char*)frame_[2].ptr, frame_[2].pitch, cur.width, cur.height, err));
+            // velocity: mean of (cur->next) and -(cur->prev), whichever exist
+            const float k = next && prev ? 0.5f : 1.0f;
+            if (ok && !next && !prev)
+                cudaMemset2DAsync(flowA_.ptr, flowA_.pitch, 0, (size_t)flowA_.w * sizeof(float2), flowA_.h);
+            if (ok && next)
+                ok = dis_.Compute(0, 1, fs.refineEdges, k, false, (char*)flowA_.ptr, flowA_.pitch, err);
+            if (ok && prev)
+                ok = dis_.Compute(0, 2, fs.refineEdges, -k, next != nullptr, (char*)flowA_.ptr, flowA_.pitch, err);
+            cudaEventRecord(ev_[2], nullptr);
+            ok = ok && BlurSingle(s, err) && Finish(stats, err);
+        }
+        ok = ok && Download(out, outRowBytes, cur.argb, cur.isFloat, err);
+        CUcontext dummy;
+        cuCtxPopCurrent(&dummy);
+        return ok;
+    }
+
+    bool EstimateFlowPairGpu(const HostImage& A, const HostImage& B, const FlowSettings& fs, float* fab, float* fba,
+                             int* fw, int* fh, Stats* stats, std::string* err) override
+    {
+        if (B.width != A.width || B.height != A.height || B.isFloat != A.isFloat)
+            return Fail(err, "frame size/format mismatch");
+        std::lock_guard<std::mutex> lock(mu_);
+        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
+            return Fail(err, "cuCtxPushCurrent failed");
+        bool ok = Upload(A, 0, err) && Upload(B, 1, err) && SetupFlow(A.width, A.height, fs, err);
+        if (ok)
+        {
+            cudaEventRecord(ev_[0], nullptr);
+            ok = dis_.Prepare(0, (const char*)frame_[0].ptr, frame_[0].pitch, A.width, A.height, err) &&
+                 dis_.Prepare(1, (const char*)frame_[1].ptr, frame_[1].pitch, A.width, A.height, err) &&
+                 dis_.Compute(0, 1, fs.refineEdges, 1.0f, false, (char*)flowA_.ptr, flowA_.pitch, err) &&
+                 dis_.Compute(1, 0, fs.refineEdges, 1.0f, false, (char*)flowB_.ptr, flowB_.pitch, err);
+            cudaEventRecord(ev_[2], nullptr);
+            ok = ok && Finish(stats, err);
+        }
+        if (ok)
+        {
+            const size_t row = (size_t)flowA_.w * sizeof(float2);
+            ok = (cudaMemcpy2D(fab, row, flowA_.ptr, flowA_.pitch, row, flowA_.h, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy2D(fba, row, flowB_.ptr, flowB_.pitch, row, flowB_.h, cudaMemcpyDeviceToHost) == cudaSuccess) ||
+                 Fail(err, "flow download failed");
+            *fw = flowA_.w;
+            *fh = flowA_.h;
+        }
+        CUcontext dummy;
+        cuCtxPopCurrent(&dummy);
+        return ok;
+    }
+
 private:
     static constexpr int kMaxFrames = 4;
+
+    // Analysis size / pyramid for this frame size, and flow buffers to match.
+    bool SetupFlow(int W, int H, const FlowSettings& fs, std::string* err)
+    {
+        if (!dis_.Setup(W, H, fs.flowWidth, fs.preset))
+            return Fail(err, "frame too small for GPU motion");
+        if (!flowA_.Ensure(dis_.Fw(), dis_.Fh(), sizeof(float2)) || !flowB_.Ensure(dis_.Fw(), dis_.Fh(), sizeof(float2)))
+            return Fail(err, "out of GPU memory (flow)");
+        return true;
+    }
+
+    // Two-frame blur of frame_[0] / frame_[1] with flowA_ / flowB_ into out_.
+    bool BlurPair(double a, const Settings& s, std::string* err)
+    {
+        MipSet ma = {}, mb = {};
+        if (!BuildMips(frame_[0], mipA_, s, &ma, err) || !BuildMips(frame_[1], mipB_, s, &mb, err))
+            return false;
+        const dim3 b(16, 16), g = Grid(out_.w, out_.h, b);
+        KBlurPair<<<g, b>>>(ma, mb, Field(flowA_), Field(flowB_), (char*)out_.ptr, out_.pitch,
+                            (float)std::max(0.0, s.halfWidth), (float)std::clamp(a, 0.0, 1.0), s.showVectors ? 1 : 0,
+                            std::max(2, s.maxSamples), (float)std::max(1, s.mipThreshold));
+        return true;
+    }
+
+    // Single-frame blur of frame_[0] with flowA_ into out_.
+    bool BlurSingle(const Settings& s, std::string* err)
+    {
+        MipSet ms = {};
+        if (!BuildMips(frame_[0], mipA_, s, &ms, err))
+            return false;
+        const dim3 b(16, 16), g = Grid(out_.w, out_.h, b);
+        KBlur<<<g, b>>>(ms, Field(flowA_), (char*)out_.ptr, out_.pitch, (float)std::max(0.0, s.halfWidth),
+                        (float)s.centerOffset, s.showVectors ? 1 : 0, std::max(2, s.maxSamples),
+                        (float)std::max(1, s.mipThreshold));
+        return true;
+    }
 
     static bool Fail(std::string* err, const char* msg)
     {
@@ -590,9 +720,11 @@ private:
         }
         if (stats)
         {
-            float t = 0;
+            float t = 0, tf = 0;
             cudaEventElapsedTime(&t, ev_[0], ev_[1]);
+            cudaEventElapsedTime(&tf, ev_[0], ev_[2]);
             stats->gpuMs = t;
+            stats->flowMs = tf;
         }
         return true;
     }
@@ -600,9 +732,10 @@ private:
     std::mutex mu_;
     CUcontext ctx_ = nullptr;
     DevBuf frame_[kMaxFrames], out_, stage_[kMaxFrames], stageOut_; // float frames, output, 8-bit staging
-    DevBuf fieldFlow_, fieldMask_;                                   // Extra High: one sample's field
+    DevBuf fieldFlow_, fieldMask_;                                   // Quality High: one sample's field
     DevBuf flowA_, flowB_, mipA_[3], mipB_[3];
-    cudaEvent_t ev_[2] = {};
+    cudaEvent_t ev_[3] = {}; // start, end, end of motion estimation
+    dis::DisFlow dis_;       // GPU motion (the *GpuFlow calls)
 };
 
 } // namespace

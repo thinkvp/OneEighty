@@ -1,6 +1,6 @@
 #pragma once
 // RIFE (Real-time Intermediate Flow Estimation, v4.6 network, MIT) run with
-// ncnn on the GPU through Vulkan, used by Quality "Extra High".
+// ncnn on the GPU through Vulkan, used by Quality "High".
 //
 // RIFE builds a frame at any time t between two frames as
 //     mask * warp(frame0, flow0) + (1 - mask) * warp(frame1, flow1)

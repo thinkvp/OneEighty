@@ -38,8 +38,8 @@ Studios can switch the automatic check off with the environment variable
 **Requirements:** Windows 10/11 64-bit and Premiere Pro (tested with Premiere Pro
 2026 / 26.x). An NVIDIA GeForce RTX 20-series or newer GPU is strongly recommended;
 without one the effect still works, on the CPU, but much more slowly. Quality
-**Extra High** needs the NVIDIA GPU (its driver includes the Vulkan support it
-uses); without it, Extra High renders as High.
+**High** needs the NVIDIA GPU (its driver includes the Vulkan support it
+uses); without it, High renders as Normal.
 
 ## Using it
 
@@ -48,7 +48,7 @@ Drop the effect on a 50p / 59.94p clip (at 100% speed) in a 25p sequence. Sped-u
 | Control | |
 |---|---|
 | **Shutter angle** | The blur to simulate at the timeline rate. 180° is the classic film look; 360° is the maximum smear. The slider starts at 90°: the footage already has that much blur (50p shot at 180° = 90° at 25p; 75° for 59.94p), so lower settings add nothing. You can still type 0–720. |
-| **Quality** | **Normal** (default): best balance. **High**: cleaner edges where people pass in front of the background, slower. **Extra High**: builds 6 in-between frames per output frame with the RIFE neural network and averages them, like a real shutter: clean backgrounds next to fast objects (no smudged court lines beside a bouncing ball) and a natural streak on the object. About 3× slower than High. Works on 10-bit / log / 32-bit footage at full precision. |
+| **Quality** | **Normal** (default): optical-flow motion blur, motion and blur both on the GPU. **High**: builds 6 in-between frames per output frame with the RIFE neural network and averages them, like a real shutter: clean backgrounds next to fast objects (no smudged court lines beside a bouncing ball) and a natural streak on the object. About 3× slower than Normal; *Advanced* has its sample count and analysis size for trading quality against speed. Works on 10-bit / log / 32-bit footage at full precision. |
 | **Exact frame timing** | On (default): even motion for 59.94p → 25p. Makes no difference for 50p → 25p. |
 | *Advanced* | Source shutter angle and frame rate (auto by default), a **motion-vector view** that shows what the effect is tracking, Force CPU, a debug log (`%TEMP%\OneEighty.log`), and update checks. |
 
@@ -61,11 +61,11 @@ Drop the effect on a 50p / 59.94p clip (at 100% speed) in a 25p sequence. Sped-u
 - For 10-bit, log or graded footage, tick **Render at Maximum Depth** when
   exporting: the effect then works in 32-bit float end to end.
 - Problem area on a shot (e.g. an edge that tears)? Mask the effect in Premiere,
-  or try Quality **High** or **Extra High**.
+  or try Quality **High**.
 
 **Speed** (RTX 4070, UHD 59.94p on a 25p timeline, per frame): about **0.27 s**
 with ProRes source at Normal quality, about 1.2 s with long-GOP camera files.
-Extra High adds about 0.15 s per frame (UHD, measured offline).
+Quality High adds about 0.15 s per frame (UHD, measured offline).
 
 ## How well does it work?
 
@@ -76,23 +76,22 @@ at 180° records), PSNR, higher is better:
 |---|---|---|
 | Premiere (frame dropping) | 24.9 dB | 9.8 px |
 | OneEighty, exact frame timing off | 30.5 dB | 9.8 px |
-| **OneEighty, Normal, exact timing on** | **38.1 dB** | **0.16 px** |
-| OneEighty, High, exact timing on | 38.6 dB | 0.14 px |
-| OneEighty, Extra High, exact timing on | 40.2 dB | 0.24 px |
+| **OneEighty, Normal, exact timing on** | **38.6 dB** | **0.10 px** |
+| OneEighty, High, exact timing on | 40.2 dB | 0.24 px |
 
 | 50p → 25p | Accuracy |
 |---|---|
 | Premiere (frame dropping) | 28.1 dB |
 | 2-frame blend (Echo / nested-sequence trick) | 24.1 dB |
-| **OneEighty** (Normal / High / Extra High) | **38.8 / 39.2 / 40.5 dB** |
+| **OneEighty** (Normal / High) | **39.2 / 40.5 dB** |
 
 ## Known limitations
 
 - **Edges:** where a subject moves against a differently moving background,
   optical flow can't know which is in front, so edges can smear or tear slightly.
   OneEighty keeps a fast object's motion from spilling onto the background next
-  to it (e.g. a court line beside a bouncing ball); Quality High helps further;
-  masks are the fallback.
+  to it (e.g. a court line beside a bouncing ball); Quality High builds real
+  in-between frames instead; masks are the fallback.
 - **Speed:** frame fetching from long-GOP files dominates; use proxies to preview.
 - **Exact frame timing** assumes a constant source frame rate. It keeps to the
   frames Premiere itself shows (on sped-up clips too).
@@ -110,7 +109,7 @@ In short:
 2. The Adobe After Effects SDK (free from [developer.adobe.com](https://developer.adobe.com/after-effects/),
    Adobe licence, not included) unzipped to `sdk\ae` (containing `Examples\`).
 3. `deps\setup_opencv.bat` (fetches and builds static OpenCV and ncnn via vcpkg)
-   and `deps\setup_rife.bat` (downloads the RIFE model for Extra High).
+   and `deps\setup_rife.bat` (downloads the RIFE model for Quality High).
 4. `plugin\build.bat` → `plugin\build\OneEighty.aex`. For development,
    `plugin\install.bat` (once, as admin) links Premiere's plug-in folder to the
    build folder.
@@ -119,7 +118,7 @@ In short:
 
 | Folder | |
 |---|---|
-| `plugin/` | The effect (C++): After Effects SDK host code, CUDA engine (`gpu/`), RIFE via ncnn for Extra High (`rife/`), CPU maths (`MotionBlur.cpp`), offline test tools (`tools/`) |
+| `plugin/` | The effect (C++): After Effects SDK host code, CUDA engine (`gpu/`), RIFE via ncnn for Quality High (`rife/`), CPU maths (`MotionBlur.cpp`), offline test tools (`tools/`) |
 | `prototype/` | Python reference implementation, synthetic ground-truth clips and the validation scripts behind the numbers above |
 | `release/` | Installer scripts and release packaging |
 | `deps/` | Dependency setup scripts |

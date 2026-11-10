@@ -3,9 +3,11 @@
 Runs the CPU path (oe_offline) and the GPU path (oe_gpu_offline: CUDA on
 Windows, Metal on macOS) on the synthetic clips and checks:
   - GPU accuracy vs a real 25p camera at 180 deg (PSNR) is close to the
-    figures measured on Windows (README: 59.94p 38.1 dB, 50p 38.8 dB, Normal;
-    Extra High 40.2 / 40.5 dB, needs the RIFE model and Vulkan / MoltenVK)
+    figures measured on Windows (README: 59.94p 38.6 dB, 50p 39.2 dB, Normal;
+    High (RIFE) 40.2 / 40.5 dB, needs the RIFE model and Vulkan / MoltenVK)
   - GPU and CPU paths agree (their PSNRs within 0.6 dB)
+  - motion estimated on the GPU (OE_GPUFLOW=1, the effect's default) scores
+    within 0.3 dB of the CPU motion (OpenCV DIS), exact timing on and off
   - 32-bit float and ARGB-byte-order runs match the plain 8-bit BGRA run
   - the motion-vector view runs
 
@@ -27,10 +29,11 @@ BUILD = Path(os.environ.get("OE_BUILD") or HERE.parent / "plugin" / ("build-mac"
 EXE = ".exe" if sys.platform == "win32" else ""
 W, H = 1280, 720
 GT = HERE / "test_gt_25p.mkv"
-# clip, source fps, Windows accuracy for Normal and Extra High (README)
-CLIPS = {"59.94p": (HERE / "test_src_5994p.mkv", 60000 / 1001, 38.1, 40.2),
-         "50p": (HERE / "test_src_50p.mkv", 50.0, 38.8, 40.5)}
+# clip, source fps, Windows accuracy for Normal and High (RIFE) (README)
+CLIPS = {"59.94p": (HERE / "test_src_5994p.mkv", 60000 / 1001, 38.6, 40.2),
+         "50p": (HERE / "test_src_50p.mkv", 50.0, 39.2, 40.5)}
 MARGIN = 0.6  # dB allowed below the Windows figure / between CPU and GPU
+FLOW_MARGIN = 0.3  # dB between GPU motion and CPU motion (Windows: within 0.05)
 
 raw_in, raw_out = HERE / "_ci_src.bgra", HERE / "_ci_out.bgra"
 failures = []
@@ -71,7 +74,7 @@ def check(ok, msg):
 
 
 gt = np.array(list(read_frames(str(GT))))
-for name, (clip, fps, windows_db, extra_db) in CLIPS.items():
+for name, (clip, fps, windows_db, rife_db) in CLIPS.items():
     print(f"{name} -> 25p")
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(clip), "-f", "rawvideo", "-pix_fmt", "bgra", str(raw_in)],
                    check=True)
@@ -81,22 +84,27 @@ for name, (clip, fps, windows_db, extra_db) in CLIPS.items():
     check(gpu_db >= windows_db - MARGIN, f"GPU Normal {gpu_db:.2f} dB (Windows: {windows_db} dB)")
     check(abs(gpu_db - cpu_db) <= MARGIN, f"CPU Normal {cpu_db:.2f} dB, GPU within {MARGIN} dB")
 
-    high = score(run("oe_gpu_offline", fps, OE_QUALITY="high"), gt)
-    check(high >= gpu_db - 0.2, f"GPU High {high:.2f} dB")
-
     cpu_off, gpu_off = score(run("oe_offline", fps, OE_EXACT=0), gt), score(run("oe_gpu_offline", fps, OE_EXACT=0), gt)
     check(abs(gpu_off - cpu_off) <= MARGIN, f"exact timing off: CPU {cpu_off:.2f} dB, GPU {gpu_off:.2f} dB")
 
+    gm_frames = run("oe_gpu_offline", fps, OE_GPUFLOW=1)
+    gm = score(gm_frames, gt)
+    check(abs(gm - gpu_db) <= FLOW_MARGIN, f"GPU motion Normal {gm:.2f} dB (CPU motion {gpu_db:.2f} dB)")
+    gmo = score(run("oe_gpu_offline", fps, OE_EXACT=0, OE_GPUFLOW=1), gt)
+    check(abs(gmo - gpu_off) <= FLOW_MARGIN, f"GPU motion, exact timing off {gmo:.2f} dB (CPU motion {gpu_off:.2f} dB)")
+    gmf = agree(run("oe_gpu_offline", fps, OE_FLOAT=1, OE_GPUFLOW=1), gm_frames)
+    check(gmf >= 50, f"GPU motion: 32-bit float matches 8-bit: {gmf:.1f} dB")
+
     try:
-        extra = score(run("oe_gpu_offline", fps, OE_QUALITY="extra"), gt)
-        check(extra >= extra_db - MARGIN, f"GPU Extra High {extra:.2f} dB (Windows: {extra_db} dB)")
+        rife = score(run("oe_gpu_offline", fps, OE_QUALITY="high"), gt)
+        check(rife >= rife_db - MARGIN, f"GPU High (RIFE) {rife:.2f} dB (Windows: {rife_db} dB)")
     except RuntimeError as e:
         # RIFE refuses Apple's paravirtual GPU (GitHub's Mac runners): its
         # driver crashes under MoltenVK. Anything else is a failure.
         if "virtual GPU not supported" not in str(e):
             raise
-        print("  skip  GPU Extra High: virtual GPU (macOS VM), RIFE not supported")
-        skipped.append("Extra High")
+        print("  skip  GPU High (RIFE): virtual GPU (macOS VM), RIFE not supported")
+        skipped.append("High (RIFE)")
 
     fl = agree(run("oe_gpu_offline", fps, OE_FLOAT=1), gpu)
     check(fl >= 50, f"32-bit float matches 8-bit: {fl:.1f} dB")
@@ -104,6 +112,7 @@ for name, (clip, fps, windows_db, extra_db) in CLIPS.items():
     check(argb >= 50, f"ARGB byte order matches BGRA: {argb:.1f} dB")
     if name == "50p":
         run("oe_gpu_offline", fps, OE_VIEW=1)
+        run("oe_gpu_offline", fps, OE_VIEW=1, OE_GPUFLOW=1)
         check(True, "motion-vector view runs")
 
 raw_in.unlink(missing_ok=True)

@@ -3,10 +3,10 @@
 
     Premiere lets this effect check out its input at sub-frame times, so it can
     read the in-between source frames (Premiere's GPU filter API can't: it only
-    delivers whole timeline frames). Frames are fetched here, motion is
-    estimated with OpenCV DIS on the CPU (Quality Normal / High = FAST / MEDIUM
-    preset) and the blur runs on the CUDA engine when an NVIDIA GPU is
-    available ("hybrid"), otherwise with OpenCV on the CPU.
+    delivers whole timeline frames). Frames are fetched here; with a GPU
+    engine (CUDA, Metal) motion (DIS, MEDIUM preset; Quality High: RIFE
+    in-between frames instead) and blur both run on the GPU ("gpu"; "hybrid" = CPU motion, GPU
+    blur, the fallback), otherwise everything runs with OpenCV on the CPU.
 
     When high-frame-rate footage (50p, 59.94p) plays at 100% speed (or a
     slowed-down file is sped back up) on a lower rate timeline (25p), Premiere
@@ -213,6 +213,15 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OE_ADV_START_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("High samples", OE_RIFE_SAMPLES_MIN, OE_RIFE_SAMPLES_MAX, OE_RIFE_SAMPLES_MIN,
+                         OE_RIFE_SAMPLES_SLIDER_MAX, OE_RIFE_SAMPLES_DEFAULT, PF_Precision_INTEGER, 0, 0,
+                         OE_RIFE_SAMPLES_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("High analysis size", OE_RIFE_SIZE_COUNT, OE_RIFE_SIZE_1080, OE_RIFE_SIZE_CHOICES,
+                 OE_RIFE_SIZE_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Source shutter angle", 1, 360, 1, 360, 180, PF_Precision_INTEGER, 0, 0,
                          OE_SRC_SHUTTER_DISK_ID);
 
@@ -261,9 +270,9 @@ oe::gpu::Engine* HybridEngine()
     return gEngine.get();
 }
 
-// Quality Extra High: RIFE on the GPU through Vulkan (rife/RifeFlow.h), model
-// in rife-v4.6 next to the plugin. Created on first use; a failure is
-// remembered (Extra High then renders as High).
+// Quality High: RIFE on the GPU through Vulkan (rife/RifeFlow.h), model in
+// rife-v4.6 next to the plugin. Created on first use; a failure is remembered
+// (High then renders as Normal).
 std::unique_ptr<oe::rife::Engine> gRife;
 bool gRifeTried = false;
 
@@ -276,9 +285,9 @@ oe::rife::Engine* RifeEngine()
         std::string err;
         gRife = oe::rife::Engine::Create(oe::rife::DefaultModelDir(), &err);
         if (gRife)
-            Log("[extra] RIFE ready");
+            Log("[rife] RIFE ready");
         else
-            Log("[extra] RIFE unavailable (%s) -> Extra High renders as High", err.c_str());
+            Log("[rife] RIFE unavailable (%s) -> High renders as Normal", err.c_str());
     }
     return gRife.get();
 }
@@ -443,7 +452,7 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         unsigned fc = 0;
         cv::Mat m;
     };
-    Fetched pool[6]; // A, B, an anchor probe, and Extra High's frames before A / after B
+    Fetched pool[6]; // A, B, an anchor probe, and High's frames before A / after B
     int nPool = 0;
     double fetchMs = 0;
     auto fetch = [&](long long t) -> Fetched* {
@@ -517,13 +526,12 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     const int q = params[OE_QUALITY]->u.pd.value;
     const bool vectors = view == OE_VIEW_VECTORS;
 
-    // Normal / High: motion from OpenCV DIS on the CPU (copes with fine repeating
-    // patterns); the blur on the GPU when there is one (the expensive part at
-    // UHD), else CPU. Extra High: the shutter from RIFE in-between frames on the
-    // GPU (rife/RifeShutter.h); it falls back to High without RIFE or CUDA.
-    // Normal: DIS FAST preset (17 ms/pair at UHD, -0.4 dB on the synthetic test);
-    // High: DIS MEDIUM (41 ms/pair; cleaner edges where people cross the background).
-    const int disPreset = q == OE_QUALITY_NORMAL ? cv::DISOpticalFlow::PRESET_FAST : cv::DISOpticalFlow::PRESET_MEDIUM;
+    // Normal: DIS motion (copes with fine repeating patterns; MEDIUM preset,
+    // ~10 ms per UHD frame on the GPU, 41 ms/pair on the CPU) and the blur on
+    // the GPU when there is one, else CPU. High: the shutter from RIFE
+    // in-between frames on the GPU (rife/RifeShutter.h); it falls back to
+    // Normal without RIFE or a GPU engine.
+    constexpr int disPreset = cv::DISOpticalFlow::PRESET_MEDIUM;
     constexpr int kFlowWidth = 960; // motion analysis width
     oe::gpu::Engine* eng = nullptr;
     const bool bgra = order.b == 0 && order.g == 1 && order.r == 2;
@@ -537,15 +545,17 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         why = "GPU engine unavailable";
 
     const auto tCompute0 = Clock::now();
-    double disMs = 0; // CPU motion estimation time (hybrid path)
+    double disMs = 0;     // CPU motion estimation time (hybrid path)
+    double gpuFlowMs = 0; // GPU motion estimation time (gpu path)
     const char* path = eng ? "hybrid" : "cpu";
     std::string gerr;
     bool done = false;
     const bool pair = pairPlan && have1 && have2;
     oe::rife::ShutterStats rstats;
+    int rifeSamples = 0, rifePixels = 0;
     try
     {
-        if (q == OE_QUALITY_EXTRA && eng && have2)
+        if (q == OE_QUALITY_HIGH && eng && have2)
         {
             if (oe::rife::Engine* rife = RifeEngine())
             {
@@ -576,13 +586,13 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
                     if (have1)
                         sf.P = &m1;
                 }
-                // 6 samples: same look as 8 on a fast ball at 2x zoom; -0.2 dB on the 59.94p test,
-                // +0.0 on 50p; ~20% faster (8: 40.4 / 40.5 dB, 4: 39.8 / 40.4 dB)
-                constexpr int kSamples = 6;
-                constexpr int kRifePixels = 2100000;  // RIFE analysis size: about 1920 x 1080
-                done = oe::rife::RenderShutter(*rife, *eng, sf, order, argb && !outFloat, t, hw, kSamples, kRifePixels,
+                // samples / analysis size from Advanced (defaults 6 / 1080p: see OneEightyParams.h)
+                rifeSamples = std::clamp((int)std::lround(params[OE_RIFE_SAMPLES]->u.fs_d.value),
+                                         OE_RIFE_SAMPLES_MIN, OE_RIFE_SAMPLES_MAX);
+                rifePixels = oe::RifeMaxPixels(params[OE_RIFE_SIZE]->u.pd.value);
+                done = oe::rife::RenderShutter(*rife, *eng, sf, order, argb && !outFloat, t, hw, rifeSamples, rifePixels,
                                                vectors, out.data, out.step, &rstats, &gerr);
-                path = done ? "extra" : "hybrid (extra failed)";
+                path = done ? "rife" : "hybrid (rife failed)";
             }
             else
                 path = "hybrid (no RIFE)";
@@ -597,8 +607,27 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
             const oe::gpu::HostImage h1{m1.data, m1.step, m1.cols, m1.rows, a8, outFloat};
             const oe::gpu::HostImage h2{m2.data, m2.step, m2.cols, m2.rows, a8, outFloat};
             oe::gpu::Stats gst;
-            const auto tFlow0 = Clock::now();
+            // Motion on the GPU first (same DIS + edge clean-up, ~8x faster than the CPU
+            // offline and free of CPU contention in Premiere); CPU DIS if it fails.
+            oe::gpu::FlowSettings fs;
+            fs.flowWidth = kFlowWidth;
+            fs.preset = disPreset;
+            std::string ferr;
             if (pair)
+                done = eng->ProcessPairGpuFlow(h1, h2, phase, fs, out.data, out.step, gs, &gst, &ferr);
+            else if (have1 || have2)
+                done = eng->ProcessGpuFlow(have1 ? &h1 : nullptr, hc, have2 ? &h2 : nullptr, fs, out.data, out.step, gs,
+                                           &gst, &ferr);
+            if (done)
+            {
+                gpuFlowMs = gst.flowMs;
+                // "gpu" = motion and blur on the GPU (keeps a note of why RIFE wasn't used)
+                path = std::strcmp(path, "hybrid (no RIFE)") == 0     ? "gpu (no RIFE)"
+                       : std::strcmp(path, "hybrid (rife failed)") == 0 ? "gpu (rife failed)"
+                                                                        : "gpu";
+            }
+            const auto tFlow0 = Clock::now();
+            if (!done && pair)
             {
                 cv::Mat fa, fbBack;
                 oe::EstimateFlowPair(m1, m2, order, kFlowWidth, fa, fbBack, disPreset); // A->B and B->A
@@ -608,7 +637,7 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
                 const oe::gpu::HostFlow hfb{fb.data, fb.step, fb.cols, fb.rows};
                 done = eng->ProcessPair(h1, h2, phase, hfa, hfb, out.data, out.step, gs, &gst, &gerr);
             }
-            else
+            else if (!done)
             {
                 cv::Mat v;
                 int nv = 0;
@@ -639,6 +668,8 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
             }
             if (!done)
                 path = "cpu (gpu error)";
+            if (!ferr.empty()) // GPU motion failed (the CPU motion was used instead)
+                gerr = "GPU motion: " + ferr + (gerr.empty() ? "" : "; " + gerr);
         }
         if (!done)
         {
@@ -688,19 +719,20 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     if (log)
     {
         const double totalMs = std::chrono::duration<double, std::milli>(Clock::now() - tStart).count();
-        char extraInfo[96] = "";
+        char extraInfo[160] = "";
         if (rstats.samples)
-            snprintf(extraInfo, sizeof(extraInfo), " | extra: %d samples from %d pair(s), RIFE %.0fms, warp %.1fms",
-                     rstats.samples, rstats.pairs, rstats.rifeMs, rstats.gpuMs);
+            snprintf(extraInfo, sizeof(extraInfo),
+                     " | rife: %d samples (set %d) from %d pair(s) at <=%.1f MP, RIFE %.0fms, warp %.1fms",
+                     rstats.samples, rifeSamples, rstats.pairs, rifePixels / 1e6, rstats.rifeMs, rstats.gpuMs);
         Log("[%s] render%s%s%s forceCpu=%d t=%d/%u view=%d %dx%d %s | srcFps=%.3f (%s) speed=%.2f timeline=%.3f "
             "(src frames/out %.2f; host orig=%.3f media=%.3f) | "
             "timing=%s p=%.3f a=%.3f d1:%s d2:%s | halfWidth=%.3f q=%d | fetch=%.1fms (d1 %.1fms, d2 %.1fms) compute=%.1fms "
-            "(cpu motion %.1fms) total=%.1fms%s%s%s%s",
+            "(cpu motion %.1fms, gpu motion %.1fms) total=%.1fms%s%s%s%s",
             path, *why ? " (" : "", why, *why ? ")" : "", forceCpu ? 1 : 0, in_data->current_time, in_data->time_scale, view,
             output->width, output->height, fmts, si.fps, si.source, si.speed, timelineFps, srcRate / timelineFps,
             si.origFps, si.mediaFps, pair ? "exact-pair" : "nearest", p, pair ? phase : 0.0,
             have1 ? "ok" : "MISSING", have2 ? "ok" : "MISSING", hw, q, fetchMs, fetch1Ms, fetch2Ms,
-            computeMs, disMs, totalMs, extraInfo, diag, gerr.empty() ? "" : " gpu error: ", gerr.c_str());
+            computeMs, disMs, gpuFlowMs, totalMs, extraInfo, diag, gerr.empty() ? "" : " gpu error: ", gerr.c_str());
     }
     return err ? err : err2;
 }

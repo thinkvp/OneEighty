@@ -39,8 +39,8 @@ def pan_steps(frames):
     return np.array([cv2.phaseCorrelate(g[i], g[i + 1], win)[0][0] for i in range(len(g) - 1)])
 
 
-def run(exe, exact, quality="normal"):
-    env = dict(os.environ, OE_EXACT="1" if exact else "0", OE_QUALITY=quality)
+def run(exe, exact, quality="normal", gpu_flow=False):
+    env = dict(os.environ, OE_EXACT="1" if exact else "0", OE_QUALITY=quality, OE_GPUFLOW="1" if gpu_flow else "0")
     r = subprocess.run([str(BUILD / exe), str(raw_in), str(W), str(H), f"{SRC_FPS:.8f}", "25", str(raw_out)],
                        capture_output=True, text=True, env=env)
     if r.returncode:
@@ -63,8 +63,9 @@ methods = {
     "CPU, exact timing": run("oe_offline.exe", True),
     "GPU, exact timing off": run("oe_gpu_offline.exe", False),
     "GPU, exact timing, Normal": run("oe_gpu_offline.exe", True),
-    "GPU, exact timing, High": run("oe_gpu_offline.exe", True, "high"),
-    "GPU, exact timing, Extra High": run("oe_gpu_offline.exe", True, "extra"),
+    "GPU motion, exact off": run("oe_gpu_offline.exe", False, gpu_flow=True),
+    "GPU motion, Normal": run("oe_gpu_offline.exe", True, gpu_flow=True),
+    "GPU, exact timing, High (RIFE)": run("oe_gpu_offline.exe", True, "high"),
 }
 
 def tpsnr(frames, i):
