@@ -80,8 +80,10 @@ jobs:
           B=plugin/build-mac/OneEighty.plugin
           ls -R "$B"
           file "$B/Contents/MacOS/OneEighty"
-          echo "Exported symbols:"
-          nm -gU "$B/Contents/MacOS/OneEighty" | grep -E "EffectMain|PluginDataEntryFunction2"
+          echo "Exported symbols (exactly the two entry points: anything else, e.g. glslang"
+          echo "from ncnn, binds to Premiere's own copy at load time and crashes):"
+          nm -gU "$B/Contents/MacOS/OneEighty" | tee _exports.txt
+          test "$(awk '{print $NF}' _exports.txt | sort | tr '\n' ' ')" = "_EffectMain _PluginDataEntryFunction2 "
           test -s "$B/Contents/Resources/OneEighty.rsrc"
           codesign --verify --verbose "$B"
           echo "Linked libraries (system only expected):"
@@ -122,11 +124,21 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
+          # readable by everyone: Premiere (running as the user) silently skips a
+          # plugin it can't read once it's copied into /Library as root
+          chmod -R a+rX plugin/build-mac/OneEighty.plugin
           ditto -c -k --keepParent plugin/build-mac/OneEighty.plugin dist/OneEighty-mac-arm64.zip
+          # test tools with what they load from their own folder (zipped: keeps
+          # the executable bits that upload-artifact drops)
+          mkdir -p dist/OneEighty-mac-tools
+          cp plugin/build-mac/oe_offline plugin/build-mac/oe_gpu_offline plugin/build-mac/libMoltenVK.dylib dist/OneEighty-mac-tools/
+          cp -R plugin/build-mac/rife-v4.6 dist/OneEighty-mac-tools/
+          chmod -R a+rX dist/OneEighty-mac-tools
+          ditto -c -k --keepParent dist/OneEighty-mac-tools dist/OneEighty-mac-tools.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: OneEighty-mac-arm64
           path: |
             dist/OneEighty-mac-arm64.zip
-            plugin/build-mac/oe_offline
+            dist/OneEighty-mac-tools.zip

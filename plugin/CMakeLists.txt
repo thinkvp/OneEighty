@@ -114,7 +114,14 @@ set_source_files_properties(${OE_RIFE_MODEL} PROPERTIES MACOSX_PACKAGE_LOCATION 
 target_include_directories(OneEighty PRIVATE
     ${AE_SDK}/Headers ${AE_SDK}/Headers/SP ${AE_SDK}/Util ${AE_SDK}/Resources)
 target_link_libraries(OneEighty PRIVATE oe_gpu oe_motion oe_platform)
-target_link_options(OneEighty PRIVATE -Wl,-dead_strip)
+# Export only the entry points Premiere looks up. Premiere 2026 exports its own
+# glslang; the plugin's (from ncnn, built with default visibility) would
+# otherwise be exported too, and dyld then binds the plugin's calls to weak
+# glslang symbols (template instantiations such as
+# TIntermediate::addSwizzle<int>) to Premiere's different version: Quality
+# Extra High crashed compiling its first shader. Unexported, they bind locally.
+target_link_options(OneEighty PRIVATE -Wl,-dead_strip
+    -Wl,-exported_symbol,_EffectMain -Wl,-exported_symbol,_PluginDataEntryFunction2)
 set_target_properties(OneEighty PROPERTIES
     BUNDLE TRUE
     BUNDLE_EXTENSION plugin

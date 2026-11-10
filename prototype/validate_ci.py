@@ -87,7 +87,8 @@ for name, (clip, fps, windows_db, rife_db) in CLIPS.items():
     cpu_off, gpu_off = score(run("oe_offline", fps, OE_EXACT=0), gt), score(run("oe_gpu_offline", fps, OE_EXACT=0), gt)
     check(abs(gpu_off - cpu_off) <= MARGIN, f"exact timing off: CPU {cpu_off:.2f} dB, GPU {gpu_off:.2f} dB")
 
-    gm_frames = run("oe_gpu_offline", fps, OE_GPUFLOW=1)
+    # on a 512 KB stack, like Premiere's macOS render threads (LargeStack.h; no effect elsewhere)
+    gm_frames = run("oe_gpu_offline", fps, OE_GPUFLOW=1, OE_STACK_KB=512)
     gm = score(gm_frames, gt)
     check(abs(gm - gpu_db) <= FLOW_MARGIN, f"GPU motion Normal {gm:.2f} dB (CPU motion {gpu_db:.2f} dB)")
     gmo = score(run("oe_gpu_offline", fps, OE_EXACT=0, OE_GPUFLOW=1), gt)
