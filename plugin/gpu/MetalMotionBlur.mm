@@ -365,9 +365,7 @@ public:
             // effect then estimates motion on the CPU and logs disErr_)
             {
                 NSError* de = nil;
-                const std::string src = std::string("#include <metal_stdlib>
-using namespace metal;
-") + dis::kDisSource;
+                const std::string src = std::string("#include <metal_stdlib>\nusing namespace metal;\n") + dis::kDisSource;
                 id<MTLLibrary> dlib = [dev_ newLibraryWithSource:@(src.c_str()) options:opt error:&de];
                 if (!dlib)
                     disErr_ = "GPU motion kernels didn't compile: " +
