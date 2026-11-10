@@ -644,7 +644,7 @@ kernel void d_edge_refine(device const float2* src [[buffer(0)]], device const u
     float total = 0;
     for (int i = 0; i < n; ++i)
         total += wt[i];
-    const float half = 0.5f * total;
+    const float halfTotal = 0.5f * total;
     float bestX = 3.4e38f, bestY = 3.4e38f;
     for (int i = 0; i < n; ++i)
     {
@@ -656,9 +656,9 @@ kernel void d_edge_refine(device const float2* src [[buffer(0)]], device const u
             if (vy[j] <= vy[i])
                 accY += wt[j];
         }
-        if (accX >= half && vx[i] < bestX)
+        if (accX >= halfTotal && vx[i] < bestX)
             bestX = vx[i];
-        if (accY >= half && vy[i] < bestY)
+        if (accY >= halfTotal && vy[i] < bestY)
             bestY = vy[i];
     }
     dst[y * w + x] = float2(bestX, bestY);
