@@ -18,6 +18,7 @@
 //   OE_EDGEFIX=0   skip the motion-boundary clean-up (RefineFlowEdges)
 //   OE_GPUFLOW=1   Normal: motion estimated on the GPU (FlowSettings)
 //                  instead of OpenCV DIS on the CPU
+//   OE_SRC_SHUTTER=deg  source shutter angle (default 180; target is always 180)
 //   OE_STACK_KB=n  (macOS) run everything on a thread with an n KB stack;
 //                  512 = Premiere's render threads (see LargeStack.h)
 #include "../LargeStack.h"
@@ -112,7 +113,10 @@ int Run(int argc, char** argv)
     const int W = std::atoi(argv[2]), H = std::atoi(argv[3]);
     const double srcFps = std::atof(argv[4]), outFps = std::atof(argv[5]);
     oe::gpu::Settings s;
-    s.halfWidth = oe::BlurHalfWidth(srcFps, outFps, 180.0, 180.0);
+    double srcShutter = 180.0;
+    if (const std::string v = EnvStr("OE_SRC_SHUTTER"); !v.empty())
+        srcShutter = std::clamp(std::atof(v.c_str()), 1.0, 360.0);
+    s.halfWidth = oe::BlurHalfWidth(srcFps, outFps, srcShutter, 180.0);
     if (argc > 7)
         s.mipThreshold = std::atoi(argv[7]);
     s.showVectors = Env("OE_VIEW") == '1';
