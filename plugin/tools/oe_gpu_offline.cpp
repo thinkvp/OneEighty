@@ -17,7 +17,10 @@
 //   OE_VIEW=1      motion-vector view
 //   OE_EDGEFIX=0   skip the motion-boundary clean-up (RefineFlowEdges)
 //   OE_GPUFLOW=1   Normal: motion estimated on the GPU (FlowSettings)
-//                  instead of OpenCV DIS on the CPU
+//                  instead of OpenCV DIS on the CPU; two-sided motion and
+//                  the layered blur, as the effect
+//   OE_LAYERED=0   (with OE_GPUFLOW=1) Normal as before v1.0: one-sided
+//                  motion, each pixel averaged along its own motion only
 //   OE_SRC_SHUTTER=deg  source shutter angle (default 180; target is always 180)
 //   OE_STACK_KB=n  (macOS) run everything on a thread with an n KB stack;
 //                  512 = Premiere's render threads (see LargeStack.h)
@@ -136,6 +139,9 @@ int Run(int argc, char** argv)
     fs.flowWidth = 960;
     fs.preset = preset;
     fs.refineEdges = edgeFix;
+    const bool layered = gpuFlow && Env("OE_LAYERED") != '0';
+    fs.twoSided = layered;
+    s.layered = layered;
     const char fl = Env("OE_FLOAT");
     const bool useFloat = fl == '1' || fl == '2';
     const float gain = fl == '2' ? 1.5f : 1.0f;
@@ -228,8 +234,11 @@ int Run(int argc, char** argv)
             const long A = (long)std::floor(k * r + 1e-9);
             if (A + 1 >= (long)src.size())
                 break;
-            ok = eng->ProcessPairGpuFlow(host(src[A]), host(src[A + 1]), k * r - (double)A, fs, out.data, out.step, s,
-                                         &st, &err);
+            const oe::gpu::HostImage hp = A > 0 ? host(src[A - 1]) : oe::gpu::HostImage{};
+            const oe::gpu::HostImage hn = A + 2 < (long)src.size() ? host(src[A + 2]) : oe::gpu::HostImage{};
+            ok = eng->ProcessPairGpuFlow(A > 0 ? &hp : nullptr, host(src[A]), host(src[A + 1]),
+                                         A + 2 < (long)src.size() ? &hn : nullptr, k * r - (double)A, fs, out.data,
+                                         out.step, s, &st, &err);
             tFlow = st.flowMs;
             st.gpuMs -= st.flowMs;
         }

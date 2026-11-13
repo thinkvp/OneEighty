@@ -454,7 +454,7 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         unsigned fc = 0;
         cv::Mat m;
     };
-    Fetched pool[6]; // A, B, an anchor probe, and High's frames before A / after B
+    Fetched pool[6]; // A, B, an anchor probe, and the frames before A / after B (High; Normal on the GPU)
     int nPool = 0;
     double fetchMs = 0;
     auto fetch = [&](long long t) -> Fetched* {
@@ -555,6 +555,20 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     const bool pair = pairPlan && have1 && have2;
     oe::rife::ShutterStats rstats;
     int rifeSamples = 0, rifePixels = 0;
+    // Exact timing: the frame before A and the one after B, for High's
+    // shutter and Normal's two-sided motion; fetched once, when first needed.
+    const Fetched* fPrevA = nullptr;
+    const Fetched* fNextB = nullptr;
+    auto prevA = [&]() -> const cv::Mat* {
+        if (!fPrevA)
+            fPrevA = fetch(at(-1.0 - phase + 0.25 + offs.k));
+        return fPrevA->ok ? &fPrevA->m : nullptr;
+    };
+    auto nextB = [&]() -> const cv::Mat* {
+        if (!fNextB)
+            fNextB = fetch(at(2.0 - phase + 0.25 + offs.k));
+        return fNextB->ok ? &fNextB->m : nullptr;
+    };
     try
     {
         if (q == OE_QUALITY_HIGH && eng && have2)
@@ -569,17 +583,9 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
                     sf.B = &m2;
                     t = phase;
                     if (oe::rife::NeedsPrev(t, hw))
-                    {
-                        const Fetched* fp = fetch(at(-1.0 - phase + 0.25 + offs.k));
-                        if (fp->ok)
-                            sf.P = &fp->m;
-                    }
+                        sf.P = prevA();
                     if (oe::rife::NeedsNext(t, hw))
-                    {
-                        const Fetched* fn = fetch(at(2.0 - phase + 0.25 + offs.k));
-                        if (fn->ok)
-                            sf.N = &fn->m;
-                    }
+                        sf.N = nextB();
                 }
                 else // Premiere's frame with its neighbours
                 {
@@ -611,15 +617,30 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
             oe::gpu::Stats gst;
             // Motion on the GPU first (same DIS + edge clean-up, ~8x faster than the CPU
             // offline and free of CPU contention in Premiere); CPU DIS if it fails.
+            // Normal on the GPU: motion from both neighbouring frames and the
+            // layered blur (fast objects streak past their outline without
+            // smearing the background they are about to cover).
             oe::gpu::FlowSettings fs;
             fs.flowWidth = kFlowWidth;
             fs.preset = disPreset;
+            fs.twoSided = true;
+            gs.layered = true;
             std::string ferr;
             if (pair)
-                done = eng->ProcessPairGpuFlow(h1, h2, phase, fs, out.data, out.step, gs, &gst, &ferr);
+            {
+                const cv::Mat* mp = prevA();
+                const cv::Mat* mn = phase > 1e-3 ? nextB() : nullptr; // B is only blurred between frames
+                const oe::gpu::HostImage hp = mp ? oe::gpu::HostImage{mp->data, mp->step, mp->cols, mp->rows, a8, outFloat}
+                                                 : oe::gpu::HostImage{};
+                const oe::gpu::HostImage hn = mn ? oe::gpu::HostImage{mn->data, mn->step, mn->cols, mn->rows, a8, outFloat}
+                                                 : oe::gpu::HostImage{};
+                done = eng->ProcessPairGpuFlow(mp ? &hp : nullptr, h1, h2, mn ? &hn : nullptr, phase, fs, out.data,
+                                               out.step, gs, &gst, &ferr);
+            }
             else if (have1 || have2)
                 done = eng->ProcessGpuFlow(have1 ? &h1 : nullptr, hc, have2 ? &h2 : nullptr, fs, out.data, out.step, gs,
                                            &gst, &ferr);
+            gs.layered = false; // the CPU-motion fallbacks below: as before
             if (done)
             {
                 gpuFlowMs = gst.flowMs;
@@ -680,18 +701,24 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
             bs.flowWidth = kFlowWidth;
             bs.disPreset = disPreset;
             bs.showVectors = vectors;
+            // as Normal on the GPU: two-sided motion, layered blur
+            bs.twoSided = true;
+            bs.layered = true;
+            const cv::Mat* mp = pair ? prevA() : nullptr;
+            const cv::Mat noFrame;
             if (pair && !vectors && phase > 1e-3)
             {
                 // two-frame interpolation on the CPU: A at +a, B at -(1-a), blended
+                const cv::Mat* mn = nextB();
                 cv::Mat outA(cur.size(), cur.type()), outB(cur.size(), cur.type());
                 bs.centerOffset = phase;
-                oe::FlowMotionBlur(cv::Mat(), m1, m2, outA, order, bs);
+                oe::FlowMotionBlur(mp ? *mp : noFrame, m1, m2, outA, order, bs);
                 bs.centerOffset = phase - 1.0;
-                oe::FlowMotionBlur(m1, m2, cv::Mat(), outB, order, bs);
+                oe::FlowMotionBlur(m1, m2, mn ? *mn : noFrame, outB, order, bs);
                 cv::addWeighted(outA, 1.0 - phase, outB, phase, 0.0, out);
             }
             else if (pair)
-                oe::FlowMotionBlur(cv::Mat(), m1, m2, out, order, bs); // on a source frame: A with A->B motion
+                oe::FlowMotionBlur(mp ? *mp : noFrame, m1, m2, out, order, bs); // on a source frame: A
             else
                 oe::FlowMotionBlur(m1, cur, m2, out, order, bs);
         }

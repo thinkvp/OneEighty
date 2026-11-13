@@ -19,6 +19,11 @@ struct Settings
     int maxMipLevel = 3;
     double centerOffset = 0;  // single-frame path: output time relative to the frame, source-frame intervals
     bool showVectors = false; // draw the motion field instead of blurring
+    // Layered blur (Quality Normal): a clearly faster layer passing over a
+    // pixel covers it for its share of the shutter, so fast objects streak
+    // past their own outline (see Layered in GpuMotionBlur.cu). Off: each
+    // pixel is only averaged along its own motion.
+    bool layered = false;
 };
 
 struct Stats
@@ -36,6 +41,13 @@ struct FlowSettings
     int flowWidth = 960;     // analysis width
     int preset = 1;          // cv::DISOpticalFlow preset: 0 ultrafast, 1 fast (Normal), 2 medium (High)
     bool refineEdges = true; // motion-boundary clean-up (RefineFlowEdges)
+    // Motion of a frame from both neighbours (the previous and the next
+    // frame, each checked forward and backward): where an object is about
+    // to cover the background, the next frame has no match and the motion
+    // estimate leaks the object's motion onto it; the previous frame still
+    // saw it. Needs the frame before A / after B (ProcessPairGpuFlow's prev /
+    // next); without them, one side as before.
+    bool twoSided = false;
 };
 
 // A frame in host memory, as checked out by the effect.
@@ -113,11 +125,13 @@ public:
 
     // ProcessPair / Process with the motion estimated on the GPU from the
     // frames themselves (see FlowSettings). prev / next may be null (clip
-    // edges). Engines without it return false and the caller estimates the
-    // motion on the CPU instead.
-    virtual bool ProcessPairGpuFlow(const HostImage& /*A*/, const HostImage& /*B*/, double /*a*/,
-                                    const FlowSettings& /*fs*/, void* /*out*/, size_t /*outRowBytes*/,
-                                    const Settings& /*s*/, Stats* /*stats*/, std::string* err)
+    // edges; for the pair: the frame before A and the one after B, used by
+    // FlowSettings::twoSided only). Engines without it return false and the
+    // caller estimates the motion on the CPU instead.
+    virtual bool ProcessPairGpuFlow(const HostImage* /*prev*/, const HostImage& /*A*/, const HostImage& /*B*/,
+                                    const HostImage* /*next*/, double /*a*/, const FlowSettings& /*fs*/,
+                                    void* /*out*/, size_t /*outRowBytes*/, const Settings& /*s*/, Stats* /*stats*/,
+                                    std::string* err)
     {
         if (err)
             *err = "GPU motion not available";

@@ -292,6 +292,246 @@ void GatherBlur(const cv::Mat& cur, const cv::Mat& vFull, const BlurSettings& s,
     *maxSpeedX100Out = maxSpeedX100;
 }
 
+// Layered blur (see Layered in gpu/GpuMotionBlur.cu, same constants): the
+// pixel's own blur along its own motion, plus for the share of the shutter
+// during which a clearly faster layer passing over it covers it, that
+// layer's colour. Faster layers are found through the fastest motion per 16 px
+// tile, then over +/-2 tiles, interpolated between tile centres.
+template <typename T>
+void LayeredBlur(const cv::Mat& cur, const cv::Mat& vFull, const BlurSettings& s, cv::Mat& out, long long* samplesOut,
+                 int* maxSpeedX100Out)
+{
+    constexpr int kTile = 16, kReach = 2;
+    constexpr float kSz = 1.5f;
+    const int W = cur.cols, H = cur.rows, tw = (W + kTile - 1) / kTile, th = (H + kTile - 1) / kTile;
+    std::vector<cv::Mat> mip{cur};
+    if (s.mipThreshold > 0)
+        for (int l = 1; l <= s.maxMipLevel && mip.back().cols >= 4 && mip.back().rows >= 4; ++l)
+        {
+            cv::Mat half;
+            cv::resize(mip.back(), half, cv::Size((mip.back().cols + 1) / 2, (mip.back().rows + 1) / 2), 0, 0,
+                       cv::INTER_AREA);
+            mip.push_back(half);
+        }
+    const int topLevel = (int)mip.size() - 1;
+    // tile max, then over the neighbourhood
+    cv::Mat tiles(th, tw, CV_32FC2), nb(th, tw, CV_32FC2);
+    cv::parallel_for_(cv::Range(0, th), [&](const cv::Range& r) {
+        for (int ty = r.start; ty < r.end; ++ty)
+            for (int tx = 0; tx < tw; ++tx)
+            {
+                cv::Vec2f best(0, 0);
+                float bm = -1;
+                for (int y = ty * kTile; y < std::min(H, (ty + 1) * kTile); ++y)
+                {
+                    const cv::Vec2f* vr = vFull.ptr<cv::Vec2f>(y);
+                    for (int x = tx * kTile; x < std::min(W, (tx + 1) * kTile); ++x)
+                    {
+                        const float m = vr[x][0] * vr[x][0] + vr[x][1] * vr[x][1];
+                        if (m > bm)
+                        {
+                            bm = m;
+                            best = vr[x];
+                        }
+                    }
+                }
+                tiles.at<cv::Vec2f>(ty, tx) = best;
+            }
+    });
+    for (int ty = 0; ty < th; ++ty)
+        for (int tx = 0; tx < tw; ++tx)
+        {
+            cv::Vec2f best = tiles.at<cv::Vec2f>(ty, tx);
+            float bm = best.dot(best);
+            for (int dy = -kReach; dy <= kReach; ++dy)
+                for (int dx = -kReach; dx <= kReach; ++dx)
+                {
+                    const cv::Vec2f v = tiles.at<cv::Vec2f>(std::clamp(ty + dy, 0, th - 1), std::clamp(tx + dx, 0, tw - 1));
+                    if (v.dot(v) > bm)
+                    {
+                        bm = v.dot(v);
+                        best = v;
+                    }
+                }
+            nb.at<cv::Vec2f>(ty, tx) = best;
+        }
+    auto sampleTiles = [&](int x, int y) {
+        const float gx = std::clamp((x + 0.5f) / kTile - 0.5f, 0.0f, (float)(tw - 1));
+        const float gy = std::clamp((y + 0.5f) / kTile - 0.5f, 0.0f, (float)(th - 1));
+        const int x0 = std::min((int)gx, std::max(0, tw - 2)), y0 = std::min((int)gy, std::max(0, th - 2));
+        const int x1 = std::min(x0 + 1, tw - 1), y1 = std::min(y0 + 1, th - 1);
+        const float fx = gx - x0, fy = gy - y0;
+        const cv::Vec2f a = nb.at<cv::Vec2f>(y0, x0), b = nb.at<cv::Vec2f>(y0, x1), c = nb.at<cv::Vec2f>(y1, x0),
+                        d = nb.at<cv::Vec2f>(y1, x1);
+        return cv::Vec2f((1 - fy) * ((1 - fx) * a + fx * b) + fy * ((1 - fx) * c + fx * d));
+    };
+    auto bilinear = [](const cv::Mat& img, float sx, float sy, float acc[4], float w) {
+        const int iw = img.cols, ih = img.rows;
+        sx = std::clamp(sx, 0.0f, (float)(iw - 1));
+        sy = std::clamp(sy, 0.0f, (float)(ih - 1));
+        const int x0 = std::min((int)sx, std::max(0, iw - 2)), y0 = std::min((int)sy, std::max(0, ih - 2));
+        const int x1 = std::min(x0 + 1, iw - 1), y1 = std::min(y0 + 1, ih - 1);
+        const float fx = sx - x0, fy = sy - y0;
+        const T* p00 = img.ptr<T>(y0) + 4 * x0;
+        const T* p10 = img.ptr<T>(y0) + 4 * x1;
+        const T* p01 = img.ptr<T>(y1) + 4 * x0;
+        const T* p11 = img.ptr<T>(y1) + 4 * x1;
+        const float w00 = (1 - fx) * (1 - fy) * w, w10 = fx * (1 - fy) * w, w01 = (1 - fx) * fy * w, w11 = fx * fy * w;
+        for (int c = 0; c < 4; ++c)
+            acc[c] += w00 * p00[c] + w10 * p10[c] + w01 * p01[c] + w11 * p11[c];
+    };
+    auto velAt = [&](float qx, float qy) {
+        const int ix = std::clamp((int)std::lround(qx), 0, W - 1), iy = std::clamp((int)std::lround(qy), 0, H - 1);
+        return vFull.ptr<cv::Vec2f>(iy)[ix];
+    };
+    const float hw = (float)s.halfWidth, c0 = (float)s.centerOffset;
+    const float t0 = c0 - hw, t1 = c0 + hw;
+    const int maxS = std::max(2, s.maxSamples);
+    const float mipT = (float)std::max(1, s.mipThreshold);
+    auto level = [&](float smear) {
+        int l = 0;
+        while (l < topLevel && smear / (float)(1 << l) > mipT)
+            ++l;
+        return l;
+    };
+    std::atomic<long long> totalSamples{0};
+    std::atomic<int> maxSpeedX100{0};
+    cv::parallel_for_(cv::Range(0, H), [&](const cv::Range& rows) {
+        long long localSamples = 0;
+        int localMax = 0;
+        for (int y = rows.start; y < rows.end; ++y)
+        {
+            const cv::Vec2f* vr = vFull.ptr<cv::Vec2f>(y);
+            T* o = out.ptr<T>(y);
+            for (int x = 0; x < W; ++x, o += 4)
+            {
+                const cv::Vec2f v = vr[x], vn = sampleTiles(x, y);
+                const float sp = std::sqrt(v.dot(v)), sn = std::sqrt(vn.dot(vn));
+                localMax = std::max(localMax, (int)(sp * 100));
+                const T* pc = cur.ptr<T>(y) + 4 * x;
+                if (2.0f * hw * std::max(sp, sn) <= 1.0f && std::fabs(c0) * std::max(sp, sn) < 0.5f)
+                {
+                    o[0] = pc[0];
+                    o[1] = pc[1];
+                    o[2] = pc[2];
+                    o[3] = pc[3];
+                    ++localSamples;
+                    continue;
+                }
+                const float jit = std::fmod(52.9829189f * std::fmod(0.06711056f * x + 0.00583715f * y, 1.0f), 1.0f);
+                float bacc[4] = {0, 0, 0, 0}, facc[4] = {0, 0, 0, 0}, bw = 0, fw = 0;
+                {
+                    // the pixel's own blur, minus samples of a faster layer
+                    const float smear = 2.0f * hw * sp;
+                    const int l = level(smear);
+                    const float inv2l = 1.0f / (float)(1 << l);
+                    const int n = std::min(maxS, std::max(4, (int)std::ceil(smear * inv2l)));
+                    localSamples += n;
+                    for (int j = 0; j < n; ++j)
+                    {
+                        const float t = t0 + (t1 - t0) * (j + jit) / n;
+                        const float qx = x - t * v[0], qy = y - t * v[1];
+                        const cv::Vec2f vq = velAt(qx, qy);
+                        const float front = std::clamp(0.5f + (std::sqrt(vq.dot(vq)) - sp - kSz) / (2 * kSz), 0.0f, 1.0f);
+                        const float wb = 1.0f - front;
+                        bilinear(mip[l], (qx + 0.5f) * inv2l - 0.5f, (qy + 0.5f) * inv2l - 0.5f, bacc, wb);
+                        bw += wb;
+                    }
+                }
+                if (sn > sp)
+                {
+                    // faster layers passing over the pixel
+                    const float smear = 2.0f * hw * sn;
+                    const int l = level(smear);
+                    const float inv2l = 1.0f / (float)(1 << l);
+                    const int n = std::min(maxS, std::max(4, (int)std::ceil(smear * inv2l)));
+                    const float share = std::min(smear, 1.0f) / n;
+                    localSamples += n;
+                    for (int j = 0; j < n; ++j)
+                    {
+                        const float t = t0 + (t1 - t0) * (j + jit) / n;
+                        const float qx = x - t * vn[0], qy = y - t * vn[1];
+                        const cv::Vec2f vq = velAt(qx, qy);
+                        const float sq = std::sqrt(vq.dot(vq));
+                        const float front = std::clamp(0.5f + (sq - sp - kSz) / (2 * kSz), 0.0f, 1.0f);
+                        if (front <= 0.0f)
+                            continue;
+                        const float tq = t * sn / std::max(sq, 1e-3f);
+                        const float cover = std::clamp(std::min(tq - t0, t1 - tq) * sq + 0.5f, 0.0f, 1.0f);
+                        const float wf = front * cover * share;
+                        bilinear(mip[l], (qx + 0.5f) * inv2l - 0.5f, (qy + 0.5f) * inv2l - 0.5f, facc, wf);
+                        fw += wf;
+                    }
+                }
+                float bcol[4];
+                for (int c = 0; c < 4; ++c)
+                    bcol[c] = bw > 1e-3f ? bacc[c] / bw : (float)pc[c];
+                const float alpha = std::min(fw, 1.0f), k = fw > 1e-6f ? alpha / fw : 0.0f;
+                for (int c = 0; c < 4; ++c)
+                    o[c] = Px<T>::From(facc[c] * k + (1 - alpha) * bcol[c]);
+            }
+        }
+        totalSamples += localSamples;
+        int prevMax = maxSpeedX100.load();
+        while (localMax > prevMax && !maxSpeedX100.compare_exchange_weak(prevMax, localMax)) {}
+    });
+    *samplesOut = totalSamples;
+    *maxSpeedX100Out = maxSpeedX100;
+}
+
+// |f(x) + g(x + f(x))| (g bilinear, edges clamped), 5x5 box mean: how badly
+// the motion f fails its forward/backward check.
+cv::Mat ConsistencyError(const cv::Mat& f, const cv::Mat& g)
+{
+    cv::Mat map(f.size(), CV_32FC2), back, e(f.size(), CV_32F);
+    for (int y = 0; y < f.rows; ++y)
+    {
+        const cv::Vec2f* fr = f.ptr<cv::Vec2f>(y);
+        cv::Vec2f* mr = map.ptr<cv::Vec2f>(y);
+        for (int x = 0; x < f.cols; ++x)
+            mr[x] = cv::Vec2f(x + fr[x][0], y + fr[x][1]);
+    }
+    cv::remap(g, back, map, cv::noArray(), cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+    for (int y = 0; y < f.rows; ++y)
+    {
+        const cv::Vec2f* fr = f.ptr<cv::Vec2f>(y);
+        const cv::Vec2f* br = back.ptr<cv::Vec2f>(y);
+        float* er = e.ptr<float>(y);
+        for (int x = 0; x < f.cols; ++x)
+            er[x] = std::abs(fr[x][0] + br[x][0]) + std::abs(fr[x][1] + br[x][1]);
+    }
+    cv::blur(e, e, cv::Size(5, 5));
+    return e;
+}
+
+// cur's velocity (analysis size and pixels) from both sides: cur->next and
+// cur->prev, each weighted by its forward/backward check (a region about to
+// be covered was still visible a frame earlier).
+cv::Mat TwoSidedFlow(cv::DISOpticalFlow& dis, const cv::Mat& gCur, const cv::Mat& gPrev, const cv::Mat& gNext)
+{
+    cv::Mat fn, fnb, fp, fpb;
+    dis.calc(gCur, gNext, fn);
+    dis.calc(gNext, gCur, fnb);
+    dis.calc(gCur, gPrev, fp);
+    dis.calc(gPrev, gCur, fpb);
+    const cv::Mat en = ConsistencyError(fn, fnb), ep = ConsistencyError(fp, fpb);
+    cv::Mat v(fn.size(), CV_32FC2);
+    for (int y = 0; y < v.rows; ++y)
+    {
+        const cv::Vec2f* a = fn.ptr<cv::Vec2f>(y);
+        const cv::Vec2f* b = fp.ptr<cv::Vec2f>(y);
+        const float* ea = en.ptr<float>(y);
+        const float* eb = ep.ptr<float>(y);
+        cv::Vec2f* d = v.ptr<cv::Vec2f>(y);
+        for (int x = 0; x < v.cols; ++x)
+        {
+            const float wn = 1.0f / (0.25f + ea[x] * ea[x]), wp = 1.0f / (0.25f + eb[x] * eb[x]);
+            d[x] = (wn * a[x] - wp * b[x]) * (1.0f / (wn + wp));
+        }
+    }
+    return v;
+}
+
 } // namespace
 
 cv::Mat EstimateFlow(const cv::Mat& from, const cv::Mat& to, const ChannelOrder& order, int flowWidth, int disPreset,
@@ -386,7 +626,13 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
 
     cv::Mat v; // velocity per source frame, small res, CV_32FC2
     int nFlows = 0;
-    if (!next.empty())
+    if (s.twoSided && !prev.empty() && !next.empty())
+    {
+        v = TwoSidedFlow(*dis, gCur, SmallGray(prev, scale, order), SmallGray(next, scale, order));
+        if (s.refineEdges)
+            RefineFlowEdges(cCur, v);
+    }
+    else if (!next.empty())
     {
         cv::Mat f;
         const cv::Mat gNext = SmallGray(next, scale, order);
@@ -396,7 +642,7 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
         v = f;
         ++nFlows;
     }
-    if (!prev.empty())
+    if (!prev.empty() && !(s.twoSided && !next.empty()))
     {
         cv::Mat f;
         const cv::Mat gPrev = SmallGray(prev, scale, order);
@@ -437,7 +683,11 @@ void FlowMotionBlur(const cv::Mat& prev, const cv::Mat& cur, const cv::Mat& next
     // ---- gather blur: average cur along each pixel's motion path
     long long totalSamples = 0;
     int maxSpeedX100 = 0;
-    if (isFloat)
+    if (s.layered && isFloat)
+        LayeredBlur<float>(cur, vFull, s, out, &totalSamples, &maxSpeedX100);
+    else if (s.layered)
+        LayeredBlur<uchar>(cur, vFull, s, out, &totalSamples, &maxSpeedX100);
+    else if (isFloat)
         GatherBlur<float>(cur, vFull, s, out, &totalSamples, &maxSpeedX100);
     else
         GatherBlur<uchar>(cur, vFull, s, out, &totalSamples, &maxSpeedX100);

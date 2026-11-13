@@ -7,6 +7,9 @@
 //   OE_DIS=fast      DIS FAST preset (default: MEDIUM, as Quality Normal)
 //   OE_FLOAT=1       run as 32-bit float (Premiere 32-bit), write 8-bit
 //   OE_EDGEFIX=0     skip the motion-boundary clean-up (RefineFlowEdges)
+//   OE_LAYERED=0     Normal as before v1.0: one-sided motion, each pixel
+//                    averaged along its own motion only (default: two-sided
+//                    motion and the layered blur, as the effect)
 #include "../MotionBlur.h"
 
 #include <opencv2/video/tracking.hpp> // DIS presets
@@ -75,6 +78,7 @@ int main(int argc, char** argv)
     s.halfWidth = oe::BlurHalfWidth(srcFps, outFps, srcSh, tgtSh);
     s.disPreset = Env("OE_DIS") == 'f' ? cv::DISOpticalFlow::PRESET_FAST : cv::DISOpticalFlow::PRESET_MEDIUM;
     s.refineEdges = Env("OE_EDGEFIX") != '0';
+    s.twoSided = s.layered = Env("OE_LAYERED") != '0';
     if (argc > 9)
         s.mipThreshold = std::atoi(argv[9]); // 0 = exact (no mip levels)
     std::printf("%zu source frames, halfWidth=%.4f, %s timing\n", src.size(), s.halfWidth, exact ? "exact" : "nearest");
@@ -98,11 +102,14 @@ int main(int argc, char** argv)
                 break;
             const double a = k * r - (double)A;
             s.centerOffset = a;
-            oe::FlowMotionBlur(cv::Mat(), src[A], src[A + 1], a > 1e-3 ? outA : out, oe::kBGRA, s, &st);
+            const cv::Mat none;
+            const cv::Mat& before = s.twoSided && A > 0 ? src[A - 1] : none;        // frame before A
+            const cv::Mat& after = s.twoSided && A + 2 < (long)src.size() ? src[A + 2] : none; // after B
+            oe::FlowMotionBlur(before, src[A], src[A + 1], a > 1e-3 ? outA : out, oe::kBGRA, s, &st);
             if (a > 1e-3)
             {
                 s.centerOffset = a - 1.0;
-                oe::FlowMotionBlur(src[A], src[A + 1], cv::Mat(), outB, oe::kBGRA, s, &st);
+                oe::FlowMotionBlur(src[A], src[A + 1], after, outB, oe::kBGRA, s, &st);
                 cv::addWeighted(outA, 1.0 - a, outB, a, 0.0, out);
             }
         }

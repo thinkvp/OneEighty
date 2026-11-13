@@ -7,7 +7,9 @@ Windows, Metal on macOS) on the synthetic clips and checks:
     High (RIFE) 40.2 / 40.5 dB, needs the RIFE model and Vulkan / MoltenVK)
   - GPU and CPU paths agree (their PSNRs within 0.6 dB)
   - motion estimated on the GPU (OE_GPUFLOW=1, the effect's default) scores
-    within 0.3 dB of the CPU motion (OpenCV DIS), exact timing on and off
+    no more than 0.3 dB below the CPU motion (OpenCV DIS), exact timing on
+    and off (on CUDA it is also the two-sided motion and layered blur, which
+    score higher)
   - 32-bit float and ARGB-byte-order runs match the plain 8-bit BGRA run
   - the motion-vector view runs
 
@@ -90,9 +92,9 @@ for name, (clip, fps, windows_db, rife_db) in CLIPS.items():
     # on a 512 KB stack, like Premiere's macOS render threads (LargeStack.h; no effect elsewhere)
     gm_frames = run("oe_gpu_offline", fps, OE_GPUFLOW=1, OE_STACK_KB=512)
     gm = score(gm_frames, gt)
-    check(abs(gm - gpu_db) <= FLOW_MARGIN, f"GPU motion Normal {gm:.2f} dB (CPU motion {gpu_db:.2f} dB)")
+    check(gm >= gpu_db - FLOW_MARGIN, f"GPU motion Normal {gm:.2f} dB (CPU motion {gpu_db:.2f} dB)")
     gmo = score(run("oe_gpu_offline", fps, OE_EXACT=0, OE_GPUFLOW=1), gt)
-    check(abs(gmo - gpu_off) <= FLOW_MARGIN, f"GPU motion, exact timing off {gmo:.2f} dB (CPU motion {gpu_off:.2f} dB)")
+    check(gmo >= gpu_off - FLOW_MARGIN, f"GPU motion, exact timing off {gmo:.2f} dB (CPU motion {gpu_off:.2f} dB)")
     gmf = agree(run("oe_gpu_offline", fps, OE_FLOAT=1, OE_GPUFLOW=1), gm_frames)
     check(gmf >= 50, f"GPU motion: 32-bit float matches 8-bit: {gmf:.1f} dB")
 

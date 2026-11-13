@@ -489,7 +489,9 @@ public:
         }
     }
 
-    bool ProcessPairGpuFlow(const HostImage& A, const HostImage& B, double a, const FlowSettings& fs, void* out,
+    // (two-sided motion and the layered blur are CUDA only so far: prev / next unused)
+    bool ProcessPairGpuFlow(const HostImage* /*prev*/, const HostImage& A, const HostImage& B,
+                            const HostImage* /*next*/, double a, const FlowSettings& fs, void* out,
                             size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) override
     {
         if (B.width != A.width || B.height != A.height || B.isFloat != A.isFloat)

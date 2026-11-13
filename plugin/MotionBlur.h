@@ -30,6 +30,13 @@ struct BlurSettings
     bool showVectors = false; // draw the motion field instead of blurring
     int disPreset = 2;        // cv::DISOpticalFlow preset (0 ultrafast, 1 fast, 2 medium)
     bool refineEdges = true;  // clean up motion spilling past moving objects' outlines
+    // Quality Normal (as the GPU path, see gpu/GpuMotionBlur.h): with both
+    // prev and next, cur's motion from both sides, each weighted by its
+    // forward/backward check (twoSided); and the layered blur, where a
+    // clearly faster layer passing over a pixel covers it for its share of
+    // the shutter (layered).
+    bool twoSided = false;
+    bool layered = false;
 };
 
 struct BlurStats

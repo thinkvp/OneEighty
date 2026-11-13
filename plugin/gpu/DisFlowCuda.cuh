@@ -704,6 +704,65 @@ __global__ void KStoreFlow(const float2* f, int w, int h, float mul, int accumul
         *d = make_float2(mul * v.x, mul * v.y);
 }
 
+// ------------------------------------------------- two-sided motion (Normal)
+// Forward/backward mismatch of f (from->to) against g (to->from):
+// |f(x) + g(x + f(x))|, g bilinear (edges clamped), analysis pixels.
+__global__ void KConsistency(const float2* f, const float2* g, int w, int h, float* e)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+        return;
+    const float2 v = f[y * w + x];
+    float sx = fminf(fmaxf(x + v.x, 0.0f), (float)(w - 1)), sy = fminf(fmaxf(y + v.y, 0.0f), (float)(h - 1));
+    const int x0 = min((int)sx, max(0, w - 2)), y0 = min((int)sy, max(0, h - 2));
+    const int x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
+    const float tx = sx - x0, ty = sy - y0;
+    const float2 a = g[y0 * w + x0], b = g[y0 * w + x1], c = g[y1 * w + x0], d = g[y1 * w + x1];
+    const float gx = (1 - ty) * ((1 - tx) * a.x + tx * b.x) + ty * ((1 - tx) * c.x + tx * d.x);
+    const float gy = (1 - ty) * ((1 - tx) * a.y + tx * b.y) + ty * ((1 - tx) * c.y + tx * d.y);
+    e[y * w + x] = fabsf(v.x + gx) + fabsf(v.y + gy);
+}
+
+// 5x5 box mean (edges reflected, as cv::blur).
+__global__ void KBox5(const float* src, int w, int h, float* dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+        return;
+    auto refl = [](int i, int n) {
+        if (n == 1)
+            return 0;
+        while (i < 0 || i >= n)
+            i = i < 0 ? -i : 2 * n - 2 - i;
+        return i;
+    };
+    float s = 0;
+    for (int dy = -2; dy <= 2; ++dy)
+        for (int dx = -2; dx <= 2; ++dx)
+            s += src[refl(y + dy, h) * w + refl(x + dx, w)];
+    dst[y * w + x] = s * (1.0f / 25.0f);
+}
+
+// A's velocity per frame from A->next (fn) and A->prev (fp): each side
+// weighted by how well its forward/backward check passes (a region about to
+// be covered was still visible a frame earlier).
+__global__ void KMergeSides(const float2* fn, const float* en, const float2* fp, const float* ep, int n, float2* v)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    const float wn = 1.0f / (0.25f + en[i] * en[i]), wp = 1.0f / (0.25f + ep[i] * ep[i]);
+    const float k = 1.0f / (wn + wp);
+    v[i] = make_float2((wn * fn[i].x - wp * fp[i].x) * k, (wn * fn[i].y - wp * fp[i].y) * k);
+}
+
+__global__ void KScaleFlow(const float2* src, int n, float mul, float2* dst)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        dst[i] = make_float2(mul * src[i].x, mul * src[i].y);
+}
+
 // ---------------------------------------------------------------- host side
 template <typename T> struct Buf
 {
@@ -734,7 +793,7 @@ template <typename T> struct Buf
 class DisFlow
 {
 public:
-    static constexpr int kSlots = 3;
+    static constexpr int kSlots = 4;
 
     // Call with the engine's context current.
     void Release()
@@ -753,7 +812,11 @@ public:
         for (auto* b : {&xx_, &yy_, &xy_, &sx_, &sy_, &vIx_, &vIy_, &vIz_, &vIxx_, &vIxy_, &vIyy_, &vIxz_, &vIyz_,
                         &vAvg_, &a11_, &a12_, &a22_, &b1_, &b2_, &sw_})
             b->Release();
-        for (auto* b : {&S_, &U_[0], &U_[1], &W_, &dW_, &tW_, &f0_, &f1_})
+        for (auto* b : {&S_, &U_[0], &U_[1], &W_, &dW_, &tW_, &f0_, &f1_, &f2_})
+            b->Release();
+        for (Raw& r : raw_)
+            r.buf.Release(), r.valid = false;
+        for (auto* b : {&e0_, &e1_, &e2_})
             b->Release();
         flagQ_[0].Release();
         flagQ_[1].Release();
@@ -797,6 +860,9 @@ public:
     bool Prepare(int slot, const char* frame, size_t pitch, int W, int H, std::string* err)
     {
         Slot& s = slot_[slot];
+        for (Raw& r : raw_)
+            if (r.from == slot || r.to == slot)
+                r.valid = false;
         const size_t n0 = (size_t)fw_ * fh_;
         if (!s.gray[0].Ensure(n0) || !s.colourRaw.Ensure(n0) || !s.colour.Ensure(n0))
             return Fail(err, "out of GPU memory (motion)");
@@ -826,6 +892,72 @@ public:
     bool Compute(int from, int to, bool refineEdges, float weight, bool accumulate, char* dst, size_t dstPitch,
                  std::string* err)
     {
+        const float2* f = RawFlow(from, to, err);
+        return f && Store(f, from, refineEdges, weight, accumulate, dst, dstPitch, err);
+    }
+
+    // Quality Normal: velocity of slot `a` (per source frame, forward in
+    // time) from both sides, a->next and a->prev, each with its reverse:
+    // per pixel the side whose forward/backward check passes counts (a region
+    // about to be covered was still visible a frame earlier), then the
+    // motion-boundary clean-up. next / prev = -1 when missing (one side only).
+    // Stored as full-res pixels times `weight`.
+    bool ComputeTwoSided(int a, int next, int prev, bool refineEdges, float weight, char* dst, size_t dstPitch,
+                         std::string* err)
+    {
+        const size_t n0 = (size_t)fw_ * fh_;
+        const dim3 b(16, 16);
+        if (next < 0 && prev < 0)
+            return Fail(err, "no neighbouring frame for motion");
+        if (prev < 0)
+            return Compute(a, next, refineEdges, weight, false, dst, dstPitch, err);
+        if (next < 0)
+            return Compute(a, prev, refineEdges, -weight, false, dst, dstPitch, err);
+        const float2* fn = RawFlow(a, next, err);
+        const float2* fnb = fn ? RawFlow(next, a, err) : nullptr;
+        const float2* fp = fnb ? RawFlow(a, prev, err) : nullptr;
+        const float2* fpb = fp ? RawFlow(prev, a, err) : nullptr;
+        if (!fpb)
+            return false;
+        if (!e0_.Ensure(n0) || !e1_.Ensure(n0) || !e2_.Ensure(n0) || !f2_.Ensure(n0))
+            return Fail(err, "out of GPU memory (motion)");
+        KConsistency<<<Grid2(fw_, fh_, b), b>>>(fn, fnb, fw_, fh_, e2_.p);
+        KBox5<<<Grid2(fw_, fh_, b), b>>>(e2_.p, fw_, fh_, e0_.p);
+        KConsistency<<<Grid2(fw_, fh_, b), b>>>(fp, fpb, fw_, fh_, e2_.p);
+        KBox5<<<Grid2(fw_, fh_, b), b>>>(e2_.p, fw_, fh_, e1_.p);
+        KMergeSides<<<(unsigned)((n0 + 255) / 256), 256>>>(fn, e0_.p, fp, e1_.p, (int)n0, f2_.p);
+        return Store(f2_.p, a, refineEdges, weight, false, dst, dstPitch, err);
+    }
+
+    // Test hook: raw motion from -> to (analysis pixels, no clean-up).
+    const float2* RawFlow(int from, int to, std::string* err)
+    {
+        Raw* slot = nullptr;
+        for (Raw& r : raw_)
+            if (r.valid && r.from == from && r.to == to)
+                return r.buf.p;
+        for (Raw& r : raw_) // a free entry, else the oldest
+            if (!r.valid && (!slot || r.stamp < slot->stamp))
+                slot = &r;
+        if (!slot)
+            for (Raw& r : raw_)
+                if (!slot || r.stamp < slot->stamp)
+                    slot = &r;
+        if (!slot->buf.Ensure((size_t)fw_ * fh_))
+            return Fail(err, "out of GPU memory (motion)"), nullptr;
+        if (!Estimate(from, to, slot->buf.p, err))
+            return nullptr;
+        slot->from = from;
+        slot->to = to;
+        slot->valid = true;
+        slot->stamp = ++stamp_;
+        return slot->buf.p;
+    }
+
+private:
+    // DIS from slot `from` to slot `to` into out (analysis size and pixels).
+    bool Estimate(int from, int to, float2* out, std::string* err)
+    {
         const Slot& A = slot_[from];
         const Slot& B = slot_[to];
         const int fin = p_.finest;
@@ -841,8 +973,6 @@ public:
                 ok = ok && q->Ensure(nf);
             ok = ok && W_.Ensure(nf) && dW_.Ensure(nf) && tW_.Ensure(nf);
         }
-        const size_t n0 = (size_t)fw_ * fh_;
-        ok = ok && f0_.Ensure(n0) && f1_.Ensure(n0);
         if (!ok)
             return Fail(err, "out of GPU memory (motion)");
 
@@ -871,17 +1001,26 @@ public:
                                                                      2.0f);
         }
         // to the analysis size, in analysis pixels
-        KResizeFlow<<<Grid2(fw_, fh_, b), b>>>(U_[fin & 1].p, lw_[fin], lh_[fin], f0_.p, fw_, fh_, (float)(1 << fin));
-        const float2* result = f0_.p;
+        KResizeFlow<<<Grid2(fw_, fh_, b), b>>>(U_[fin & 1].p, lw_[fin], lh_[fin], out, fw_, fh_, (float)(1 << fin));
+        return true;
+    }
+
+    // Clean-up (colour of slot `colourSlot`) and store as full-res pixels.
+    bool Store(const float2* f, int colourSlot, bool refineEdges, float weight, bool accumulate, char* dst,
+               size_t dstPitch, std::string* err)
+    {
+        const dim3 b(16, 16);
+        const float2* result = f;
         if (refineEdges)
         {
             constexpr int kReach = 42;
             const int qw = (fw_ + 3) / 4, qh = (fh_ + 3) / 4;
-            if (!flagQ_[0].Ensure((size_t)qw * qh) || !flagQ_[1].Ensure((size_t)qw * qh))
+            if (!flagQ_[0].Ensure((size_t)qw * qh) || !flagQ_[1].Ensure((size_t)qw * qh) ||
+                !f1_.Ensure((size_t)fw_ * fh_))
                 return Fail(err, "out of GPU memory (motion)");
-            KEdgeFlagQ<<<Grid2(qw, qh, b), b>>>(f0_.p, fw_, fh_, qw, qh, flagQ_[0].p);
+            KEdgeFlagQ<<<Grid2(qw, qh, b), b>>>(f, fw_, fh_, qw, qh, flagQ_[0].p);
             KDilateQ<<<Grid2(qw, qh, b), b>>>(flagQ_[0].p, qw, qh, kReach / 4 + 1, flagQ_[1].p);
-            KEdgeRefine<<<Grid2(fw_, fh_, b), b>>>(f0_.p, A.colour.p, flagQ_[1].p, fw_, fh_, qw, qh, f1_.p);
+            KEdgeRefine<<<Grid2(fw_, fh_, b), b>>>(f, slot_[colourSlot].colour.p, flagQ_[1].p, fw_, fh_, qw, qh, f1_.p);
             result = f1_.p;
         }
         KStoreFlow<<<Grid2(fw_, fh_, b), b>>>(result, fw_, fh_, (float)(weight / scale_), accumulate ? 1 : 0, dst,
@@ -889,7 +1028,6 @@ public:
         return true;
     }
 
-private:
     struct Slot
     {
         Buf<float> gray[kMaxLevels], gx[kMaxLevels], gy[kMaxLevels];
@@ -944,7 +1082,17 @@ private:
     Slot slot_[kSlots];
     Buf<float> xx_, yy_, xy_, sx_, sy_;
     Buf<float> vIx_, vIy_, vIz_, vIxx_, vIxy_, vIyy_, vIxz_, vIyz_, vAvg_, a11_, a12_, a22_, b1_, b2_, sw_;
-    Buf<float2> S_, U_[2], W_, dW_, tW_, f0_, f1_;
+    Buf<float2> S_, U_[2], W_, dW_, tW_, f0_, f1_, f2_;
+    Buf<float> e0_, e1_, e2_; // two-sided: consistency errors
+    struct Raw
+    {
+        int from = -1, to = -1;
+        bool valid = false;
+        unsigned stamp = 0;
+        Buf<float2> buf;
+    };
+    Raw raw_[6]; // raw motion of this call, by (from, to): A->B is shared by A's and B's two-sided motion
+    unsigned stamp_ = 0;
     Buf<unsigned char> flagQ_[2];
 };
 
