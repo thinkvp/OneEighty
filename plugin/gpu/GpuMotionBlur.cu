@@ -537,6 +537,8 @@ public:
             CUcontext dummy;
             cuCtxPopCurrent(&dummy);
         }
+        if (ctx_)
+            cuDevicePrimaryCtxRelease(dev_); // pairs with the retain in Init
     }
 
     bool Init(std::string* err)
@@ -547,14 +549,30 @@ public:
             return Fail(err, "nvcuda.dll not found (no NVIDIA driver)");
         if (cuInit(0) != CUDA_SUCCESS)
             return Fail(err, "cuInit failed (no NVIDIA driver?)");
-        if (cudaFree(nullptr) != cudaSuccess) // creates/attaches the primary context
-            return Fail(err, "CUDA runtime init failed (no supported NVIDIA GPU?)");
-        if (cuCtxGetCurrent(&ctx_) != CUDA_SUCCESS || !ctx_)
-            return Fail(err, "no current CUDA context");
+        // Init runs on the host's render thread, which the host (Premiere) also
+        // drives its own CUDA work from. Nothing here may change which context
+        // is current on it: retain the primary context explicitly and only ever
+        // use it pushed. (A runtime call with no context current, such as the
+        // old cudaFree(nullptr) init, binds the primary context to the thread
+        // and leaves it there; Premiere then drops every third-party GPU effect
+        // to software for the rest of the session.)
+        CUdevice dev = 0;
+        if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS)
+            return Fail(err, "no CUDA device (no supported NVIDIA GPU?)");
+        CUcontext primary = nullptr;
+        if (cuDevicePrimaryCtxRetain(&primary, dev) != CUDA_SUCCESS || !primary)
+            return Fail(err, "could not retain the CUDA primary context");
+        ctx_ = primary;
+        dev_ = dev;
+        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
+            return Fail(err, "cuCtxPushCurrent failed");
+        bool ok = true;
         for (auto& e : ev_)
-            if (cudaEventCreate(&e) != cudaSuccess)
-                return Fail(err, "cudaEventCreate failed");
-        return true;
+            if (ok && cudaEventCreate(&e) != cudaSuccess)
+                ok = Fail(err, "CUDA runtime init / cudaEventCreate failed (no supported NVIDIA GPU?)");
+        CUcontext dummy;
+        cuCtxPopCurrent(&dummy);
+        return ok;
     }
 
     bool ProcessPair(const HostImage& A, const HostImage& B, double a, const HostFlow& fa, const HostFlow& fb,
@@ -950,7 +968,8 @@ private:
     }
 
     std::mutex mu_;
-    CUcontext ctx_ = nullptr;
+    CUcontext ctx_ = nullptr; // device 0's primary context, retained; used only pushed
+    CUdevice dev_ = 0;
     DevBuf frame_[kMaxFrames], out_, stage_[kMaxFrames], stageOut_; // float frames, output, 8-bit staging
     DevBuf fieldFlow_, fieldMask_;                                   // Quality High: one sample's field
     DevBuf flowA_, flowB_, mipA_[3], mipB_[3];
