@@ -773,18 +773,15 @@ template <typename T> struct Buf
         if (p && n >= count)
             return true;
         Release();
-        if (cudaMalloc(&p, std::max<size_t>(count, 1) * sizeof(T)) != cudaSuccess)
-        {
-            p = nullptr;
+        p = (T*)DevAlloc(std::max<size_t>(count, 1) * sizeof(T)); // GpuMotionBlur.cu: through the host when it has one
+        if (!p)
             return false;
-        }
         n = count;
         return true;
     }
     void Release()
     {
-        if (p)
-            cudaFree(p);
+        DevFree(p);
         p = nullptr;
         n = 0;
     }

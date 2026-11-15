@@ -17,6 +17,8 @@ if not exist "%OBJ%" mkdir "%OBJ%"
 
 set CFLAGS=/nologo /c /O2 /EHsc /MD /W3 /WX /std:c++17 /DMSWindows /DWIN32 /D_WINDOWS /DNOMINMAX /I "%CV%\include\opencv4"
 set AEINC=/I "%SDK%\Headers" /I "%SDK%\Headers\SP" /I "%SDK%\Util" /I "%SDK%\Resources"
+rem Premiere SDK headers, for PremiereGpu.cpp only (they clash with the AE SDK headers; they define NOMINMAX themselves)
+set PRINC=/I "%~dp0..\sdk\premiere\Examples\Headers"
 set CVLIBS="%CV%\lib\opencv_video4.lib" "%CV%\lib\opencv_imgproc4.lib" "%CV%\lib\opencv_core4.lib" "%CV%\lib\zs.lib"
 set CUDALIBS="%CUDA_PATH%\lib\x64\cudart_static.lib" "%CUDA_PATH%\lib\x64\cuda.lib"
 rem ncnn with Vulkan (loads the driver's vulkan-1.dll at runtime) + glslang for its shaders
@@ -33,9 +35,12 @@ rc /nologo /fo "%OBJ%\OneEightyPiPL.res" "%OBJ%\OneEightyPiPL.rc" || exit /b 1
 echo [2/5] Compile C++
 cl %CFLAGS% %AEINC% /Fo"%OBJ%\\" OneEighty.cpp MotionBlur.cpp Log.cpp Platform_win.cpp UpdateCheck.cpp tools\oe_offline.cpp tools\oe_gpu_offline.cpp tools\oe_update_test.cpp || exit /b 1
 cl %CFLAGS% %NCNNINC% /Fo"%OBJ%\\" rife\RifeFlow.cpp rife\RifeShutter.cpp || exit /b 1
+cl %CFLAGS% %PRINC% /Fo"%OBJ%\\" PremiereGpu.cpp || exit /b 1
 
 echo [3/5] Compile CUDA
-"%CUDA_PATH%\bin\nvcc.exe" -c -O3 -std=c++17 -Xcompiler "/MD /EHsc /W3" ^
+rem Per-thread default stream: in Premiere's CUDA context our work must not queue behind (or hold up)
+rem Premiere's own streams, as the legacy default stream would.
+"%CUDA_PATH%\bin\nvcc.exe" -c -O3 -std=c++17 --default-stream per-thread -Xcompiler "/MD /EHsc /W3" ^
    -gencode arch=compute_75,code=sm_75 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 ^
    -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120 ^
    -o "%OBJ%\GpuMotionBlur.obj" gpu\GpuMotionBlur.cu || exit /b 1
@@ -58,7 +63,7 @@ echo [5/5] Link plugin
 rem CUDA 13's cuda.lib/cudart_static load the NVIDIA driver at runtime (no nvcuda.dll import),
 rem so the plugin still loads, CPU-only, on machines without NVIDIA.
 link /nologo /DLL /OUT:"%OUT%\OneEighty.aex" /IMPLIB:"%OBJ%\OneEighty.lib" ^
-   "%OBJ%\OneEighty.obj" "%OBJ%\MotionBlur.obj" "%OBJ%\Log.obj" "%OBJ%\Platform_win.obj" "%OBJ%\UpdateCheck.obj" "%OBJ%\GpuMotionBlur.obj" ^
+   "%OBJ%\OneEighty.obj" "%OBJ%\MotionBlur.obj" "%OBJ%\Log.obj" "%OBJ%\Platform_win.obj" "%OBJ%\UpdateCheck.obj" "%OBJ%\GpuMotionBlur.obj" "%OBJ%\PremiereGpu.obj" ^
    "%OBJ%\RifeFlow.obj" "%OBJ%\RifeShutter.obj" "%OBJ%\OneEightyPiPL.res" %CVLIBS% %CUDALIBS% %NCNNLIBS% ^
    kernel32.lib user32.lib shell32.lib winhttp.lib || exit /b 1
 

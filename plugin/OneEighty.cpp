@@ -41,6 +41,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
+
+#ifdef _WIN32
+    #include "PremiereGpu.h"
+#endif
 
 namespace
 {
@@ -248,16 +253,122 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_
 }
 
 // ---------------------------------------------------------------- GPU engine
-// Hybrid path: one CUDA engine for the CPU effect (device 0, private context,
-// own thread: see GpuMotionBlur.cu). Created on first use; a failure is
-// remembered (CPU maths then).
+// Hybrid path: one GPU engine for the CPU effect. Windows, Premiere: CUDA in
+// Premiere's own context (PremiereEngine); elsewhere a context of its own on
+// device 0 (Metal on macOS). Created on first use; a failure is remembered
+// (CPU maths then).
 std::mutex gEngineMutex;
 std::unique_ptr<oe::gpu::Engine> gEngine;
 bool gEngineTried = false;
 
-oe::gpu::Engine* HybridEngine()
+// ONEEIGHTY_NO_GPU=1: never touch the GPU (CPU maths everywhere), for telling
+// OneEighty's GPU use apart from other trouble in the host.
+bool GpuDisabledByEnv()
+{
+    static const bool off = [] {
+        char v[8] = {0};
+#ifdef _WIN32
+        size_t len = 0;
+        getenv_s(&len, v, sizeof(v), "ONEEIGHTY_NO_GPU");
+#else
+        if (const char* e = std::getenv("ONEEIGHTY_NO_GPU"))
+            snprintf(v, sizeof(v), "%s", e);
+#endif
+        if (v[0] && v[0] != '0')
+        {
+            Log("[hybrid] GPU engine off (ONEEIGHTY_NO_GPU=%s) -> CPU maths", v);
+            return true;
+        }
+        return false;
+    }();
+    return off;
+}
+
+#ifdef _WIN32
+// Premiere's GPU through its MediaCore GPU Device Suite (see
+// oe::gpu::HostDevice): Premiere 26 renders third-party GPU effects (e.g.
+// ProMatch) on the CPU for the whole session if another CUDA context appears
+// in the process before it has set them up, as when a project opens on a
+// OneEighty clip. So in Premiere the engine never creates a context: it works
+// in Premiere's, with Premiere's exclusive access to the device held around
+// each call and its device memory from Premiere. (Frames still come through
+// the AE API: Premiere's GPU filter API only delivers whole timeline frames.)
+const void* gPrGpuSuite = nullptr; // PrSDKGPUDeviceSuite, acquired once, kept for the session
+bool gPrGpuSuiteTried = false;
+void* gPrContext = nullptr;                  // Premiere's CUDA context the engine below works in
+oe::gpu::Engine* gPrEngine = nullptr;        // leaked on purpose, as its host device: both live
+                                             // until the process exits (no CUDA from static destructors)
+bool gPrWaitLogged = false;
+std::chrono::steady_clock::time_point gPrEngineAt; // when gPrEngine was created (RifeEngine waits on it)
+
+// nullptr: no suite (then the effect makes its own context, as in After Effects).
+// Sets *wait when Premiere has no CUDA context yet: CPU for this frame, ask again next.
+oe::gpu::Engine* PremiereEngine(PF_InData* in_data, bool* wait)
+{
+    *wait = false;
+    if (!gPrGpuSuiteTried)
+    {
+        gPrGpuSuiteTried = true;
+        const void* p = nullptr;
+        if (in_data->pica_basicP &&
+            in_data->pica_basicP->AcquireSuite(oe::premiere::GpuDeviceSuiteName(),
+                                               oe::premiere::GpuDeviceSuiteVersion(), &p) == kSPNoError &&
+            p)
+            gPrGpuSuite = p;
+        else
+            Log("[hybrid] Premiere's GPU Device Suite unavailable -> own CUDA context");
+    }
+    if (!gPrGpuSuite)
+        return nullptr;
+    const oe::premiere::GpuDeviceInfo info = oe::premiere::DeviceInfo(gPrGpuSuite);
+    if (info.err || !info.cuda || !info.context || !info.meetsMinimum)
+    {
+        if (!gPrWaitLogged)
+        {
+            gPrWaitLogged = true;
+            Log("[hybrid] Premiere's GPU not ready (err=%d framework=%d context=%p min=%d) -> CPU until it is",
+                info.err, info.framework, info.context, info.meetsMinimum ? 1 : 0);
+        }
+        *wait = true;
+        return nullptr;
+    }
+    if (info.context != gPrContext)
+    {
+        // first time, or Premiere replaced its context (an old engine's memory went with the old one)
+        gPrContext = info.context;
+        gPrWaitLogged = false;
+        std::string err;
+        oe::gpu::HostDevice* dev = oe::premiere::MakeHostDevice(gPrGpuSuite, gPrContext).release();
+        gPrEngine = oe::gpu::Engine::CreateOnHostDevice(dev, &err).release();
+        gPrEngineAt = std::chrono::steady_clock::now();
+        if (gPrEngine)
+            Log("[hybrid] GPU engine ready in Premiere's context (%s)", gPrEngine->Describe().c_str());
+        else
+            Log("[hybrid] GPU engine unavailable in Premiere's context (%s) -> CPU maths", err.c_str());
+    }
+    if (!gPrEngine)
+        *wait = true; // failed on this context: CPU, without falling back to a context of our own
+    return gPrEngine;
+}
+#endif
+
+oe::gpu::Engine* HybridEngine(PF_InData* in_data)
 {
     std::lock_guard<std::mutex> lock(gEngineMutex);
+    if (GpuDisabledByEnv())
+        return nullptr;
+#ifdef _WIN32
+    if (in_data->appl_id == kAppID_Premiere)
+    {
+        bool wait = false;
+        if (oe::gpu::Engine* e = PremiereEngine(in_data, &wait))
+            return e;
+        if (wait)
+            return nullptr;
+    }
+#else
+    (void)in_data;
+#endif
     if (!gEngineTried)
     {
         gEngineTried = true;
@@ -279,6 +390,34 @@ bool gRifeTried = false;
 
 oe::rife::Engine* RifeEngine()
 {
+#ifdef _WIN32
+    // RIFE runs on its own Vulkan device. Started in the same second as
+    // Premiere's GPU set-up (a project opening on a Quality High clip), it
+    // knocked Premiere's third-party GPU effects to the CPU for the session,
+    // like a CUDA context of our own did (see PremiereEngine). So in Premiere
+    // its first start waits until Premiere's context has been up a while; the
+    // render that needs it waits too (High stays High).
+    constexpr auto kRifeDelay = std::chrono::seconds(10);
+    for (bool logged = false;;)
+    {
+        std::chrono::steady_clock::duration left{};
+        {
+            std::lock_guard<std::mutex> lock(gEngineMutex);
+            if (gRifeTried || !gPrEngine)
+                break;
+            left = gPrEngineAt + kRifeDelay - std::chrono::steady_clock::now();
+        }
+        if (left <= std::chrono::steady_clock::duration::zero())
+            break;
+        if (!logged)
+        {
+            logged = true;
+            Log("[rife] waiting %.1f s for Premiere's GPU set-up before starting RIFE",
+                std::chrono::duration<double>(left).count());
+        }
+        std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(left, std::chrono::milliseconds(250)));
+    }
+#endif
     std::lock_guard<std::mutex> lock(gEngineMutex);
     if (!gRifeTried)
     {
@@ -544,7 +683,7 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         why = "Force CPU";
     else if (!bgra && !argb)
         why = "unsupported pixel order";
-    else if (!(eng = HybridEngine()))
+    else if (!(eng = HybridEngine(in_data)))
         why = "GPU engine unavailable";
 
     const auto tCompute0 = Clock::now();

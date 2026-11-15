@@ -88,13 +88,34 @@ struct TimeSample
     HostField field;
 };
 
+#ifdef _WIN32
+// A CUDA device owned by the host (Premiere's MediaCore GPU Device Suite).
+// An engine on it works in the host's CUDA context instead of creating its
+// own, holds the host's exclusive access to the device around every call and
+// allocates device memory through the host. (Premiere 26 renders third-party
+// GPU effects on the CPU for the whole session when another CUDA context
+// shows up in the process before it has set up its GPU effects.)
+struct HostDevice
+{
+    virtual ~HostDevice() = default;
+    virtual void* Context() = 0; // CUcontext
+    virtual bool Acquire() = 0;  // exclusive access to the device
+    virtual void Release() = 0;
+    virtual void* Allocate(size_t bytes) = 0; // device memory, nullptr on failure
+    virtual void Free(void* p) = 0;
+};
+#endif
+
 class Engine
 {
 public:
-    // CUDA: device 0, in a private context on a thread of its own (all CUDA
-    // calls run there); Metal: the system default GPU.
+    // CUDA: device 0, in a context of its own; Metal: the system default GPU.
     // Returns nullptr and sets *err when there is no usable GPU / driver.
     static std::unique_ptr<Engine> Create(std::string* err);
+#ifdef _WIN32
+    // CUDA in the host's context (see HostDevice). `dev` must outlive the engine.
+    static std::unique_ptr<Engine> CreateOnHostDevice(HostDevice* dev, std::string* err);
+#endif
     virtual ~Engine() = default;
 
     // For the log, e.g. "Metal: Apple M1" (empty when the engine doesn't say).

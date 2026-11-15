@@ -22,13 +22,8 @@
 
 #include <algorithm>
 #include <cmath>
-#include <condition_variable>
 #include <cstdio>
-#include <deque>
-#include <functional>
-#include <future>
 #include <mutex>
-#include <thread>
 
 namespace oe::gpu
 {
@@ -476,6 +471,28 @@ __global__ void KF4ToU8(const char* src, size_t sp, unsigned char* dst, size_t d
 inline dim3 Grid(int w, int h, dim3 b) { return dim3((w + b.x - 1) / b.x, (h + b.y - 1) / b.y); }
 
 } // namespace
+
+// Device memory for the engine in use on this thread: through the host
+// (HostDevice) while an engine on a host device has it bound, else cudaMalloc.
+thread_local HostDevice* tlHost = nullptr;
+
+inline void* DevAlloc(size_t bytes)
+{
+    if (tlHost)
+        return tlHost->Allocate(bytes);
+    void* p = nullptr;
+    return cudaMalloc(&p, bytes) == cudaSuccess ? p : nullptr;
+}
+
+inline void DevFree(void* p)
+{
+    if (!p)
+        return;
+    if (tlHost)
+        tlHost->Free(p);
+    else
+        cudaFree(p);
+}
 } // namespace oe::gpu
 
 #include "DisFlowCuda.cuh"
@@ -496,11 +513,10 @@ struct DevBuf
         if (ptr && w == W && h == Hh && elem == bytesPerPixel)
             return true;
         Release();
-        if (cudaMallocPitch(&ptr, &pitch, (size_t)W * bytesPerPixel, Hh) != cudaSuccess)
-        {
-            ptr = nullptr;
+        pitch = ((size_t)W * bytesPerPixel + 511) & ~(size_t)511; // rows 512-byte aligned, as cudaMallocPitch
+        ptr = DevAlloc(pitch * Hh);
+        if (!ptr)
             return false;
-        }
         w = W;
         h = Hh;
         elem = bytesPerPixel;
@@ -508,8 +524,7 @@ struct DevBuf
     }
     void Release()
     {
-        if (ptr)
-            cudaFree(ptr);
+        DevFree(ptr);
         ptr = nullptr;
         w = h = 0;
     }
@@ -521,8 +536,11 @@ public:
     ~EngineImpl() override
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (ctx_ && cuCtxPushCurrent(ctx_) == CUDA_SUCCESS)
+        if (ctx_)
         {
+            Bind bind(*this);
+            if (!bind.ok)
+                return;
             for (DevBuf* b : {&flowA_, &flowB_, &out_, &stageOut_, &fieldFlow_, &fieldMask_})
                 b->Release();
             for (int i = 0; i < kMaxFrames; ++i)
@@ -540,70 +558,59 @@ public:
             dis_.Release();
             for (auto* t : {&tilesA_[0], &tilesA_[1], &tilesB_[0], &tilesB_[1]})
                 t->Release();
-            CUcontext dummy;
-            cuCtxPopCurrent(&dummy);
         }
-        if (ctx_)
-            cuCtxDestroy(ctx_); // pairs with the cuCtxCreate in Init
+        if (ctx_ && !host_)
+            cuCtxDestroy(ctx_); // pairs with the cuCtxCreate in Init (a host's context stays the host's)
     }
 
     std::string Describe() const override { return desc_; }
 
-    // Runs on the engine's own thread (ThreadedEngine below), as does every
-    // other call. Premiere 26 renders third-party GPU effects (e.g. ProMatch)
-    // on the CPU for the whole session if CUDA is set up from under it before
-    // it has set up its own GPU rendering: seen when a project opens on a
-    // OneEighty clip, so the first render of the session is ours. So nothing
-    // here touches Premiere's threads or device 0's primary context (the one
-    // the CUDA runtime, and possibly Premiere, would use): the engine works
-    // in a private context, current only on its own thread.
-    bool Init(std::string* err)
+    // host: work in the host's CUDA context (see HostDevice), else in one of
+    // our own on device 0.
+    bool Init(HostDevice* host, std::string* err)
     {
         // CUDA 13's cuda.lib loads the driver at runtime: check it exists
-        // before the first cu* call. Whether the host had already loaded it
-        // goes into the log line (see desc_).
+        // before the first cu* call.
         const bool driverLoaded = GetModuleHandleA("nvcuda.dll") != nullptr;
         if (!driverLoaded && !LoadLibraryA("nvcuda.dll"))
             return Fail(err, "nvcuda.dll not found (no NVIDIA driver)");
-        CUcontext cur = nullptr;
-        const CUresult preInit = cuCtxGetCurrent(&cur); // NOT_INITIALIZED: nobody in the process called cuInit yet
         if (cuInit(0) != CUDA_SUCCESS)
             return Fail(err, "cuInit failed (no NVIDIA driver?)");
+        if (host)
+        {
+            ctx_ = (CUcontext)host->Context();
+            host_ = host;
+            if (!ctx_)
+                return Fail(err, "the host has no CUDA context");
+        }
+        else
+        {
+            CUdevice dev = 0;
+            if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS)
+                return Fail(err, "no CUDA device (no supported NVIDIA GPU?)");
+            CUcontext ctx = nullptr;
+            if (cuCtxCreate(&ctx, nullptr, 0, dev) != CUDA_SUCCESS || !ctx)
+                return Fail(err, "could not create a CUDA context");
+            ctx_ = ctx;
+            CUcontext dummy;
+            cuCtxPopCurrent(&dummy); // created current: used pushed like every call
+        }
+        Bind bind(*this);
+        if (!bind.ok)
+            return Fail(err, bind.Error());
         CUdevice dev = 0;
-        if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS)
-            return Fail(err, "no CUDA device (no supported NVIDIA GPU?)");
-        unsigned primaryFlags = 0;
-        int primaryActive = -1;
-        cuDevicePrimaryCtxGetState(dev, &primaryFlags, &primaryActive);
+        cuCtxGetDevice(&dev);
         char name[256] = {};
         cuDeviceGetName(name, (int)sizeof(name) - 1, dev);
-
-        CUcontext ctx = nullptr;
-        if (cuCtxCreate(&ctx, nullptr, 0, dev) != CUDA_SUCCESS || !ctx)
-            return Fail(err, "could not create a CUDA context");
-        ctx_ = ctx; // created current on this thread
-        dev_ = dev;
         bool ok = true;
         for (auto& e : ev_)
             if (ok && cudaEventCreate(&e) != cudaSuccess)
                 ok = Fail(err, "CUDA runtime init / cudaEventCreate failed (no supported NVIDIA GPU?)");
         size_t memFree = 0, memTotal = 0;
         cuMemGetInfo(&memFree, &memTotal);
-        // the CUDA runtime should have adopted our context, not woken the primary one
-        unsigned primaryFlagsAfter = 0;
-        int primaryActiveAfter = -1;
-        cuDevicePrimaryCtxGetState(dev, &primaryFlagsAfter, &primaryActiveAfter);
-        CUcontext dummy;
-        cuCtxPopCurrent(&dummy); // calls push / pop it like before
-
-        char buf[640];
-        snprintf(buf, sizeof(buf),
-                 "CUDA: %s, own context on engine thread t%05lu | at init: driver loaded by host=%s, "
-                 "CUDA initialised by host=%s (cuCtxGetCurrent=%d, ctx=%p), primary context active=%d flags=0x%x "
-                 "(after our init: %d), VRAM free %zu / %zu MB",
-                 name, GetCurrentThreadId() % 100000, driverLoaded ? "yes" : "no",
-                 preInit == CUDA_SUCCESS ? "yes" : preInit == CUDA_ERROR_NOT_INITIALIZED ? "no" : "?", (int)preInit,
-                 (void*)cur, primaryActive, primaryFlags, primaryActiveAfter, memFree >> 20, memTotal >> 20);
+        char buf[512];
+        snprintf(buf, sizeof(buf), "CUDA: %s, %s context %p, VRAM free %zu / %zu MB", name,
+                 host ? "host's" : "own", (void*)ctx_, memFree >> 20, memTotal >> 20);
         desc_ = buf;
         return ok;
     }
@@ -614,8 +621,9 @@ public:
         if (B.width != A.width || B.height != A.height || B.isFloat != A.isFloat)
             return Fail(err, "frame size/format mismatch");
         std::lock_guard<std::mutex> lock(mu_);
-        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
-            return Fail(err, "cuCtxPushCurrent failed");
+        Bind bind(*this);
+        if (!bind.ok)
+            return Fail(err, bind.Error());
         bool ok = Upload(A, 0, err) && Upload(B, 1, err) && EnsureOut(A.width, A.height, err) &&
                   UploadFlow(fa, flowA_, err) && UploadFlow(fb, flowB_, err);
         if (ok)
@@ -625,8 +633,6 @@ public:
             ok = BlurPair(a, s, err) && Finish(stats, err);
         }
         ok = ok && Download(out, outRowBytes, A.argb, A.isFloat, err);
-        CUcontext dummy;
-        cuCtxPopCurrent(&dummy);
         return ok;
     }
 
@@ -634,8 +640,9 @@ public:
                  Stats* stats, std::string* err) override
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
-            return Fail(err, "cuCtxPushCurrent failed");
+        Bind bind(*this);
+        if (!bind.ok)
+            return Fail(err, bind.Error());
         bool ok = Upload(cur, 0, err) && EnsureOut(cur.width, cur.height, err) && UploadFlow(v, flowA_, err);
         if (ok)
         {
@@ -644,8 +651,6 @@ public:
             ok = BlurSingle(s, err) && Finish(stats, err);
         }
         ok = ok && Download(out, outRowBytes, cur.argb, cur.isFloat, err);
-        CUcontext dummy;
-        cuCtxPopCurrent(&dummy);
         return ok;
     }
 
@@ -659,8 +664,9 @@ public:
                 frames[i].isFloat != frames[0].isFloat)
                 return Fail(err, "frame size/format mismatch");
         std::lock_guard<std::mutex> lock(mu_);
-        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
-            return Fail(err, "cuCtxPushCurrent failed");
+        Bind bind(*this);
+        if (!bind.ok)
+            return Fail(err, bind.Error());
         const int W = frames[0].width, H = frames[0].height;
         bool ok = EnsureOut(W, H, err);
         for (int i = 0; i < nFrames && ok; ++i)
@@ -707,8 +713,6 @@ public:
         }
         ok = ok && Finish(stats, err);
         ok = ok && Download(out, outRowBytes, frames[0].argb, frames[0].isFloat, err);
-        CUcontext dummy;
-        cuCtxPopCurrent(&dummy);
         return ok;
     }
 
@@ -720,8 +724,9 @@ public:
             if (o && (o->width != A.width || o->height != A.height || o->isFloat != A.isFloat))
                 return Fail(err, "frame size/format mismatch");
         std::lock_guard<std::mutex> lock(mu_);
-        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
-            return Fail(err, "cuCtxPushCurrent failed");
+        Bind bind(*this);
+        if (!bind.ok)
+            return Fail(err, bind.Error());
         // slots: 0 = A, 1 = B, 2 = before A, 3 = after B (two-sided motion only)
         const bool useB = a > 1e-3;
         const bool haveP = fs.twoSided && prev, haveN = fs.twoSided && next && useB;
@@ -750,8 +755,6 @@ public:
             ok = ok && BlurPair(a, s, err) && Finish(stats, err);
         }
         ok = ok && Download(out, outRowBytes, A.argb, A.isFloat, err);
-        CUcontext dummy;
-        cuCtxPopCurrent(&dummy);
         return ok;
     }
 
@@ -762,8 +765,9 @@ public:
             if (o && (o->width != cur.width || o->height != cur.height || o->isFloat != cur.isFloat))
                 return Fail(err, "frame size/format mismatch");
         std::lock_guard<std::mutex> lock(mu_);
-        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
-            return Fail(err, "cuCtxPushCurrent failed");
+        Bind bind(*this);
+        if (!bind.ok)
+            return Fail(err, bind.Error());
         // slots: 0 = cur, 1 = next, 2 = prev
         bool ok = Upload(cur, 0, err) && (!next || Upload(*next, 1, err)) && (!prev || Upload(*prev, 2, err)) &&
                   EnsureOut(cur.width, cur.height, err) && SetupFlow(cur.width, cur.height, fs, err);
@@ -789,8 +793,6 @@ public:
             ok = ok && BlurSingle(s, err) && Finish(stats, err);
         }
         ok = ok && Download(out, outRowBytes, cur.argb, cur.isFloat, err);
-        CUcontext dummy;
-        cuCtxPopCurrent(&dummy);
         return ok;
     }
 
@@ -800,8 +802,9 @@ public:
         if (B.width != A.width || B.height != A.height || B.isFloat != A.isFloat)
             return Fail(err, "frame size/format mismatch");
         std::lock_guard<std::mutex> lock(mu_);
-        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
-            return Fail(err, "cuCtxPushCurrent failed");
+        Bind bind(*this);
+        if (!bind.ok)
+            return Fail(err, bind.Error());
         bool ok = Upload(A, 0, err) && Upload(B, 1, err) && SetupFlow(A.width, A.height, fs, err);
         if (ok)
         {
@@ -822,8 +825,6 @@ public:
             *fw = flowA_.w;
             *fh = flowA_.h;
         }
-        CUcontext dummy;
-        cuCtxPopCurrent(&dummy);
         return ok;
     }
 
@@ -1000,10 +1001,45 @@ private:
         return true;
     }
 
+    // For the length of a call: the host's exclusive access to the device (on
+    // a host device), our context pushed on this thread, device memory from
+    // the host. Every call is synchronous, so nothing of ours is still running
+    // on the GPU when the host gets the device back.
+    struct Bind
+    {
+        EngineImpl& e;
+        bool ok = false;
+        bool acquired = false;
+        explicit Bind(EngineImpl& eng) : e(eng)
+        {
+            if (e.host_ && !(acquired = e.host_->Acquire()))
+                return;
+            if (cuCtxPushCurrent(e.ctx_) != CUDA_SUCCESS)
+                return;
+            tlHost = e.host_;
+            ok = true;
+        }
+        ~Bind()
+        {
+            if (ok)
+            {
+                tlHost = nullptr;
+                CUcontext dummy;
+                cuCtxPopCurrent(&dummy);
+            }
+            if (acquired)
+                e.host_->Release();
+        }
+        const char* Error() const
+        {
+            return e.host_ && !acquired ? "no exclusive access to the host's GPU" : "cuCtxPushCurrent failed";
+        }
+    };
+
     std::mutex mu_;
-    CUcontext ctx_ = nullptr; // private context on device 0 (not the primary one); used only pushed
-    CUdevice dev_ = 0;
-    std::string desc_; // device and CUDA state at Init, for the log
+    CUcontext ctx_ = nullptr;    // the host's context, or our own on device 0; used only pushed
+    HostDevice* host_ = nullptr; // set: ctx_ is the host's (see HostDevice)
+    std::string desc_;           // device and context, for the log
     DevBuf frame_[kMaxFrames], out_, stage_[kMaxFrames], stageOut_; // float frames, output, 8-bit staging
     DevBuf fieldFlow_, fieldMask_;                                   // Quality High: one sample's field
     DevBuf flowA_, flowB_, mipA_[3], mipB_[3];
@@ -1012,141 +1048,20 @@ private:
     dis::DisFlow dis_;       // GPU motion (the *GpuFlow calls)
 };
 
-// One thread that runs every CUDA call of an engine, so the host's threads
-// never touch CUDA (see EngineImpl::Init).
-class CudaThread
-{
-public:
-    CudaThread() : th_([this] { Loop(); }) {}
-
-    // Runs f on the thread and waits for it; exceptions come back to the caller.
-    template <class F> auto Run(F&& f) -> decltype(f())
-    {
-        std::packaged_task<decltype(f())()> task(std::forward<F>(f));
-        auto result = task.get_future();
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            q_.emplace_back([&task] { task(); });
-        }
-        cv_.notify_one();
-        return result.get();
-    }
-
-    // Ends the thread (not from DllMain / static destructors: see ~ThreadedEngine).
-    void Stop()
-    {
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            stop_ = true;
-        }
-        cv_.notify_one();
-        th_.join();
-    }
-
-private:
-    void Loop()
-    {
-        for (;;)
-        {
-            std::function<void()> job;
-            {
-                std::unique_lock<std::mutex> lock(mu_);
-                cv_.wait(lock, [this] { return stop_ || !q_.empty(); });
-                if (q_.empty())
-                    return;
-                job = std::move(q_.front());
-                q_.pop_front();
-            }
-            job();
-        }
-    }
-
-    std::mutex mu_;
-    std::condition_variable cv_;
-    std::deque<std::function<void()>> q_;
-    bool stop_ = false;
-    std::thread th_; // last: starts once the members above exist
-};
-
-class ThreadedEngine final : public Engine
-{
-public:
-    // Engines live until the process exits (the effect's is a global). By the
-    // time static destructors run the thread is gone (process exit) or can't
-    // be joined (loader lock on FreeLibrary), so leave the thread, the engine
-    // and its context to the OS.
-    ~ThreadedEngine() override
-    {
-        (void)e_.release();
-        (void)th_.release();
-    }
-
-    bool Init(std::string* err)
-    {
-        th_ = std::make_unique<CudaThread>();
-        const bool ok = th_->Run([&] {
-            e_ = std::make_unique<EngineImpl>();
-            if (e_->Init(err))
-                return true;
-            e_.reset();
-            return false;
-        });
-        if (!ok)
-        {
-            th_->Stop();
-            th_.reset();
-        }
-        return ok;
-    }
-
-    std::string Describe() const override { return e_->Describe(); }
-
-    bool ProcessPair(const HostImage& A, const HostImage& B, double a, const HostFlow& fa, const HostFlow& fb,
-                     void* out, size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) override
-    {
-        return th_->Run([&] { return e_->ProcessPair(A, B, a, fa, fb, out, outRowBytes, s, stats, err); });
-    }
-    bool Process(const HostImage& cur, const HostFlow& v, void* out, size_t outRowBytes, const Settings& s,
-                 Stats* stats, std::string* err) override
-    {
-        return th_->Run([&] { return e_->Process(cur, v, out, outRowBytes, s, stats, err); });
-    }
-    bool ProcessSamples(const HostImage* frames, int nFrames, const TimeSample* samples, int nSamples, void* out,
-                        size_t outRowBytes, bool showVectors, Stats* stats, std::string* err) override
-    {
-        return th_->Run([&] {
-            return e_->ProcessSamples(frames, nFrames, samples, nSamples, out, outRowBytes, showVectors, stats, err);
-        });
-    }
-    bool ProcessPairGpuFlow(const HostImage* prev, const HostImage& A, const HostImage& B, const HostImage* next,
-                            double a, const FlowSettings& fs, void* out, size_t outRowBytes, const Settings& s,
-                            Stats* stats, std::string* err) override
-    {
-        return th_->Run(
-            [&] { return e_->ProcessPairGpuFlow(prev, A, B, next, a, fs, out, outRowBytes, s, stats, err); });
-    }
-    bool ProcessGpuFlow(const HostImage* prev, const HostImage& cur, const HostImage* next, const FlowSettings& fs,
-                        void* out, size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) override
-    {
-        return th_->Run([&] { return e_->ProcessGpuFlow(prev, cur, next, fs, out, outRowBytes, s, stats, err); });
-    }
-    bool EstimateFlowPairGpu(const HostImage& A, const HostImage& B, const FlowSettings& fs, float* fab, float* fba,
-                             int* fw, int* fh, Stats* stats, std::string* err) override
-    {
-        return th_->Run([&] { return e_->EstimateFlowPairGpu(A, B, fs, fab, fba, fw, fh, stats, err); });
-    }
-
-private:
-    std::unique_ptr<CudaThread> th_;
-    std::unique_ptr<EngineImpl> e_; // created, used and (on a failed Init) destroyed on th_
-};
-
 } // namespace
 
 std::unique_ptr<Engine> Engine::Create(std::string* err)
 {
-    auto e = std::make_unique<ThreadedEngine>();
-    if (!e->Init(err))
+    auto e = std::make_unique<EngineImpl>();
+    if (!e->Init(nullptr, err))
+        return nullptr;
+    return e;
+}
+
+std::unique_ptr<Engine> Engine::CreateOnHostDevice(HostDevice* dev, std::string* err)
+{
+    auto e = std::make_unique<EngineImpl>();
+    if (!e->Init(dev, err))
         return nullptr;
     return e;
 }
