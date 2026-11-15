@@ -22,7 +22,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
+#include <functional>
+#include <future>
 #include <mutex>
+#include <thread>
 
 namespace oe::gpu
 {
@@ -538,40 +544,67 @@ public:
             cuCtxPopCurrent(&dummy);
         }
         if (ctx_)
-            cuDevicePrimaryCtxRelease(dev_); // pairs with the retain in Init
+            cuCtxDestroy(ctx_); // pairs with the cuCtxCreate in Init
     }
 
+    std::string Describe() const override { return desc_; }
+
+    // Runs on the engine's own thread (ThreadedEngine below), as does every
+    // other call. Premiere 26 renders third-party GPU effects (e.g. ProMatch)
+    // on the CPU for the whole session if CUDA is set up from under it before
+    // it has set up its own GPU rendering: seen when a project opens on a
+    // OneEighty clip, so the first render of the session is ours. So nothing
+    // here touches Premiere's threads or device 0's primary context (the one
+    // the CUDA runtime, and possibly Premiere, would use): the engine works
+    // in a private context, current only on its own thread.
     bool Init(std::string* err)
     {
-        // nvcuda.dll is delay-loaded by the plugin so it still loads on machines
-        // without an NVIDIA driver: check it exists before the first cu* call.
-        if (!GetModuleHandleA("nvcuda.dll") && !LoadLibraryA("nvcuda.dll"))
+        // CUDA 13's cuda.lib loads the driver at runtime: check it exists
+        // before the first cu* call. Whether the host had already loaded it
+        // goes into the log line (see desc_).
+        const bool driverLoaded = GetModuleHandleA("nvcuda.dll") != nullptr;
+        if (!driverLoaded && !LoadLibraryA("nvcuda.dll"))
             return Fail(err, "nvcuda.dll not found (no NVIDIA driver)");
+        CUcontext cur = nullptr;
+        const CUresult preInit = cuCtxGetCurrent(&cur); // NOT_INITIALIZED: nobody in the process called cuInit yet
         if (cuInit(0) != CUDA_SUCCESS)
             return Fail(err, "cuInit failed (no NVIDIA driver?)");
-        // Init runs on the host's render thread, which the host (Premiere) also
-        // drives its own CUDA work from. Nothing here may change which context
-        // is current on it: retain the primary context explicitly and only ever
-        // use it pushed. (A runtime call with no context current, such as the
-        // old cudaFree(nullptr) init, binds the primary context to the thread
-        // and leaves it there; Premiere then drops every third-party GPU effect
-        // to software for the rest of the session.)
         CUdevice dev = 0;
         if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS)
             return Fail(err, "no CUDA device (no supported NVIDIA GPU?)");
-        CUcontext primary = nullptr;
-        if (cuDevicePrimaryCtxRetain(&primary, dev) != CUDA_SUCCESS || !primary)
-            return Fail(err, "could not retain the CUDA primary context");
-        ctx_ = primary;
+        unsigned primaryFlags = 0;
+        int primaryActive = -1;
+        cuDevicePrimaryCtxGetState(dev, &primaryFlags, &primaryActive);
+        char name[256] = {};
+        cuDeviceGetName(name, (int)sizeof(name) - 1, dev);
+
+        CUcontext ctx = nullptr;
+        if (cuCtxCreate(&ctx, nullptr, 0, dev) != CUDA_SUCCESS || !ctx)
+            return Fail(err, "could not create a CUDA context");
+        ctx_ = ctx; // created current on this thread
         dev_ = dev;
-        if (cuCtxPushCurrent(ctx_) != CUDA_SUCCESS)
-            return Fail(err, "cuCtxPushCurrent failed");
         bool ok = true;
         for (auto& e : ev_)
             if (ok && cudaEventCreate(&e) != cudaSuccess)
                 ok = Fail(err, "CUDA runtime init / cudaEventCreate failed (no supported NVIDIA GPU?)");
+        size_t memFree = 0, memTotal = 0;
+        cuMemGetInfo(&memFree, &memTotal);
+        // the CUDA runtime should have adopted our context, not woken the primary one
+        unsigned primaryFlagsAfter = 0;
+        int primaryActiveAfter = -1;
+        cuDevicePrimaryCtxGetState(dev, &primaryFlagsAfter, &primaryActiveAfter);
         CUcontext dummy;
-        cuCtxPopCurrent(&dummy);
+        cuCtxPopCurrent(&dummy); // calls push / pop it like before
+
+        char buf[640];
+        snprintf(buf, sizeof(buf),
+                 "CUDA: %s, own context on engine thread t%05lu | at init: driver loaded by host=%s, "
+                 "CUDA initialised by host=%s (cuCtxGetCurrent=%d, ctx=%p), primary context active=%d flags=0x%x "
+                 "(after our init: %d), VRAM free %zu / %zu MB",
+                 name, GetCurrentThreadId() % 100000, driverLoaded ? "yes" : "no",
+                 preInit == CUDA_SUCCESS ? "yes" : preInit == CUDA_ERROR_NOT_INITIALIZED ? "no" : "?", (int)preInit,
+                 (void*)cur, primaryActive, primaryFlags, primaryActiveAfter, memFree >> 20, memTotal >> 20);
+        desc_ = buf;
         return ok;
     }
 
@@ -968,8 +1001,9 @@ private:
     }
 
     std::mutex mu_;
-    CUcontext ctx_ = nullptr; // device 0's primary context, retained; used only pushed
+    CUcontext ctx_ = nullptr; // private context on device 0 (not the primary one); used only pushed
     CUdevice dev_ = 0;
+    std::string desc_; // device and CUDA state at Init, for the log
     DevBuf frame_[kMaxFrames], out_, stage_[kMaxFrames], stageOut_; // float frames, output, 8-bit staging
     DevBuf fieldFlow_, fieldMask_;                                   // Quality High: one sample's field
     DevBuf flowA_, flowB_, mipA_[3], mipB_[3];
@@ -978,11 +1012,140 @@ private:
     dis::DisFlow dis_;       // GPU motion (the *GpuFlow calls)
 };
 
+// One thread that runs every CUDA call of an engine, so the host's threads
+// never touch CUDA (see EngineImpl::Init).
+class CudaThread
+{
+public:
+    CudaThread() : th_([this] { Loop(); }) {}
+
+    // Runs f on the thread and waits for it; exceptions come back to the caller.
+    template <class F> auto Run(F&& f) -> decltype(f())
+    {
+        std::packaged_task<decltype(f())()> task(std::forward<F>(f));
+        auto result = task.get_future();
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            q_.emplace_back([&task] { task(); });
+        }
+        cv_.notify_one();
+        return result.get();
+    }
+
+    // Ends the thread (not from DllMain / static destructors: see ~ThreadedEngine).
+    void Stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_one();
+        th_.join();
+    }
+
+private:
+    void Loop()
+    {
+        for (;;)
+        {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                cv_.wait(lock, [this] { return stop_ || !q_.empty(); });
+                if (q_.empty())
+                    return;
+                job = std::move(q_.front());
+                q_.pop_front();
+            }
+            job();
+        }
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> q_;
+    bool stop_ = false;
+    std::thread th_; // last: starts once the members above exist
+};
+
+class ThreadedEngine final : public Engine
+{
+public:
+    // Engines live until the process exits (the effect's is a global). By the
+    // time static destructors run the thread is gone (process exit) or can't
+    // be joined (loader lock on FreeLibrary), so leave the thread, the engine
+    // and its context to the OS.
+    ~ThreadedEngine() override
+    {
+        (void)e_.release();
+        (void)th_.release();
+    }
+
+    bool Init(std::string* err)
+    {
+        th_ = std::make_unique<CudaThread>();
+        const bool ok = th_->Run([&] {
+            e_ = std::make_unique<EngineImpl>();
+            if (e_->Init(err))
+                return true;
+            e_.reset();
+            return false;
+        });
+        if (!ok)
+        {
+            th_->Stop();
+            th_.reset();
+        }
+        return ok;
+    }
+
+    std::string Describe() const override { return e_->Describe(); }
+
+    bool ProcessPair(const HostImage& A, const HostImage& B, double a, const HostFlow& fa, const HostFlow& fb,
+                     void* out, size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) override
+    {
+        return th_->Run([&] { return e_->ProcessPair(A, B, a, fa, fb, out, outRowBytes, s, stats, err); });
+    }
+    bool Process(const HostImage& cur, const HostFlow& v, void* out, size_t outRowBytes, const Settings& s,
+                 Stats* stats, std::string* err) override
+    {
+        return th_->Run([&] { return e_->Process(cur, v, out, outRowBytes, s, stats, err); });
+    }
+    bool ProcessSamples(const HostImage* frames, int nFrames, const TimeSample* samples, int nSamples, void* out,
+                        size_t outRowBytes, bool showVectors, Stats* stats, std::string* err) override
+    {
+        return th_->Run([&] {
+            return e_->ProcessSamples(frames, nFrames, samples, nSamples, out, outRowBytes, showVectors, stats, err);
+        });
+    }
+    bool ProcessPairGpuFlow(const HostImage* prev, const HostImage& A, const HostImage& B, const HostImage* next,
+                            double a, const FlowSettings& fs, void* out, size_t outRowBytes, const Settings& s,
+                            Stats* stats, std::string* err) override
+    {
+        return th_->Run(
+            [&] { return e_->ProcessPairGpuFlow(prev, A, B, next, a, fs, out, outRowBytes, s, stats, err); });
+    }
+    bool ProcessGpuFlow(const HostImage* prev, const HostImage& cur, const HostImage* next, const FlowSettings& fs,
+                        void* out, size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) override
+    {
+        return th_->Run([&] { return e_->ProcessGpuFlow(prev, cur, next, fs, out, outRowBytes, s, stats, err); });
+    }
+    bool EstimateFlowPairGpu(const HostImage& A, const HostImage& B, const FlowSettings& fs, float* fab, float* fba,
+                             int* fw, int* fh, Stats* stats, std::string* err) override
+    {
+        return th_->Run([&] { return e_->EstimateFlowPairGpu(A, B, fs, fab, fba, fw, fh, stats, err); });
+    }
+
+private:
+    std::unique_ptr<CudaThread> th_;
+    std::unique_ptr<EngineImpl> e_; // created, used and (on a failed Init) destroyed on th_
+};
+
 } // namespace
 
 std::unique_ptr<Engine> Engine::Create(std::string* err)
 {
-    auto e = std::make_unique<EngineImpl>();
+    auto e = std::make_unique<ThreadedEngine>();
     if (!e->Init(err))
         return nullptr;
     return e;

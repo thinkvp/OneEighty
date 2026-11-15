@@ -248,8 +248,9 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_
 }
 
 // ---------------------------------------------------------------- GPU engine
-// Hybrid path: one CUDA engine for the CPU effect (primary context of device
-// 0). Created on first use; a failure is remembered (CPU maths then).
+// Hybrid path: one CUDA engine for the CPU effect (device 0, private context,
+// own thread: see GpuMotionBlur.cu). Created on first use; a failure is
+// remembered (CPU maths then).
 std::mutex gEngineMutex;
 std::unique_ptr<oe::gpu::Engine> gEngine;
 bool gEngineTried = false;

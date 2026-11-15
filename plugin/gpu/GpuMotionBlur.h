@@ -91,7 +91,8 @@ struct TimeSample
 class Engine
 {
 public:
-    // CUDA: primary context of device 0; Metal: the system default GPU.
+    // CUDA: device 0, in a private context on a thread of its own (all CUDA
+    // calls run there); Metal: the system default GPU.
     // Returns nullptr and sets *err when there is no usable GPU / driver.
     static std::unique_ptr<Engine> Create(std::string* err);
     virtual ~Engine() = default;
