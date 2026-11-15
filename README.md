@@ -4,6 +4,8 @@ A Premiere Pro effect that gives high-frame-rate footage the motion blur of a
 **180° shutter** when it plays at normal speed on a lower-rate timeline, and
 evens out the stutter of uneven conversions like **59.94p → 25p**.
 
+![Original clip, ReelSmart Motion Blur, and OneEighty at 180° in Normal and High quality](docs/screenshots/Comparison%201.png)
+
 ## The problem
 
 B-roll is often shot at 50p or 59.94p with a 180° shutter so it can be slowed
@@ -44,6 +46,8 @@ uses); without it, High renders as Normal.
 ## Using it
 
 Drop the effect on a 50p / 59.94p clip (at 100% speed) in a 25p sequence. Sped-up clips work too, e.g. an S&Q / slow-motion 25p file at 200%: whenever Premiere would drop frames, OneEighty uses them for the blur.
+
+![OneEighty Motion Blur in Premiere's Effect Controls panel](docs/screenshots/Effect%20Panel.png)
 
 | Control | |
 |---|---|
