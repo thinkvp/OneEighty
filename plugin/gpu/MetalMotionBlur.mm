@@ -10,7 +10,8 @@
 // dispatch sees the previous one's writes):
 //   1. 8-bit frames converted to float BGRA (float frames copied as is)
 //   2. mip chain of each frame (1/2, 1/4, 1/8, box filtered)
-//   3. each pixel: average the frame along +/- halfWidth * v
+//   3. each pixel: average the frame along +/- halfWidth * v (Settings::layered:
+//      plus the colour of a faster layer passing over it, see Layered)
 //   4. back to 8-bit when the input was 8-bit
 // The *GpuFlow calls also estimate the motion on the GPU first, in their own
 // command buffer (DisFlowMetal.inl, a port of DisFlowCuda.cuh).
@@ -47,6 +48,8 @@ struct BlurArgs
     float hw, c0;         // half-width; centre offset (single frame) or a (pair)
     int mode, maxS;       // 0 blur, 1 motion vectors; sample cap
     float mipT;
+    int layered;          // layered blur (tile fields bound at 12 / 13)
+    int tw, th;           // tile grid (same for A and B: the output size)
 };
 struct AccumArgs
 {
@@ -62,16 +65,22 @@ struct DownArgs
 {
     int sw, sh, dw, dh;
 };
+struct TileArgs
+{
+    int W, H, fw, fh, tw, th;
+};
+constexpr int kTile = 16; // layered blur: tile size (px), as kTile in the shader
 
 const char* kSource = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
 struct MipDims { int w[4]; int h[4]; int top; };
-struct BlurArgs { MipDims a; MipDims b; int fw, fh, fbw, fbh; float hw, c0; int mode, maxS; float mipT; };
+struct BlurArgs { MipDims a; MipDims b; int fw, fh, fbw, fbh; float hw, c0; int mode, maxS; float mipT; int layered, tw, th; };
 struct AccumArgs { int W, H, aw, ah; float weight; int first, vectors; };
 struct ConvArgs { int w, h, argb; };
 struct DownArgs { int sw, sh, dw, dh; };
+struct TileArgs { int W, H, fw, fh, tw, th; };
 
 // Images are float4 B,G,R,A, 0..1 (values above 1 allowed), pitch = width.
 inline float4 Ld(device const float4* img, int w, int x, int y) { return img[y * w + x]; }
@@ -165,6 +174,167 @@ float4 Gather(thread const Mips& m, int x, int y, float vx, float vy, float hw, 
     return acc * (1.0f / n);
 }
 
+// ------------------------------------------------------------ layered blur
+// Quality Normal's blur (prototype/layered_blur.py, recon_blur; Layered in
+// GpuMotionBlur.cu). Gather above only averages a pixel along its own
+// motion, so a fast object can't streak past its own outline. Here the
+// output is the pixel's own blur plus, for the share of the shutter during
+// which a clearly faster layer passing over it covers it, that layer's
+// colour. Speed stands in for depth (faster = in front). Faster layers are
+// found through the fastest motion around each pixel: per 16 px tile, then
+// over +/-2 tiles, interpolated between tile centres.
+constant int kTile = 16;
+constant int kTileReach = 2;
+
+// Fastest motion in each tile (velocity sampled per full-res pixel).
+kernel void k_tile_max(device const float2* flow [[buffer(0)]], device float2* tiles [[buffer(1)]],
+                       constant TileArgs& p [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    const int tx = gid.x, ty = gid.y;
+    if (tx >= p.tw || ty >= p.th)
+        return;
+    float2 best = float2(0);
+    float bm = -1;
+    for (int y = ty * kTile; y < min(p.H, (ty + 1) * kTile); ++y)
+        for (int x = tx * kTile; x < min(p.W, (tx + 1) * kTile); ++x)
+        {
+            const float2 v = SampleFlow(flow, p.fw, p.fh, p.W, p.H, x, y);
+            const float m = v.x * v.x + v.y * v.y;
+            if (m > bm)
+            {
+                bm = m;
+                best = v;
+            }
+        }
+    tiles[ty * p.tw + tx] = best;
+}
+
+// ... and over the tiles within +/-kTileReach.
+kernel void k_neighbour_max(device const float2* tiles [[buffer(0)]], device float2* out [[buffer(1)]],
+                            constant TileArgs& p [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    const int tx = gid.x, ty = gid.y, tw = p.tw, th = p.th;
+    if (tx >= tw || ty >= th)
+        return;
+    float2 best = tiles[ty * tw + tx];
+    float bm = best.x * best.x + best.y * best.y;
+    for (int dy = -kTileReach; dy <= kTileReach; ++dy)
+        for (int dx = -kTileReach; dx <= kTileReach; ++dx)
+        {
+            const int x = min(max(tx + dx, 0), tw - 1), y = min(max(ty + dy, 0), th - 1);
+            const float2 v = tiles[y * tw + x];
+            const float m = v.x * v.x + v.y * v.y;
+            if (m > bm)
+            {
+                bm = m;
+                best = v;
+            }
+        }
+    out[ty * tw + tx] = best;
+}
+
+// Neighbourhood's fastest motion at pixel (x, y), bilinear between tile centres.
+inline float2 SampleTiles(device const float2* t, int tw, int th, int x, int y)
+{
+    float gx = (x + 0.5f) / kTile - 0.5f, gy = (y + 0.5f) / kTile - 0.5f;
+    gx = min(max(gx, 0.0f), float(tw - 1));
+    gy = min(max(gy, 0.0f), float(th - 1));
+    const int x0 = min(int(gx), max(0, tw - 2)), y0 = min(int(gy), max(0, th - 2));
+    const int x1 = min(x0 + 1, tw - 1), y1 = min(y0 + 1, th - 1);
+    const float fx = gx - x0, fy = gy - y0;
+    const float2 a = t[y0 * tw + x0], b = t[y0 * tw + x1], c = t[y1 * tw + x0], d = t[y1 * tw + x1];
+    return (1 - fy) * ((1 - fx) * a + fx * b) + fy * ((1 - fx) * c + fx * d);
+}
+
+// Mip level for a smear of `smear` full-res pixels.
+inline int SmearLevel(thread const Mips& m, float smear, float mipT)
+{
+    int lvl = 0;
+    while (lvl < m.top && smear / float(1 << lvl) > mipT)
+        ++lvl;
+    return lvl;
+}
+
+// Velocity at the full-res pixel nearest (qx, qy) (rounded half to even, as __float2int_rn).
+inline float2 FlowNear(device const float2* flow, int fw, int fh, int W, int H, float qx, float qy)
+{
+    return SampleFlow(flow, fw, fh, W, H, min(max(int(rint(qx)), 0), W - 1), min(max(int(rint(qy)), 0), H - 1));
+}
+
+float4 Layered(thread const Mips& m, device const float2* flow, int fw, int fh, device const float2* tiles, int tw,
+               int th, int x, int y, float hw, float c0, int maxS, float mipT)
+{
+    const int W = m.w[0], H = m.h[0];
+    const float2 v = SampleFlow(flow, fw, fh, W, H, x, y);
+    const float2 vn = SampleTiles(tiles, tw, th, x, y);
+    const float sp = length(v), sn = length(vn);
+    const float4 centre = Ld(m.p[0], W, x, y);
+    if (2.0f * hw * max(sp, sn) <= 1.0f && fabs(c0) * max(sp, sn) < 0.5f)
+        return centre;
+    const float kSz = 1.5f; // px/frame faster to count as clearly in front
+    // per-pixel jitter of the sample times (interleaved gradient noise)
+    const float jit = fmod(52.9829189f * fmod(0.06711056f * x + 0.00583715f * y, 1.0f), 1.0f);
+    const float t0 = c0 - hw, t1 = c0 + hw;
+
+    // the pixel's own blur: along its own path, minus samples of a faster layer
+    float4 bacc = float4(0);
+    float bw = 0;
+    {
+        const float smear = 2.0f * hw * sp;
+        const int lvl = SmearLevel(m, smear, mipT);
+        const float inv2l = 1.0f / float(1 << lvl);
+        const int n = min(maxS, max(4, int(ceil(smear * inv2l))));
+        device const float4* P = m.p[lvl];
+        const int w = m.w[lvl], h = m.h[lvl];
+        for (int j = 0; j < n; ++j)
+        {
+            const float t = t0 + (t1 - t0) * (j + jit) / n;
+            const float qx = x - t * v.x, qy = y - t * v.y;
+            const float2 vq = FlowNear(flow, fw, fh, W, H, qx, qy);
+            const float front = min(max(0.5f + (length(vq) - sp - kSz) / (2 * kSz), 0.0f), 1.0f);
+            const float wb = 1.0f - front;
+            bacc += wb * Bilinear(P, w, h, (qx + 0.5f) * inv2l - 0.5f, (qy + 0.5f) * inv2l - 0.5f);
+            bw += wb;
+        }
+    }
+
+    // faster layers passing over the pixel: sampled where an object moving
+    // with the neighbourhood's fastest motion would have come from
+    float4 facc = float4(0);
+    float fwt = 0;
+    if (sn > sp) // (front is 0 unless a sample is faster than the pixel)
+    {
+        const float smear = 2.0f * hw * sn;
+        const int lvl = SmearLevel(m, smear, mipT);
+        const float inv2l = 1.0f / float(1 << lvl);
+        const int n = min(maxS, max(4, int(ceil(smear * inv2l))));
+        device const float4* P = m.p[lvl];
+        const int w = m.w[lvl], h = m.h[lvl];
+        const float share = min(smear, 1.0f) / n; // each sample's share of the shutter
+        for (int j = 0; j < n; ++j)
+        {
+            const float t = t0 + (t1 - t0) * (j + jit) / n;
+            const float qx = x - t * vn.x, qy = y - t * vn.y;
+            const float sq = length(FlowNear(flow, fw, fh, W, H, qx, qy));
+            const float front = min(max(0.5f + (sq - sp - kSz) / (2 * kSz), 0.0f), 1.0f);
+            if (front <= 0.0f)
+                continue;
+            // does q's own smear reach the pixel within the shutter? (q moving
+            // like vn but at its own speed: it gets here at time t * sn / sq)
+            const float tq = t * sn / max(sq, 1e-3f);
+            const float cover = min(max(min(tq - t0, t1 - tq) * sq + 0.5f, 0.0f), 1.0f);
+            const float wf = front * cover * share;
+            facc += wf * Bilinear(P, w, h, (qx + 0.5f) * inv2l - 0.5f, (qy + 0.5f) * inv2l - 0.5f);
+            fwt += wf;
+        }
+    }
+    const float4 bcol = bw > 1e-3f ? bacc / bw : centre;
+    if (fwt <= 1e-6f)
+        return bcol;
+    const float alpha = min(fwt, 1.0f), k = alpha / fwt;
+    return facc * k + (1 - alpha) * bcol;
+}
+
 inline float4 VectorPixel(device const float4* L0, int W, int x, int y, float vx, float vy)
 {
     const float4 p = Ld(L0, W, x, y); // x=B y=G z=R
@@ -178,7 +348,8 @@ inline float4 VectorPixel(device const float4* L0, int W, int x, int y, float vx
 kernel void k_blur(device const float4* a0 [[buffer(0)]], device const float4* a1 [[buffer(1)]],
                    device const float4* a2 [[buffer(2)]], device const float4* a3 [[buffer(3)]],
                    device const float2* flow [[buffer(8)]], device float4* out [[buffer(10)]],
-                   constant BlurArgs& p [[buffer(11)]], uint2 gid [[thread_position_in_grid]])
+                   constant BlurArgs& p [[buffer(11)]], device const float2* tiles [[buffer(12)]],
+                   uint2 gid [[thread_position_in_grid]])
 {
     const int W = p.a.w[0], H = p.a.h[0];
     const int x = gid.x, y = gid.y;
@@ -186,7 +357,8 @@ kernel void k_blur(device const float4* a0 [[buffer(0)]], device const float4* a
         return;
     const Mips m = MakeMips(a0, a1, a2, a3, p.a);
     const float2 v = SampleFlow(flow, p.fw, p.fh, W, H, x, y);
-    out[y * W + x] = p.mode == 1 ? VectorPixel(a0, W, x, y, v.x, v.y)
+    out[y * W + x] = p.mode == 1  ? VectorPixel(a0, W, x, y, v.x, v.y)
+                     : p.layered ? Layered(m, flow, p.fw, p.fh, tiles, p.tw, p.th, x, y, p.hw, p.c0, p.maxS, p.mipT)
                                  : Gather(m, x, y, v.x, v.y, p.hw, p.c0, p.maxS, p.mipT);
 }
 
@@ -199,6 +371,7 @@ kernel void k_blur_pair(device const float4* a0 [[buffer(0)]], device const floa
                         device const float4* b2 [[buffer(6)]], device const float4* b3 [[buffer(7)]],
                         device const float2* fa [[buffer(8)]], device const float2* fb [[buffer(9)]],
                         device float4* out [[buffer(10)]], constant BlurArgs& p [[buffer(11)]],
+                        device const float2* ta [[buffer(12)]], device const float2* tb [[buffer(13)]],
                         uint2 gid [[thread_position_in_grid]])
 {
     const int W = p.a.w[0], H = p.a.h[0];
@@ -213,12 +386,14 @@ kernel void k_blur_pair(device const float4* a0 [[buffer(0)]], device const floa
         return;
     }
     const Mips ma = MakeMips(a0, a1, a2, a3, p.a);
-    float4 r = Gather(ma, x, y, va.x, va.y, p.hw, a, p.maxS, p.mipT);
+    float4 r = p.layered ? Layered(ma, fa, p.fw, p.fh, ta, p.tw, p.th, x, y, p.hw, a, p.maxS, p.mipT)
+                         : Gather(ma, x, y, va.x, va.y, p.hw, a, p.maxS, p.mipT);
     if (a > 1e-3f)
     {
         const Mips mb = MakeMips(b0, b1, b2, b3, p.b);
         const float2 vb = SampleFlow(fb, p.fbw, p.fbh, W, H, x, y);
-        const float4 q = Gather(mb, x, y, vb.x, vb.y, p.hw, a - 1.0f, p.maxS, p.mipT);
+        const float4 q = p.layered ? Layered(mb, fb, p.fbw, p.fbh, tb, p.tw, p.th, x, y, p.hw, a - 1.0f, p.maxS, p.mipT)
+                                   : Gather(mb, x, y, vb.x, vb.y, p.hw, a - 1.0f, p.maxS, p.mipT);
         r = (1 - a) * r + a * q;
     }
     out[y * W + x] = r;
@@ -353,7 +528,8 @@ public:
                 const char* name;
                 id<MTLComputePipelineState> __strong* ps;
             } kernels[] = {{"k_blur", &blur_},       {"k_blur_pair", &pair_}, {"k_rife_accum", &accum_},
-                           {"k_u8_to_f4", &toF4_},   {"k_f4_to_u8", &toU8_},  {"k_down", &down_}};
+                           {"k_u8_to_f4", &toF4_},   {"k_f4_to_u8", &toU8_},  {"k_down", &down_},
+                           {"k_tile_max", &tileMax_}, {"k_neighbour_max", &nbrMax_}};
             for (auto& k : kernels)
             {
                 id<MTLFunction> fn = [lib newFunctionWithName:@(k.name)];
@@ -489,25 +665,36 @@ public:
         }
     }
 
-    // (two-sided motion and the layered blur are CUDA only so far: prev / next unused)
-    bool ProcessPairGpuFlow(const HostImage* /*prev*/, const HostImage& A, const HostImage& B,
-                            const HostImage* /*next*/, double a, const FlowSettings& fs, void* out,
-                            size_t outRowBytes, const Settings& s, Stats* stats, std::string* err) override
+    // prev / next: the frame before A / after B, for FlowSettings::twoSided.
+    bool ProcessPairGpuFlow(const HostImage* prev, const HostImage& A, const HostImage& B, const HostImage* next,
+                            double a, const FlowSettings& fs, void* out, size_t outRowBytes, const Settings& s,
+                            Stats* stats, std::string* err) override
     {
-        if (B.width != A.width || B.height != A.height || B.isFloat != A.isFloat)
-            return Fail(err, "frame size/format mismatch");
+        for (const HostImage* o : {&B, prev, next})
+            if (o && (o->width != A.width || o->height != A.height || o->isFloat != A.isFloat))
+                return Fail(err, "frame size/format mismatch");
         std::lock_guard<std::mutex> lock(mu_);
         @autoreleasepool
         {
+            // slots: 0 = A, 1 = B, 2 = before A, 3 = after B (two-sided motion only)
+            const bool useB = a > 1e-3;
+            const bool haveP = fs.twoSided && prev, haveN = fs.twoSided && next && useB;
             // motion in its own command buffer (timed separately), then the blur
             id<MTLCommandBuffer> cb = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             bool ok = EnsureOut(A.width, A.height, err) && Upload(enc, A, 0, err) && Upload(enc, B, 1, err) &&
+                      (!haveP || Upload(enc, *prev, 2, err)) && (!haveN || Upload(enc, *next, 3, err)) &&
                       SetupFlow(A.width, A.height, fs, err) && dis_.Prepare(enc, 0, frame_[0].b, err) &&
-                      dis_.Prepare(enc, 1, frame_[1].b, err) &&
-                      // A's motion forward (A->B) and B's motion forward (minus B->A)
-                      dis_.Compute(enc, 0, 1, fs.refineEdges, 1.0f, false, flowA_.b, err) &&
-                      dis_.Compute(enc, 1, 0, fs.refineEdges, -1.0f, false, flowB_.b, err);
+                      dis_.Prepare(enc, 1, frame_[1].b, err) && (!haveP || dis_.Prepare(enc, 2, frame_[2].b, err)) &&
+                      (!haveN || dis_.Prepare(enc, 3, frame_[3].b, err));
+            if (ok && fs.twoSided)
+                // A's and B's motion forward in time, each from both its neighbours
+                ok = dis_.ComputeTwoSided(enc, 0, 1, haveP ? 2 : -1, fs.refineEdges, 1.0f, flowA_.b, err) &&
+                     (!useB || dis_.ComputeTwoSided(enc, 1, haveN ? 3 : -1, 0, fs.refineEdges, 1.0f, flowB_.b, err));
+            else if (ok)
+                // A's motion forward (A->B) and B's motion forward (minus B->A)
+                ok = dis_.Compute(enc, 0, 1, fs.refineEdges, 1.0f, false, flowA_.b, err) &&
+                     dis_.Compute(enc, 1, 0, fs.refineEdges, -1.0f, false, flowB_.b, err);
             [enc endEncoding];
             Stats fst, bst;
             ok = ok && Finish(cb, &fst, err);
@@ -545,12 +732,15 @@ public:
                       (!next || dis_.Prepare(enc, 1, frame_[1].b, err)) &&
                       (!prev || dis_.Prepare(enc, 2, frame_[2].b, err));
             // velocity: mean of (cur->next) and -(cur->prev), whichever exist
+            // (two-sided: each side weighted by its forward/backward check)
             const float k = next && prev ? 0.5f : 1.0f;
             if (ok && !next && !prev)
                 dis_.Zero(enc, flowA_.b);
-            if (ok && next)
+            else if (ok && fs.twoSided)
+                ok = dis_.ComputeTwoSided(enc, 0, next ? 1 : -1, prev ? 2 : -1, fs.refineEdges, 1.0f, flowA_.b, err);
+            else if (ok && next)
                 ok = dis_.Compute(enc, 0, 1, fs.refineEdges, k, false, flowA_.b, err);
-            if (ok && prev)
+            if (ok && prev && !fs.twoSided)
                 ok = dis_.Compute(enc, 0, 2, fs.refineEdges, -k, next != nullptr, flowA_.b, err);
             [enc endEncoding];
             Stats fst, bst;
@@ -638,6 +828,11 @@ private:
         args.mode = s.showVectors ? 1 : 0;
         args.maxS = std::max(2, s.maxSamples);
         args.mipT = (float)std::max(1, s.mipThreshold);
+        const bool useB = args.c0 > 1e-3f;
+        args.layered = s.layered && !s.showVectors ? 1 : 0;
+        if (args.layered && (!BuildTiles(enc, flowA_, faw, fah, tilesA_, &args.tw, &args.th, err) ||
+                             (useB && !BuildTiles(enc, flowB_, fbw, fbh, tilesB_, &args.tw, &args.th, err))))
+            return false;
         [enc setComputePipelineState:pair_];
         for (int i = 0; i < 4; ++i)
         {
@@ -648,6 +843,9 @@ private:
         [enc setBuffer:flowB_.b offset:0 atIndex:9];
         [enc setBuffer:out_.b offset:0 atIndex:10];
         [enc setBytes:&args length:sizeof(args) atIndex:11];
+        // (unused tile bindings point at the flow so every binding is valid)
+        [enc setBuffer:args.layered ? tilesA_[1].b : flowA_.b offset:0 atIndex:12];
+        [enc setBuffer:args.layered && useB ? tilesB_[1].b : flowB_.b offset:0 atIndex:13];
         Dispatch(enc, pair_, A.width, A.height);
         EncodeToU8(enc, A);
         return true;
@@ -668,14 +866,42 @@ private:
         args.mode = s.showVectors ? 1 : 0;
         args.maxS = std::max(2, s.maxSamples);
         args.mipT = (float)std::max(1, s.mipThreshold);
+        args.layered = s.layered && !s.showVectors ? 1 : 0;
+        if (args.layered && !BuildTiles(enc, flowA_, fw, fh, tilesA_, &args.tw, &args.th, err))
+            return false;
         [enc setComputePipelineState:blur_];
         for (int i = 0; i < 4; ++i)
             [enc setBuffer:ms[i] offset:0 atIndex:i];
         [enc setBuffer:flowA_.b offset:0 atIndex:8];
         [enc setBuffer:out_.b offset:0 atIndex:10];
         [enc setBytes:&args length:sizeof(args) atIndex:11];
+        [enc setBuffer:args.layered ? tilesA_[1].b : flowA_.b offset:0 atIndex:12];
         Dispatch(enc, blur_, cur.width, cur.height);
         EncodeToU8(enc, cur);
+        return true;
+    }
+
+    // Fastest motion per tile and around it (layered blur), for the output
+    // size, from flow (fw x fh grid); result in bufs[1] (tw x th).
+    bool BuildTiles(id<MTLComputeCommandEncoder> enc, const Buf& flow, int fw, int fh, Buf* bufs, int* tw, int* th,
+                    std::string* err)
+    {
+        const TileArgs args = {outW_, outH_, fw, fh, (outW_ + kTile - 1) / kTile, (outH_ + kTile - 1) / kTile};
+        const size_t bytes = (size_t)args.tw * args.th * 8;
+        if (!bufs[0].Ensure(dev_, bytes) || !bufs[1].Ensure(dev_, bytes))
+            return Fail(err, "out of GPU memory (tiles)");
+        [enc setComputePipelineState:tileMax_];
+        [enc setBuffer:flow.b offset:0 atIndex:0];
+        [enc setBuffer:bufs[0].b offset:0 atIndex:1];
+        [enc setBytes:&args length:sizeof(args) atIndex:2];
+        Dispatch(enc, tileMax_, args.tw, args.th);
+        [enc setComputePipelineState:nbrMax_];
+        [enc setBuffer:bufs[0].b offset:0 atIndex:0];
+        [enc setBuffer:bufs[1].b offset:0 atIndex:1];
+        [enc setBytes:&args length:sizeof(args) atIndex:2];
+        Dispatch(enc, nbrMax_, args.tw, args.th);
+        *tw = args.tw;
+        *th = args.th;
         return true;
     }
 
@@ -815,10 +1041,12 @@ private:
     id<MTLDevice> dev_ = nil;
     id<MTLCommandQueue> queue_ = nil;
     id<MTLComputePipelineState> blur_ = nil, pair_ = nil, accum_ = nil, toF4_ = nil, toU8_ = nil, down_ = nil;
+    id<MTLComputePipelineState> tileMax_ = nil, nbrMax_ = nil;
     std::string name_;
     Buf frame_[kMaxFrames], stage_[kMaxFrames], out_, stageOut_; // float frames, 8-bit staging, output
     Buf fieldFlow_, fieldMask_;                                   // Quality High: one sample's field
     Buf flowA_, flowB_, mipA_[3], mipB_[3];
+    Buf tilesA_[2], tilesB_[2]; // layered blur: tile max, neighbourhood max
     int outW_ = 0, outH_ = 0;
     dis::MetalDis dis_; // GPU motion (the *GpuFlow calls)
     bool disOk_ = false;

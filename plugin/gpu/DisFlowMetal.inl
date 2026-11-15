@@ -673,12 +673,75 @@ kernel void d_store_flow(device const float2* f [[buffer(0)]], device float2* ds
     const int k = y * a.fw + x;
     dst[k] = a.acc != 0 ? dst[k] + a.mul * f[k] : a.mul * f[k];
 }
+
+// ------------------------------------------------- two-sided motion (Normal)
+// Forward/backward mismatch of f (from->to) against g (to->from):
+// |f(x) + g(x + f(x))|, g bilinear (edges clamped), analysis pixels.
+kernel void d_consistency(device const float2* f [[buffer(0)]], device const float2* g [[buffer(1)]],
+                          device float* e [[buffer(2)]], constant DisArgs& a [[buffer(3)]],
+                          uint2 gid [[thread_position_in_grid]])
+{
+    const int x = gid.x, y = gid.y, w = a.fw, h = a.fh;
+    if (x >= w || y >= h)
+        return;
+    const float2 v = f[y * w + x];
+    const float sx = min(max(x + v.x, 0.0f), float(w - 1)), sy = min(max(y + v.y, 0.0f), float(h - 1));
+    const int x0 = min(int(sx), max(0, w - 2)), y0 = min(int(sy), max(0, h - 2));
+    const int x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
+    const float tx = sx - x0, ty = sy - y0;
+    const float2 p = g[y0 * w + x0], q = g[y0 * w + x1], r = g[y1 * w + x0], s = g[y1 * w + x1];
+    const float gx = (1 - ty) * ((1 - tx) * p.x + tx * q.x) + ty * ((1 - tx) * r.x + tx * s.x);
+    const float gy = (1 - ty) * ((1 - tx) * p.y + tx * q.y) + ty * ((1 - tx) * r.y + tx * s.y);
+    e[y * w + x] = abs(v.x + gx) + abs(v.y + gy);
+}
+
+// Reflection without repeating the edge pixel, for any distance (cv::blur's border).
+inline int ReflectAny(int i, int n)
+{
+    if (n == 1)
+        return 0;
+    while (i < 0 || i >= n)
+        i = i < 0 ? -i : 2 * n - 2 - i;
+    return i;
+}
+
+// 5x5 box mean (edges reflected, as cv::blur).
+kernel void d_box5(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
+                   constant DisArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    const int x = gid.x, y = gid.y, w = a.fw, h = a.fh;
+    if (x >= w || y >= h)
+        return;
+    float s = 0;
+    for (int dy = -2; dy <= 2; ++dy)
+        for (int dx = -2; dx <= 2; ++dx)
+            s += src[ReflectAny(y + dy, h) * w + ReflectAny(x + dx, w)];
+    dst[y * w + x] = s * (1.0f / 25.0f);
+}
+
+// A's velocity per frame from A->next (fn) and A->prev (fp): each side
+// weighted by how well its forward/backward check passes (a region about to
+// be covered was still visible a frame earlier).
+kernel void d_merge_sides(device const float2* fn [[buffer(0)]], device const float* en [[buffer(1)]],
+                          device const float2* fp [[buffer(2)]], device const float* ep [[buffer(3)]],
+                          device float2* v [[buffer(4)]], constant DisArgs& a [[buffer(5)]],
+                          uint2 gid [[thread_position_in_grid]])
+{
+    const int x = gid.x, y = gid.y;
+    if (x >= a.fw || y >= a.fh)
+        return;
+    const int i = y * a.fw + x;
+    const float wn = 1.0f / (0.25f + en[i] * en[i]), wp = 1.0f / (0.25f + ep[i] * ep[i]);
+    const float k = 1.0f / (wn + wp);
+    v[i] = float2((wn * fn[i].x - wp * fp[i].x) * k, (wn * fn[i].y - wp * fp[i].y) * k);
+}
 )MSL";
 
 const char* const kDisKernels[] = {"d_area_frame", "d_box3",       "d_area_gray",  "d_sobel",       "d_structure",
                                    "d_patch_search", "d_densify",  "d_var_warp",   "d_var_deriv1",  "d_var_deriv2",
                                    "d_var_smooth", "d_var_system", "d_var_sor",    "d_flow_add",    "d_flow_zero",
-                                   "d_resize_flow", "d_edge_flag", "d_dilate",     "d_edge_refine", "d_store_flow"};
+                                   "d_resize_flow", "d_edge_flag", "d_dilate",     "d_edge_refine", "d_store_flow",
+                                   "d_consistency", "d_box5",      "d_merge_sides"};
 enum DisKernel
 {
     kAreaFrame,
@@ -701,6 +764,9 @@ enum DisKernel
     kDilate,
     kEdgeRefine,
     kStoreFlow,
+    kConsistency,
+    kBox5,
+    kMergeSides,
     kDisKernelCount
 };
 
@@ -729,7 +795,7 @@ inline Params Preset(int preset)
 class MetalDis
 {
 public:
-    static constexpr int kSlots = 3;
+    static constexpr int kSlots = 4; // engine: 0 = A, 1 = B, 2 = before A, 3 = after B
 
     bool Init(id<MTLDevice> dev, id<MTLLibrary> lib, std::string* err)
     {
@@ -749,6 +815,8 @@ public:
     bool Setup(int W, int H, int flowWidth, int preset)
     {
         p_ = Preset(preset);
+        for (Raw& r : raw_)
+            r.valid = false;
         const double scale = std::min(1.0, (double)flowWidth / W);
         scale_ = scale;
         frameW_ = W;
@@ -781,6 +849,9 @@ public:
     bool Prepare(id<MTLComputeCommandEncoder> enc, int slot, id<MTLBuffer> frame, std::string* err)
     {
         Slot& s = slot_[slot];
+        for (Raw& r : raw_)
+            if (r.from == slot || r.to == slot)
+                r.valid = false;
         const size_t n0 = (size_t)fw_ * fh_;
         if (!Ensure(s.gray[0], n0 * 4) || !Ensure(s.colourRaw, n0 * 4) || !Ensure(s.colour, n0 * 4))
             return Fail(err, "out of GPU memory (motion)");
@@ -814,6 +885,80 @@ public:
     bool Compute(id<MTLComputeCommandEncoder> enc, int from, int to, bool refineEdges, float weight, bool accumulate,
                  id<MTLBuffer> dst, std::string* err)
     {
+        id<MTLBuffer> f = RawFlow(enc, from, to, err);
+        return f && Store(enc, f, from, refineEdges, weight, accumulate, dst, err);
+    }
+
+    // Same as DisFlow::ComputeTwoSided in DisFlowCuda.cuh (Quality Normal):
+    // velocity of slot `a` (per source frame, forward in time) from a->next
+    // and a->prev, each checked against its reverse; next / prev = -1 when
+    // missing (one side only). Stored as full-res pixels times `weight`.
+    bool ComputeTwoSided(id<MTLComputeCommandEncoder> enc, int a, int next, int prev, bool refineEdges, float weight,
+                         id<MTLBuffer> dst, std::string* err)
+    {
+        if (next < 0 && prev < 0)
+            return Fail(err, "no neighbouring frame for motion");
+        if (prev < 0)
+            return Compute(enc, a, next, refineEdges, weight, false, dst, err);
+        if (next < 0)
+            return Compute(enc, a, prev, refineEdges, -weight, false, dst, err);
+        id<MTLBuffer> fn = RawFlow(enc, a, next, err);
+        id<MTLBuffer> fnb = fn ? RawFlow(enc, next, a, err) : nil;
+        id<MTLBuffer> fp = fnb ? RawFlow(enc, a, prev, err) : nil;
+        id<MTLBuffer> fpb = fp ? RawFlow(enc, prev, a, err) : nil;
+        if (!fpb)
+            return false;
+        const size_t n0 = (size_t)fw_ * fh_;
+        if (!Ensure(e0_, n0 * 4) || !Ensure(e1_, n0 * 4) || !Ensure(e2_, n0 * 4) || !Ensure(f2_, n0 * 8))
+            return Fail(err, "out of GPU memory (motion)");
+        const DisArgs g = Args();
+        Run(enc, kConsistency, {fn, fnb, e2_}, g, fw_, fh_);
+        Run(enc, kBox5, {e2_, e0_}, g, fw_, fh_);
+        Run(enc, kConsistency, {fp, fpb, e2_}, g, fw_, fh_);
+        Run(enc, kBox5, {e2_, e1_}, g, fw_, fh_);
+        Run(enc, kMergeSides, {fn, e0_, fp, e1_, f2_}, g, fw_, fh_);
+        return Store(enc, f2_, a, refineEdges, weight, false, dst, err);
+    }
+
+    // Zero motion into dst (fw x fh), for a single frame without neighbours.
+    void Zero(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> dst)
+    {
+        DisArgs a = Args();
+        a.w = fw_;
+        a.h = fh_;
+        Run(enc, kFlowZero, {dst}, a, fw_, fh_);
+    }
+
+private:
+    // Raw motion from -> to (analysis size and pixels, no clean-up), cached
+    // per call: A->B / B->A serve both A's and B's two-sided motion.
+    id<MTLBuffer> RawFlow(id<MTLComputeCommandEncoder> enc, int from, int to, std::string* err)
+    {
+        Raw* slot = nullptr;
+        for (Raw& r : raw_)
+            if (r.valid && r.from == from && r.to == to)
+                return r.buf;
+        for (Raw& r : raw_) // a free entry, else the oldest
+            if (!r.valid && (!slot || r.stamp < slot->stamp))
+                slot = &r;
+        if (!slot)
+            for (Raw& r : raw_)
+                if (!slot || r.stamp < slot->stamp)
+                    slot = &r;
+        if (!Ensure(slot->buf, (size_t)fw_ * fh_ * 8))
+            return Fail(err, "out of GPU memory (motion)"), nil;
+        if (!Estimate(enc, from, to, slot->buf, err))
+            return nil;
+        slot->from = from;
+        slot->to = to;
+        slot->valid = true;
+        slot->stamp = ++stamp_;
+        return slot->buf;
+    }
+
+    // DIS from slot `from` to slot `to` into out (analysis size and pixels).
+    bool Estimate(id<MTLComputeCommandEncoder> enc, int from, int to, id<MTLBuffer> out, std::string* err)
+    {
         const Slot& A = slot_[from];
         const Slot& B = slot_[to];
         const int fin = p_.finest;
@@ -829,8 +974,6 @@ public:
                 ok = ok && Ensure(*q, nf * 4);
             ok = ok && Ensure(W_, nf * 8) && Ensure(dW_, nf * 8) && Ensure(tW_, nf * 8);
         }
-        const size_t n0 = (size_t)fw_ * fh_;
-        ok = ok && Ensure(f0_, n0 * 8) && Ensure(f1_, n0 * 8);
         if (!ok)
             return Fail(err, "out of GPU memory (motion)");
 
@@ -878,8 +1021,15 @@ public:
         r.dw = fw_;
         r.dh = fh_;
         r.mul = (float)(1 << fin);
-        Run(enc, kResizeFlow, {U_[fin & 1], f0_}, r, fw_, fh_);
-        id<MTLBuffer> result = f0_;
+        Run(enc, kResizeFlow, {U_[fin & 1], out}, r, fw_, fh_);
+        return true;
+    }
+
+    // Clean-up (colour of slot `colourSlot`) and store as full-res pixels.
+    bool Store(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> f, int colourSlot, bool refineEdges, float weight,
+               bool accumulate, id<MTLBuffer> dst, std::string* err)
+    {
+        id<MTLBuffer> result = f;
         if (refineEdges)
         {
             constexpr int kReach = 42;
@@ -887,11 +1037,12 @@ public:
             e.qw = (fw_ + 3) / 4;
             e.qh = (fh_ + 3) / 4;
             e.r = kReach / 4 + 1;
-            if (!Ensure(flagQ_[0], (size_t)e.qw * e.qh) || !Ensure(flagQ_[1], (size_t)e.qw * e.qh))
+            if (!Ensure(flagQ_[0], (size_t)e.qw * e.qh) || !Ensure(flagQ_[1], (size_t)e.qw * e.qh) ||
+                !Ensure(f1_, (size_t)fw_ * fh_ * 8))
                 return Fail(err, "out of GPU memory (motion)");
-            Run(enc, kEdgeFlag, {f0_, flagQ_[0]}, e, e.qw, e.qh);
+            Run(enc, kEdgeFlag, {f, flagQ_[0]}, e, e.qw, e.qh);
             Run(enc, kDilate, {flagQ_[0], flagQ_[1]}, e, e.qw, e.qh);
-            Run(enc, kEdgeRefine, {f0_, A.colour, flagQ_[1], f1_}, e, fw_, fh_);
+            Run(enc, kEdgeRefine, {f, slot_[colourSlot].colour, flagQ_[1], f1_}, e, fw_, fh_);
             result = f1_;
         }
         DisArgs st = Args();
@@ -901,16 +1052,6 @@ public:
         return true;
     }
 
-    // Zero motion into dst (fw x fh), for a single frame without neighbours.
-    void Zero(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> dst)
-    {
-        DisArgs a = Args();
-        a.w = fw_;
-        a.h = fh_;
-        Run(enc, kFlowZero, {dst}, a, fw_, fh_);
-    }
-
-private:
     struct Slot
     {
         id<MTLBuffer> gray[kMaxLevels], gx[kMaxLevels], gy[kMaxLevels];
@@ -1001,7 +1142,17 @@ private:
     Slot slot_[kSlots];
     id<MTLBuffer> xx_, yy_, xy_, sx_, sy_;
     id<MTLBuffer> vIx_, vIy_, vIz_, vIxx_, vIxy_, vIyy_, vIxz_, vIyz_, vAvg_, a11_, a12_, a22_, b1_, b2_, sw_;
-    id<MTLBuffer> S_, U_[2], W_, dW_, tW_, f0_, f1_;
+    id<MTLBuffer> S_, U_[2], W_, dW_, tW_, f1_, f2_;
+    id<MTLBuffer> e0_, e1_, e2_; // two-sided: consistency errors
+    struct Raw
+    {
+        int from = -1, to = -1;
+        bool valid = false;
+        unsigned stamp = 0;
+        id<MTLBuffer> buf;
+    };
+    Raw raw_[6]; // raw motion of this call, by (from, to): A->B is shared by A's and B's two-sided motion
+    unsigned stamp_ = 0;
     id<MTLBuffer> flagQ_[2];
 };
 

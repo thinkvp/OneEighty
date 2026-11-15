@@ -8,8 +8,8 @@ Windows, Metal on macOS) on the synthetic clips and checks:
   - GPU and CPU paths agree (their PSNRs within 0.6 dB)
   - motion estimated on the GPU (OE_GPUFLOW=1, the effect's default) scores
     no more than 0.3 dB below the CPU motion (OpenCV DIS), exact timing on
-    and off (on CUDA it is also the two-sided motion and layered blur, which
-    score higher)
+    and off (it is also the two-sided motion and layered blur, CUDA and
+    Metal, which score higher)
   - 32-bit float and ARGB-byte-order runs match the plain 8-bit BGRA run
   - the motion-vector view runs
 
