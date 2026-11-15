@@ -598,6 +598,18 @@ kernel void d_dilate(device const uchar* src [[buffer(0)]], device uchar* dst [[
     dst[y * qw + x] = m;
 }
 
+// Candidate k (1..40) of the edge clean-up: radius {3, 8, 16, 28, 42}, then
+// direction E, SE, S, SW, W, NW, N, NE (KEdgeRefine's radii / dirs).
+inline int ErRadius(int k) { const int ri = (k - 1) >> 3; return ri == 0 ? 3 : ri == 1 ? 8 : ri == 2 ? 16 : ri == 3 ? 28 : 42; }
+inline int ErDx(int k) { const int d = (k - 1) & 7; return (d == 0 || d == 1 || d == 7) ? 1 : (d == 2 || d == 6) ? 0 : -1; }
+inline int ErDy(int k) { const int d = (k - 1) & 7; return (d == 1 || d == 2 || d == 3) ? 1 : (d == 0 || d == 4) ? 0 : -1; }
+
+// KEdgeRefine, same result to the bit, written for Apple GPUs: every loop is
+// unrolled so the per-pixel arrays stay in registers (indexed at run time
+// they spill to thread memory, 5-8x slower on an M1). Candidates outside the
+// frame keep their slot with weight 0 and value FLT_MAX: adding 0 leaves
+// every sum unchanged, FLT_MAX is never <= a real motion value, and they
+// are not tried as the median. One axis at a time (fewer live registers).
 kernel void d_edge_refine(device const float2* src [[buffer(0)]], device const uchar4* col [[buffer(1)]],
                           device const uchar* maskQ [[buffer(2)]], device float2* dst [[buffer(3)]],
                           constant DisArgs& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
@@ -612,56 +624,67 @@ kernel void d_edge_refine(device const float2* src [[buffer(0)]], device const u
         dst[y * w + x] = own;
         return;
     }
-    const int radii[5] = {3, 8, 16, 28, 42};
-    const int dirs[8][2] = {{1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1}};
-    float vx[41], vy[41], wt[41];
+    float v[41], wt[41];
     const uchar4 c0 = col[y * w + x];
     float spread = 0;
-    vx[0] = own.x;
-    vy[0] = own.y;
+    v[0] = own.x;
     wt[0] = 1.0f;
-    int n = 1;
-    for (int ri = 0; ri < 5; ++ri)
-        for (int di = 0; di < 8; ++di)
-        {
-            const int cx = x + dirs[di][0] * radii[ri], cy = y + dirs[di][1] * radii[ri];
-            if (cx < 0 || cy < 0 || cx >= w || cy >= h)
-                continue;
-            const float2 v = src[cy * w + cx];
-            const uchar4 c = col[cy * w + cx];
-            spread = max(spread, abs(v.x - own.x) + abs(v.y - own.y));
-            const float dcol = float(abs(int(c.x) - int(c0.x)) + abs(int(c.y) - int(c0.y)) + abs(int(c.z) - int(c0.z)));
-            vx[n] = v.x;
-            vy[n] = v.y;
-            wt[n] = exp(-(dcol / 36.0f) * (dcol / 36.0f));
-            ++n;
-        }
+#pragma unroll
+    for (int k = 1; k < 41; ++k)
+    {
+        const int cx = x + ErDx(k) * ErRadius(k), cy = y + ErDy(k) * ErRadius(k);
+        const bool in = cx >= 0 && cy >= 0 && cx < w && cy < h;
+        const int i = min(max(cy, 0), h - 1) * w + min(max(cx, 0), w - 1);
+        const float2 s = src[i];
+        const uchar4 c = col[i];
+        const float dcol = float(abs(int(c.x) - int(c0.x)) + abs(int(c.y) - int(c0.y)) + abs(int(c.z) - int(c0.z)));
+        if (in)
+            spread = max(spread, abs(s.x - own.x) + abs(s.y - own.y));
+        v[k] = in ? s.x : FLT_MAX;
+        wt[k] = in ? exp(-(dcol / 36.0f) * (dcol / 36.0f)) : 0.0f;
+    }
     if (spread < 1.0f)
     {
         dst[y * w + x] = own;
         return;
     }
     float total = 0;
-    for (int i = 0; i < n; ++i)
-        total += wt[i];
+#pragma unroll
+    for (int k = 0; k < 41; ++k)
+        total += wt[k];
     const float halfTotal = 0.5f * total;
-    float bestX = 3.4e38f, bestY = 3.4e38f;
-    for (int i = 0; i < n; ++i)
+    float best[2];
+#pragma unroll
+    for (int axis = 0; axis < 2; ++axis)
     {
-        float accX = 0, accY = 0;
-        for (int j = 0; j < n; ++j)
+        if (axis == 1)
         {
-            if (vx[j] <= vx[i])
-                accX += wt[j];
-            if (vy[j] <= vy[i])
-                accY += wt[j];
+            v[0] = own.y;
+#pragma unroll
+            for (int k = 1; k < 41; ++k)
+            {
+                const int cx = x + ErDx(k) * ErRadius(k), cy = y + ErDy(k) * ErRadius(k);
+                const bool in = cx >= 0 && cy >= 0 && cx < w && cy < h;
+                v[k] = in ? src[min(max(cy, 0), h - 1) * w + min(max(cx, 0), w - 1)].y : FLT_MAX;
+            }
         }
-        if (accX >= halfTotal && vx[i] < bestX)
-            bestX = vx[i];
-        if (accY >= halfTotal && vy[i] < bestY)
-            bestY = vy[i];
+        // weighted median: the smallest value whose weight at or below it
+        // reaches half the total (summed in candidate order, as KEdgeRefine)
+        float b = 3.4e38f;
+#pragma unroll
+        for (int i = 0; i < 41; ++i)
+            if (v[i] < b) // never true outside the frame (FLT_MAX)
+            {
+                float acc = 0;
+#pragma unroll
+                for (int j = 0; j < 41; ++j)
+                    acc += v[j] <= v[i] ? wt[j] : 0.0f;
+                if (acc >= halfTotal)
+                    b = v[i];
+            }
+        best[axis] = b;
     }
-    dst[y * w + x] = float2(bestX, bestY);
+    dst[y * w + x] = float2(best[0], best[1]);
 }
 
 kernel void d_store_flow(device const float2* f [[buffer(0)]], device float2* dst [[buffer(1)]],
