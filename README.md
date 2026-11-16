@@ -29,19 +29,31 @@ each output frame at its true 1/25 s moment, so motion advances evenly.
 Uninstall from Windows *Settings › Apps*. A `.zip` with install/uninstall scripts
 is also attached to each release for manual installs.
 
+**macOS (Apple Silicon, new in v0.10):** download **`OneEighty-v…-mac-arm64.zip`**
+and unpack it. The plugin isn't notarized, so clear macOS's download flag and copy
+it into Adobe's plug-in folder from Terminal (Premiere closed; `README.txt` in the
+zip has the exact lines):
+
+```bash
+xattr -dr com.apple.quarantine OneEighty.plugin
+sudo cp -R OneEighty.plugin "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/"
+```
+
 **Updates:** the effect checks GitHub for a newer release about once a day (one
 anonymous request to the public releases page; nothing about you or your machine
 is sent). When one exists, the *Advanced* group and the *Updates* button say so;
 **Check for updates** checks immediately and offers to open the download page.
 Studios can switch the automatic check off with the environment variable
-`ONEEIGHTY_DISABLE_UPDATE_CHECK=1` or the registry value `DisableUpdateCheck=1`
-(DWORD) under `HKEY_CURRENT_USER` or `HKEY_LOCAL_MACHINE\Software\thinkvp\OneEighty`.
+`ONEEIGHTY_DISABLE_UPDATE_CHECK=1`, on Windows the registry value `DisableUpdateCheck=1`
+(DWORD) under `HKEY_CURRENT_USER` or `HKEY_LOCAL_MACHINE\Software\thinkvp\OneEighty`,
+on macOS `defaults write com.thinkvp.OneEighty DisableUpdateCheck -bool true`.
 
-**Requirements:** Windows 10/11 64-bit and Premiere Pro (tested with Premiere Pro
-2026 / 26.x). An NVIDIA GeForce RTX 20-series or newer GPU is strongly recommended;
-without one the effect still works, on the CPU, but much more slowly. Quality
-**High** needs the NVIDIA GPU (its driver includes the Vulkan support it
-uses); without it, High renders as Normal.
+**Requirements:** Premiere Pro (tested with Premiere Pro 2026 / 26.x) on Windows
+10/11 64-bit, or on macOS 12+ with Apple Silicon. On Windows an NVIDIA GeForce
+RTX 20-series or newer GPU is strongly recommended; without one the effect still
+works, on the CPU, but much more slowly. Quality **High** needs the NVIDIA GPU
+(its driver includes the Vulkan support it uses); without it, High renders as
+Normal. On a Mac everything runs on the built-in GPU (Metal).
 
 ## Using it
 
@@ -102,7 +114,8 @@ at 180° records), PSNR, higher is better:
 - **Speed changes:** constant speeds work (e.g. 200%); reversed clips and speed
   ramps (keyframed time remapping) aren't supported.
 - Tested in **Premiere Pro on Windows with an NVIDIA RTX 4070**. The plugin also
-  loads in After Effects, but that's untested. No macOS build.
+  loads in After Effects, but that's untested. The macOS build (Apple Silicon,
+  Metal) is new and has had much less testing than Windows.
 
 ## Building from source
 

@@ -9,14 +9,16 @@ https://github.com/thinkvp/OneEighty
 
 
 REQUIREMENTS
-  - Windows 10 or 11 (64-bit)
   - Adobe Premiere Pro (tested with Premiere Pro 2026 / 26.x)
-  - Recommended: NVIDIA GeForce RTX 20-series or newer with a current driver
-    (the effect falls back to the CPU otherwise - correct, but much slower)
-  - The Microsoft Visual C++ runtime (installed with Premiere Pro)
+  - Windows 10 or 11 (64-bit). Recommended: NVIDIA GeForce RTX 20-series or
+    newer with a current driver (the effect falls back to the CPU otherwise -
+    correct, but much slower). The Microsoft Visual C++ runtime comes with
+    Premiere Pro.
+  - or macOS 12 or later on Apple Silicon (M1 or newer). The effect runs on
+    the Mac's GPU (Metal). New in v0.10 and less tested than Windows.
 
 
-INSTALL
+INSTALL ON WINDOWS
   Installer: run OneEighty-v...-setup.exe (uninstall from Windows Settings >
   Apps). Or, from the zip:
   1. Close Premiere Pro, After Effects and Media Encoder.
@@ -26,6 +28,22 @@ INSTALL
   To remove a zip install, run "Uninstall OneEighty.bat".
 
 
+INSTALL ON macOS
+  The plugin isn't notarized by Apple, so macOS blocks it until you clear the
+  "downloaded from the internet" flag. Close Premiere Pro, After Effects and
+  Media Encoder, open Terminal and run these two lines (the second asks for
+  your Mac password). This assumes the zip was unpacked in Downloads:
+
+    xattr -dr com.apple.quarantine ~/Downloads/OneEighty-{VERSION}-mac/OneEighty.plugin
+    sudo cp -R ~/Downloads/OneEighty-{VERSION}-mac/OneEighty.plugin "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/"
+
+  Then in Premiere Pro: Effects > Video Effects > OneEighty > OneEighty
+  Motion Blur. To update, delete the old OneEighty.plugin first (below).
+  To remove it:
+
+    sudo rm -rf "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/OneEighty.plugin"
+
+
 USING IT
   Drop the effect on a 50p / 59.94p clip in a 25p sequence (clip at 100%).
   Sped-up clips work too, e.g. a slow-motion (S&Q) 25p file at 200%.
@@ -33,16 +51,18 @@ USING IT
   Shutter angle       Amount of blur to simulate (180 = normal film look).
                       The slider starts at 90: below that the footage
                       already has the blur, so nothing changes.
-  Quality             Normal (default): best balance.
-                      High: cleaner edges where people pass in front of the
-                      background; slower.
-                      Extra High: in-between frames from the RIFE neural
-                      network, averaged like a real shutter: clean
-                      backgrounds next to fast objects. About 3x slower than
-                      High; needs the NVIDIA GPU (otherwise renders as High).
+  Quality             Normal (default): optical-flow motion blur, on the GPU.
+                      High: in-between frames from the RIFE neural network,
+                      averaged like a real shutter: clean backgrounds next
+                      to fast objects. About 3x slower than Normal; needs
+                      the NVIDIA GPU on Windows (otherwise renders as
+                      Normal). Advanced has its sample count and analysis
+                      size for trading quality against speed.
   Exact frame timing  On (default): even motion for 59.94p -> 25p.
-  Advanced            Source shutter angle / frame rate, motion-vector view,
-                      Force CPU, debug log (%TEMP%\OneEighty.log), updates.
+  Advanced            Source shutter angle / frame rate, High samples and
+                      analysis size, motion-vector view, Force CPU, debug
+                      log (Windows: %TEMP%\OneEighty.log, macOS:
+                      ~/Library/Logs/OneEighty.log), updates.
 
 
 UPDATES
@@ -51,9 +71,11 @@ UPDATES
   machine is sent). If there is one, the Advanced group and the Updates button
   say so. "Check for updates" checks now and offers to open the download page.
   To switch the automatic check off (studios / IT): set the environment
-  variable ONEEIGHTY_DISABLE_UPDATE_CHECK=1, or the DWORD registry value
-  DisableUpdateCheck=1 under HKEY_CURRENT_USER or HKEY_LOCAL_MACHINE
-  \Software\thinkvp\OneEighty.
+  variable ONEEIGHTY_DISABLE_UPDATE_CHECK=1, or
+  - Windows: the DWORD registry value DisableUpdateCheck=1 under
+    HKEY_CURRENT_USER or HKEY_LOCAL_MACHINE\Software\thinkvp\OneEighty
+  - macOS: defaults write com.thinkvp.OneEighty DisableUpdateCheck -bool true
+    (or the same key in a managed profile)
 
 
 TIPS

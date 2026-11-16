@@ -23,21 +23,23 @@ parts = [
     "# Third-party notices",
     "",
     "OneEighty's own code is MIT licensed (see `LICENSE`). The released plugin",
-    "binary (`OneEighty.aex`) also contains the following third-party software,",
-    "compiled in statically, and ships with the RIFE model files:",
+    "binaries (`OneEighty.aex` on Windows, `OneEighty.plugin` on macOS) also",
+    "contain the following third-party software, compiled in statically, and",
+    "ship with the RIFE model files:",
     "",
     "| Component | Used for | Licence |",
     "|---|---|---|",
     "| [OpenCV](https://opencv.org) 4 (core, imgproc, video) | DIS optical flow, CPU blur | Apache 2.0 (+ notices below) |",
     "| [zlib](https://zlib.net) | dependency of OpenCV core | zlib licence |",
-    "| NVIDIA CUDA Runtime (`cudart_static`) | GPU processing | NVIDIA CUDA Toolkit EULA (redistributable component) |",
-    "| [ncnn](https://github.com/Tencent/ncnn) | running the RIFE network on the GPU (Vulkan), Quality Extra High | BSD 3-clause (+ notices below) |",
+    "| NVIDIA CUDA Runtime (`cudart_static`) | GPU processing (Windows) | NVIDIA CUDA Toolkit EULA (redistributable component) |",
+    "| [ncnn](https://github.com/Tencent/ncnn) | running the RIFE network on the GPU (Vulkan), Quality High | BSD 3-clause (+ notices below) |",
     "| [glslang](https://github.com/KhronosGroup/glslang) | compiling ncnn's GPU shaders | BSD 3-clause and others (below) |",
     "| [rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan) | RIFE's Warp layer shaders and the ncnn conversion of the model (`rife-v4.6`) | MIT |",
-    "| [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) v4.6 model | in-between frames for Quality Extra High | MIT |",
+    "| [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) v4.6 model | in-between frames for Quality High | MIT |",
+    "| [MoltenVK](https://github.com/KhronosGroup/MoltenVK) (`libMoltenVK.dylib`, inside the macOS plugin bundle) | Vulkan on Metal, so ncnn can run RIFE on macOS | Apache 2.0 |",
     "",
-    "The CUDA driver and the Vulkan loader (`vulkan-1.dll`) are part of the",
-    "graphics driver and are not distributed with OneEighty.",
+    "On Windows the CUDA driver and the Vulkan loader (`vulkan-1.dll`) are part",
+    "of the graphics driver and are not distributed with OneEighty.",
     "",
     "Building from source also needs the Adobe After Effects SDK, which is",
     "licensed separately by Adobe and is not included in this repository or in",
@@ -57,6 +59,8 @@ parts += block("rife-ncnn-vulkan (MIT)", text(THIRD / "rife-ncnn-vulkan" / "LICE
 parts += block("ncnn", text(SHARE / "ncnn" / "copyright"))
 parts += block("glslang", text(SHARE / "glslang" / "copyright"))
 parts += block("zlib", text(SHARE / "zlib" / "copyright"))
+parts += block("MoltenVK (Apache License 2.0; macOS build only)",
+               "MoltenVK - Copyright (c) 2015-2025 The Brenwill Workshop Ltd.\n\n" + text(THIRD / "moltenvk" / "LICENSE"))
 parts += block("OpenCV (Apache License 2.0, with notices for bundled components)", text(SHARE / "opencv4" / "copyright"))
 out = ROOT / "THIRD_PARTY_NOTICES.md"
 out.write_text("\n".join(parts), encoding="utf-8")

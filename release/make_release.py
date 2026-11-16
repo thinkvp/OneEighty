@@ -6,12 +6,15 @@
 -> dist/OneEighty-v<version>-setup.exe   Inno Setup installer (needs Inno Setup 6)
 -> dist/OneEighty-v<version>-win64.zip   manual install: .aex + RIFE model + install/
                                          uninstall scripts, README.txt, LICENSE, notices
+--mac: also -> dist/OneEighty-v<version>-mac-arm64.zip, from the zip the macOS
+CI job uploads (OneEighty.plugin), with README.txt, LICENSE and notices.
 The version is read from plugin/OneEightyParams.h.
 """
 import os
 import re
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -61,4 +64,32 @@ else:
         raise SystemExit(r.stdout + r.stderr)
     exe = dist / f"OneEighty-v{ver}-setup.exe"
     print(f"wrote {exe} ({exe.stat().st_size / 1e6:.1f} MB)")
+
+# ---- macOS (repackage the CI build, keeping its Unix permissions)
+if "--mac" in sys.argv:
+    src = Path(sys.argv[sys.argv.index("--mac") + 1])
+    out = dist / f"OneEighty-v{ver}-mac-arm64.zip"
+    folder = f"OneEighty-v{ver}-mac"
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        names = zin.namelist()
+        if "OneEighty.plugin/Contents/Info.plist" not in names:
+            raise SystemExit(f"{src}: no OneEighty.plugin/ inside")
+        plist = zin.read("OneEighty.plugin/Contents/Info.plist").decode()
+        if f"<string>{ver}</string>" not in plist:
+            raise SystemExit(f"{src}: Info.plist isn't version {ver}")
+        for info in zin.infolist():
+            if info.filename.startswith("__MACOSX/"):
+                continue
+            new = zipfile.ZipInfo(f"{folder}/{info.filename}", info.date_time)
+            new.external_attr, new.create_system = info.external_attr, 3  # Unix mode bits
+            new.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(new, zin.read(info.filename))
+        def add(name, data, mode=0o644):
+            i = zipfile.ZipInfo(f"{folder}/{name}", (2026, 1, 1, 0, 0, 0))
+            i.external_attr, i.create_system, i.compress_type = mode << 16, 3, zipfile.ZIP_DEFLATED
+            z.writestr(i, data)
+        add("README.txt", readme)
+        add("LICENSE.txt", (ROOT / "LICENSE").read_bytes())
+        add("THIRD_PARTY_NOTICES.md", (ROOT / "THIRD_PARTY_NOTICES.md").read_bytes())
+    print(f"wrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
 print(f"version {ver}")
