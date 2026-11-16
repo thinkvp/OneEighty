@@ -86,7 +86,7 @@ if "--mac" in sys.argv:
             z.writestr(new, zin.read(info.filename))
         def add(name, data, mode=0o644):
             i = zipfile.ZipInfo(f"{folder}/{name}", (2026, 1, 1, 0, 0, 0))
-            i.external_attr, i.create_system, i.compress_type = mode << 16, 3, zipfile.ZIP_DEFLATED
+            i.external_attr, i.create_system, i.compress_type = (0o100000 | mode) << 16, 3, zipfile.ZIP_DEFLATED
             z.writestr(i, data)
         add("README.txt", readme)
         add("LICENSE.txt", (ROOT / "LICENSE").read_bytes())
