@@ -9,7 +9,7 @@
 
 // Keep in sync with AE_Effect_Version in OneEightyPiPL.r
 #define MAJOR_VERSION 0
-#define MINOR_VERSION 10
+#define MINOR_VERSION 11
 #define BUG_VERSION   0
 #define STAGE_VERSION PF_Stage_DEVELOP
 #define BUILD_VERSION 1
@@ -23,6 +23,7 @@ enum
     OE_QUALITY,        // Normal / High
     OE_EXACT_TIMING,
     OE_ADV_START,      // ---- "Advanced" (collapsed)
+    OE_FAST_PLAYBACK,  // playback without in-between frames (see PreviewFrame in OneEighty.cpp)
     OE_RIFE_SAMPLES,   // High: RIFE in-between frames per output frame
     OE_RIFE_SIZE,      // High: RIFE analysis size
     OE_SRC_SHUTTER,
@@ -54,6 +55,7 @@ enum
     OE_QUALITY_DISK_ID = 15,
     OE_RIFE_SAMPLES_DISK_ID = 16,
     OE_RIFE_SIZE_DISK_ID = 17,
+    OE_FAST_PLAYBACK_DISK_ID = 18,
 };
 
 // Rendering: Premiere's GPU filter API only delivers whole timeline frames

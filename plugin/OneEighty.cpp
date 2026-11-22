@@ -34,6 +34,7 @@
 #include <string>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <map>
 #include <cmath>
 #include <cstdarg>
@@ -216,6 +217,12 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_
 
     // ---- Advanced (collapsed)
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OE_ADV_START_DISK_ID);
+
+    // On: playback (and reduced playback resolution) without in-between
+    // frames, near real time; paused frames, rendered previews and exports
+    // always use Quality as set. Off: playback as exact as the export, slowly.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Fast playback", TRUE, 0, OE_FAST_PLAYBACK_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("High samples", OE_RIFE_SAMPLES_MIN, OE_RIFE_SAMPLES_MAX, OE_RIFE_SAMPLES_MIN,
@@ -516,6 +523,119 @@ void SetFrameOffset(A_long id, const FrameOffset& o)
     gOffsets[id] = o;
 }
 
+// ------------------------------------------------- fast path (playback)
+// Exact timing needs source frames Premiere never shows, and each checkout of
+// one costs it ~0.5 s (long-GOP footage). The fast path needs none: the effect
+// keeps a copy of each input frame it is handed and builds the frame from
+// Premiere's own frame and the nearest kept neighbours, normally the
+// neighbouring output frames' (an output interval apart, e.g. 2 source frames
+// for 50p on 25p): motion between them, the blur scaled to that gap and
+// centred on the exact output time. Less exact than the full path (no
+// in-between frames: 38.1 vs 39.3 dB on the 50p test, 35.6 vs 38.6 on 59.94p,
+// and visibly worse in a Nov 2026 test as a Quality option for exports, so
+// it stays a playback aid). Used during playback (Premiere asks for low
+// quality then, 8-bit: measured in Premiere 26.3, while paused frames,
+// rendered previews and exports come at high quality) and at reduced
+// resolution (1/2, 1/4). Copies are kept briefly, so a frame re-rendered after
+// an edit upstream (playback stopped) finds none and takes the full path; a
+// playback frame with none (the first of a playback) goes out unblurred.
+struct PreviewFrame
+{
+    double time;         // effect time, seconds
+    long long frame;     // the source frame Premiere handed over (nearest to the output time)
+    unsigned fourcc;     // the output format it was conformed to
+    int width, height;
+    long long rateMilli; // source fps x 1000
+    std::chrono::steady_clock::time_point kept;
+    std::shared_ptr<const cv::Mat> m;
+};
+std::mutex gPreviewMutex;
+std::condition_variable gPreviewCv;
+std::map<A_long, std::vector<PreviewFrame>> gPreview; // per effect instance, oldest first
+constexpr auto kPreviewKeep = std::chrono::milliseconds(1500);
+constexpr double kPreviewBudget = 1.5e9;     // bytes of kept frames per instance (UHD float: 11 frames)
+constexpr long long kPreviewMaxGap = 4;      // source frames
+constexpr auto kPreviewWait = std::chrono::milliseconds(80); // for a neighbour rendered alongside
+
+bool SamePreviewFormat(const PreviewFrame& a, const PreviewFrame& b)
+{
+    return a.fourcc == b.fourcc && a.width == b.width && a.height == b.height && a.rateMilli == b.rateMilli;
+}
+
+void KeepPreviewFrame(A_long instance, PreviewFrame f)
+{
+    const double bytes = (double)f.m->total() * (double)f.m->elemSize();
+    const size_t maxFrames = (size_t)std::clamp(kPreviewBudget / std::max(bytes, 1.0), 4.0, 24.0);
+    std::lock_guard<std::mutex> lock(gPreviewMutex);
+    for (auto it = gPreview.begin(); it != gPreview.end();)
+    {
+        auto& v = it->second;
+        v.erase(std::remove_if(v.begin(), v.end(),
+                               [&](const PreviewFrame& o) {
+                                   return f.kept - o.kept > kPreviewKeep ||
+                                          (it->first == instance && o.time == f.time && SamePreviewFormat(o, f));
+                               }),
+                v.end());
+        it = v.empty() ? gPreview.erase(it) : std::next(it);
+    }
+    auto& v = gPreview[instance];
+    v.push_back(std::move(f));
+    while (v.size() > maxFrames)
+        v.erase(v.begin());
+    gPreviewCv.notify_all();
+}
+
+// The nearest kept frames of the instance before and after f's source frame
+// (1..kPreviewMaxGap source frames away), waiting up to `wait` for one.
+struct PreviewNeighbours
+{
+    std::shared_ptr<const cv::Mat> prev, next;
+    long long prevGap = 0, nextGap = 0; // source frames
+};
+PreviewNeighbours FindPreviewNeighbours(A_long instance, const PreviewFrame& f, std::chrono::milliseconds wait)
+{
+    std::unique_lock<std::mutex> lk(gPreviewMutex);
+    const auto deadline = std::chrono::steady_clock::now() + wait;
+    for (;;)
+    {
+        PreviewNeighbours nb;
+        const auto now = std::chrono::steady_clock::now();
+        auto it = gPreview.find(instance);
+        if (it != gPreview.end())
+            for (const PreviewFrame& o : it->second)
+            {
+                if (!SamePreviewFormat(o, f) || now - o.kept > kPreviewKeep)
+                    continue;
+                const long long d = o.frame - f.frame;
+                if (d < 0 && -d <= kPreviewMaxGap && (!nb.prev || -d < nb.prevGap))
+                {
+                    nb.prev = o.m;
+                    nb.prevGap = -d;
+                }
+                else if (d > 0 && d <= kPreviewMaxGap && (!nb.next || d < nb.nextGap))
+                {
+                    nb.next = o.m;
+                    nb.nextGap = d;
+                }
+            }
+        if (nb.prev || nb.next)
+            return nb;
+        if (gPreviewCv.wait_until(lk, deadline) == std::cv_status::timeout)
+            return nb;
+    }
+}
+
+// A deep, top-down copy (rows one by one: Premiere's frames may run bottom-up,
+// negative row bytes held as a wrapped size_t step).
+cv::Mat CopyRows(const cv::Mat& src)
+{
+    cv::Mat dst(src.rows, src.cols, src.type());
+    const size_t rowLen = (size_t)src.cols * src.elemSize();
+    for (int y = 0; y < src.rows; ++y)
+        std::memcpy(dst.ptr(y), src.ptr(y), rowLen);
+    return dst;
+}
+
 PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output)
 {
     using Clock = std::chrono::steady_clock;
@@ -585,6 +705,113 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     const oe::ChannelOrder ordIn = PixelOrder(in_data, curW, &fcIn);
     const bool outFloat = IsFloatFormat(fourcc);
     const cv::Mat cur = Conform(Wrap(curW, IsFloatFormat(fcIn)), ordIn, order, outFloat);
+
+    // Fast path: playback and reduced resolution (see PreviewFrame).
+    const bool reduced = (double)in_data->downsample_x.num < (double)in_data->downsample_x.den ||
+                         (double)in_data->downsample_y.num < (double)in_data->downsample_y.den;
+    const bool playback = in_data->quality == PF_Quality_LO;
+    const bool fastPlayback = params[OE_FAST_PLAYBACK]->u.bd.value != 0;
+    if (fastPlayback && (reduced || playback) && in_data->appl_id == kAppID_Premiere && si.instanceId >= 0 &&
+        !forceCpu)
+    {
+        // Premiere's frame: the source frame nearest the output time (shifted by the offset exact timing learned)
+        const double pk = p + (pairPlan ? offs.k : 0);
+        PreviewFrame pf{(double)in_data->current_time / in_data->time_scale, std::llround(pk), fourcc, cur.cols,
+                        cur.rows, std::llround(clipRate * 1000.0), Clock::now(), nullptr};
+        const char* fail = nullptr;
+        PreviewNeighbours nb;
+        try
+        {
+            pf.m = std::make_shared<const cv::Mat>(CopyRows(cur));
+            KeepPreviewFrame(si.instanceId, pf);
+            nb = FindPreviewNeighbours(si.instanceId, pf, kPreviewWait);
+            // one side only, the nearer (the previous frame on a tie): two-sided
+            // motion doubles the motion work and an upload for little to see
+            // in playback (measured, UHD: ~10 vs ~21 ms of GPU work per frame)
+            if (nb.prev && nb.next)
+            {
+                if (nb.nextGap < nb.prevGap)
+                    nb.prev.reset();
+                else
+                    nb.next.reset();
+            }
+        }
+        catch (const std::exception&)
+        {
+            fail = "out of memory";
+        }
+        const double findMs = std::chrono::duration<double, std::milli>(Clock::now() - tStart).count();
+        const bool pBgra = order.b == 0 && order.g == 1 && order.r == 2;
+        const bool pArgb = order.a == 0 && order.r == 1 && order.g == 2 && order.b == 3;
+        oe::gpu::Engine* peng = nullptr;
+        if (!fail && !nb.prev && !nb.next && playback)
+        {
+            // playback with no neighbour kept yet (its first frame, a jump):
+            // Premiere's frame unblurred for this one frame rather than the full
+            // path, whose ~1-2 s stalled playback
+            if (log)
+                Log("[preview] t=%d/%u %dx%d: no neighbouring frame -> unblurred", in_data->current_time,
+                    in_data->time_scale, output->width, output->height);
+            return PF_COPY(curW, output, NULL, NULL);
+        }
+        if (!fail && !nb.prev && !nb.next)
+            fail = "no neighbouring frame";
+        else if (!fail && !pBgra && !pArgb)
+            fail = "unsupported pixel order";
+        else if (!fail && !(peng = HybridEngine(in_data)))
+            fail = "GPU engine unavailable";
+        bool ok = false;
+        if (!fail)
+        {
+            // motion between the frames is `gap` source frames' worth: the blur
+            // scaled to match, centred on the exact output time
+            const bool both = nb.prev && nb.next;
+            const double gap = both ? 0.5 * (double)(nb.prevGap + nb.nextGap) : (double)(nb.prev ? nb.prevGap : nb.nextGap);
+            oe::gpu::Settings gs;
+            gs.halfWidth = oe::BlurHalfWidth(srcRate, timelineFps, params[OE_SRC_SHUTTER]->u.fs_d.value,
+                                             params[OE_TARGET_SHUTTER]->u.fs_d.value) /
+                           gap;
+            gs.centerOffset = (pk - (double)pf.frame) / gap;
+            gs.showVectors = view == OE_VIEW_VECTORS;
+            gs.layered = true;
+            oe::gpu::FlowSettings fs;
+            fs.flowWidth = std::min(960, cur.cols);
+            fs.preset = cv::DISOpticalFlow::PRESET_MEDIUM;
+            fs.twoSided = both;
+            const bool a8 = pArgb && !outFloat;
+            auto hostOf = [&](const cv::Mat& m) {
+                return oe::gpu::HostImage{m.data, m.step, m.cols, m.rows, a8, outFloat};
+            };
+            const oe::gpu::HostImage hc = hostOf(cur);
+            const oe::gpu::HostImage hp = nb.prev ? hostOf(*nb.prev) : oe::gpu::HostImage{};
+            const oe::gpu::HostImage hn = nb.next ? hostOf(*nb.next) : oe::gpu::HostImage{};
+            cv::Mat out = Wrap(output, outFloat);
+            oe::gpu::Stats gst;
+            std::string perr;
+            const auto tC = Clock::now();
+            ok = peng->ProcessGpuFlow(nb.prev ? &hp : nullptr, hc, nb.next ? &hn : nullptr, fs, out.data, out.step, gs,
+                                      &gst, &perr);
+            if (log)
+            {
+                const auto tEnd = Clock::now();
+                Log("[preview] render t=%d/%u %dx%d downsample %d/%d quality %d | neighbours prev %lld next %lld source "
+                    "frames, timing %+.2f (copy + lookup %.1fms) | compute=%.1fms (wait %.1f, device %.1f, upload %.1f, "
+                    "gpu %.1f of which motion %.1f, download %.1f) total=%.1fms%s%s",
+                    in_data->current_time, in_data->time_scale, output->width, output->height,
+                    (int)in_data->downsample_x.num, (int)in_data->downsample_x.den, (int)in_data->quality,
+                    nb.prev ? nb.prevGap : 0LL, nb.next ? nb.nextGap : 0LL, gs.centerOffset * gap, findMs,
+                    std::chrono::duration<double, std::milli>(tEnd - tC).count(), gst.lockMs, gst.acquireMs,
+                    gst.uploadMs, gst.gpuMs, gst.flowMs, gst.downloadMs,
+                    std::chrono::duration<double, std::milli>(tEnd - tStart).count(), ok ? "" : " FAILED: ",
+                    perr.c_str());
+            }
+        }
+        else if (log)
+            Log("[preview] t=%d/%u %dx%d: %s -> full path", in_data->current_time, in_data->time_scale,
+                output->width, output->height, fail);
+        if (ok)
+            return PF_Err_NONE;
+    }
 
     // Checked-out frames (all checked in at the end).
     struct Fetched
@@ -893,12 +1120,12 @@ PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
             snprintf(extraInfo, sizeof(extraInfo),
                      " | rife: %d samples (set %d) from %d pair(s) at <=%.1f MP, RIFE %.0fms, warp %.1fms",
                      rstats.samples, rifeSamples, rstats.pairs, rifePixels / 1e6, rstats.rifeMs, rstats.gpuMs);
-        Log("[%s] render%s%s%s forceCpu=%d t=%d/%u view=%d %dx%d %s | srcFps=%.3f (%s) speed=%.2f timeline=%.3f "
+        Log("[%s] render%s%s%s forceCpu=%d t=%d/%u view=%d %dx%d ds=%d/%d quality=%d %s | srcFps=%.3f (%s) speed=%.2f timeline=%.3f "
             "(src frames/out %.2f; host orig=%.3f media=%.3f) | "
             "timing=%s p=%.3f a=%.3f d1:%s d2:%s | halfWidth=%.3f q=%d | fetch=%.1fms (d1 %.1fms, d2 %.1fms) compute=%.1fms "
             "(cpu motion %.1fms, gpu motion %.1fms) total=%.1fms%s%s%s%s",
             path, *why ? " (" : "", why, *why ? ")" : "", forceCpu ? 1 : 0, in_data->current_time, in_data->time_scale, view,
-            output->width, output->height, fmts, si.fps, si.source, si.speed, timelineFps, srcRate / timelineFps,
+            output->width, output->height, (int)in_data->downsample_x.num, (int)in_data->downsample_x.den, (int)in_data->quality, fmts, si.fps, si.source, si.speed, timelineFps, srcRate / timelineFps,
             si.origFps, si.mediaFps, pair ? "exact-pair" : "nearest", p, pair ? phase : 0.0,
             have1 ? "ok" : "MISSING", have2 ? "ok" : "MISSING", hw, q, fetchMs, fetch1Ms, fetch2Ms,
             computeMs, disMs, gpuFlowMs, totalMs, extraInfo, diag, gerr.empty() ? "" : " gpu error: ", gerr.c_str());

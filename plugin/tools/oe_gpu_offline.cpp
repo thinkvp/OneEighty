@@ -21,7 +21,14 @@
 //                  the layered blur, as the effect
 //   OE_LAYERED=0   (with OE_GPUFLOW=1) Normal as before v1.0: one-sided
 //                  motion, each pixel averaged along its own motion only
+//   OE_FAST=1      the effect's fast playback: Premiere's frame and the nearer
+//                  neighbouring output frame's, one-sided motion over that gap
+//                  (no in-between source frames); 2 = both neighbouring
+//                  output frames, two-sided
 //   OE_SRC_SHUTTER=deg  source shutter angle (default 180; target is always 180)
+//   OE_BOTTOMUP=1  frames and output with rows bottom-up in memory (negative
+//                  row bytes, as Premiere hands some footage); must match a
+//                  normal run byte for byte
 //   OE_STACK_KB=n  (macOS) run everything on a thread with an n KB stack;
 //                  512 = Premiere's render threads (see LargeStack.h)
 #include "../LargeStack.h"
@@ -135,6 +142,7 @@ int Run(int argc, char** argv)
     const bool argb = Env("OE_ARGB") == '1';
     const bool edgeFix = Env("OE_EDGEFIX") != '0';
     const bool gpuFlow = Env("OE_GPUFLOW") == '1';
+    const int fastMode = Env("OE_FAST") == '1' ? 1 : Env("OE_FAST") == '2' ? 2 : 0;
     oe::gpu::FlowSettings fs;
     fs.flowWidth = 960;
     fs.preset = preset;
@@ -197,7 +205,29 @@ int Run(int argc, char** argv)
     if (!fo)
         return 1;
     cv::Mat out(H, W, useFloat ? CV_32FC4 : CV_8UC4), out8(H, W, CV_8UC4);
+    // OE_BOTTOMUP=1: frames and output whose rows run bottom-up in memory
+    // (negative row bytes), as Premiere 26 hands them out with some footage;
+    // the result must match a normal run byte for byte. (High: output only,
+    // its frames go in as cv::Mat.)
+    const bool bottomUp = Env("OE_BOTTOMUP") == '1';
+    std::vector<cv::Mat> srcUp;
+    if (bottomUp)
+        for (const cv::Mat& m : src)
+        {
+            cv::Mat f;
+            cv::flip(m, f, 0);
+            srcUp.push_back(f);
+        }
+    cv::Mat outUp(out.size(), out.type());
+    unsigned char* const outPtr = bottomUp ? outUp.data + (size_t)(H - 1) * outUp.step : out.data;
+    const size_t outStep = bottomUp ? (size_t)(-(ptrdiff_t)outUp.step) : out.step;
     auto host = [&](const cv::Mat& m) {
+        if (bottomUp)
+        {
+            const cv::Mat& f = srcUp[&m - src.data()];
+            return oe::gpu::HostImage{f.data + (size_t)(f.rows - 1) * f.step, (size_t)(-(ptrdiff_t)f.step), f.cols,
+                                      f.rows, argb && !useFloat, useFloat};
+        }
         return oe::gpu::HostImage{m.data, m.step, m.cols, m.rows, argb && !useFloat, useFloat};
     };
     const double r = srcFps / outFps;
@@ -209,7 +239,43 @@ int Run(int argc, char** argv)
         bool ok;
         const auto t0 = std::chrono::steady_clock::now();
         double tFlow = 0;
-        if (extra)
+        if (fastMode)
+        {
+            // the effect's fast playback: Premiere's frame round(k*r) and the
+            // nearer neighbouring output frame's (the previous one on a tie),
+            // motion over that gap, the blur scaled to it and centred on the
+            // exact output time. OE_FAST=2: both neighbours, two-sided (gap
+            // averaged).
+            const long i = std::lround(k * r);
+            if (i >= (long)src.size())
+                break;
+            const long ip = k > 0 ? std::lround((k - 1) * r) : -1;
+            const long in = std::lround((k + 1) * r) < (long)src.size() ? std::lround((k + 1) * r) : -1;
+            oe::gpu::Settings fsS = s;
+            oe::gpu::FlowSettings fsF = fs;
+            fsF.twoSided = false;
+            fsS.layered = true;
+            const oe::gpu::HostImage hp = ip >= 0 ? host(src[ip]) : oe::gpu::HostImage{};
+            const oe::gpu::HostImage hn = in >= 0 ? host(src[in]) : oe::gpu::HostImage{};
+            bool usePrev = ip >= 0, useNext = in >= 0;
+            if (fastMode == 1 && usePrev && useNext)
+                (in - i < i - ip ? usePrev : useNext) = false;
+            double gap = 0;
+            if (usePrev && useNext)
+            {
+                gap = 0.5 * (double)(in - ip);
+                fsF.twoSided = true;
+            }
+            else
+                gap = usePrev ? (double)(i - ip) : (double)(in - i);
+            fsS.halfWidth = s.halfWidth / std::max(gap, 1e-6);
+            fsS.centerOffset = (k * r - (double)i) / std::max(gap, 1e-6);
+            ok = eng->ProcessGpuFlow(usePrev ? &hp : nullptr, host(src[i]), useNext ? &hn : nullptr, fsF, outPtr,
+                                     outStep, fsS, &st, &err);
+            tFlow = st.flowMs;
+            st.gpuMs -= st.flowMs;
+        }
+        else if (extra)
         {
             // frame A and the output time t relative to it, as the effect does
             const long A = exact ? (long)std::floor(k * r + 1e-9) : std::lround(k * r);
@@ -225,7 +291,7 @@ int Run(int argc, char** argv)
                 f.N = &src[A + 2];
             oe::rife::ShutterStats rs;
             ok = oe::rife::RenderShutter(*rife, *eng, f, order, argb && !useFloat, t, s.halfWidth, nSamples, rifePixels,
-                                         s.showVectors, out.data, out.step, &rs, &err);
+                                         s.showVectors, outPtr, outStep, &rs, &err);
             tFlow = rs.rifeMs;
             st.gpuMs = rs.gpuMs;
         }
@@ -237,8 +303,8 @@ int Run(int argc, char** argv)
             const oe::gpu::HostImage hp = A > 0 ? host(src[A - 1]) : oe::gpu::HostImage{};
             const oe::gpu::HostImage hn = A + 2 < (long)src.size() ? host(src[A + 2]) : oe::gpu::HostImage{};
             ok = eng->ProcessPairGpuFlow(A > 0 ? &hp : nullptr, host(src[A]), host(src[A + 1]),
-                                         A + 2 < (long)src.size() ? &hn : nullptr, k * r - (double)A, fs, out.data,
-                                         out.step, s, &st, &err);
+                                         A + 2 < (long)src.size() ? &hn : nullptr, k * r - (double)A, fs, outPtr,
+                                         outStep, s, &st, &err);
             tFlow = st.flowMs;
             st.gpuMs -= st.flowMs;
         }
@@ -250,8 +316,8 @@ int Run(int argc, char** argv)
             const bool hasPrev = i > 0, hasNext = i + 1 < (long)src.size();
             const oe::gpu::HostImage hp = hasPrev ? host(src[i - 1]) : oe::gpu::HostImage{};
             const oe::gpu::HostImage hn = hasNext ? host(src[i + 1]) : oe::gpu::HostImage{};
-            ok = eng->ProcessGpuFlow(hasPrev ? &hp : nullptr, host(src[i]), hasNext ? &hn : nullptr, fs, out.data,
-                                     out.step, s, &st, &err);
+            ok = eng->ProcessGpuFlow(hasPrev ? &hp : nullptr, host(src[i]), hasNext ? &hn : nullptr, fs, outPtr,
+                                     outStep, s, &st, &err);
             tFlow = st.flowMs;
             st.gpuMs -= st.flowMs;
         }
@@ -265,8 +331,8 @@ int Run(int argc, char** argv)
             const cv::Mat fb = -fbBack;
             tFlow = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             ok = eng->ProcessPair(host(src[A]), host(src[A + 1]), k * r - (double)A,
-                                  {fa.data, fa.step, fa.cols, fa.rows}, {fb.data, fb.step, fb.cols, fb.rows}, out.data,
-                                  out.step, s, &st, &err);
+                                  {fa.data, fa.step, fa.cols, fa.rows}, {fb.data, fb.step, fb.cols, fb.rows}, outPtr,
+                                  outStep, s, &st, &err);
         }
         else
         {
@@ -289,13 +355,15 @@ int Run(int argc, char** argv)
             if (nv == 2)
                 v *= 0.5;
             tFlow = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            ok = eng->Process(host(src[i]), {v.data, v.step, v.cols, v.rows}, out.data, out.step, s, &st, &err);
+            ok = eng->Process(host(src[i]), {v.data, v.step, v.cols, v.rows}, outPtr, outStep, s, &st, &err);
         }
         if (!ok)
         {
             std::fprintf(stderr, "frame %d: %s\n", k, err.c_str());
             return 1;
         }
+        if (bottomUp)
+            cv::flip(outUp, out, 0);
         if (k > 0) // the first frame includes one-off setup
         {
             disMs += tFlow;

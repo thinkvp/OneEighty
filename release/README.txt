@@ -59,10 +59,13 @@ USING IT
                       Normal). Advanced has its sample count and analysis
                       size for trading quality against speed.
   Exact frame timing  On (default): even motion for 59.94p -> 25p.
-  Advanced            Source shutter angle / frame rate, High samples and
-                      analysis size, motion-vector view, Force CPU, debug
-                      log (Windows: %TEMP%\OneEighty.log, macOS:
-                      ~/Library/Logs/OneEighty.log), updates.
+  Advanced            Fast playback (on by default: while Premiere plays,
+                      a quicker, slightly less accurate blur; paused
+                      frames, rendered previews and exports always use
+                      Quality as set), source shutter angle / frame rate,
+                      High samples and analysis size, motion-vector view,
+                      Force CPU, debug log (Windows: %TEMP%\OneEighty.log,
+                      macOS: ~/Library/Logs/OneEighty.log), updates.
 
 
 UPDATES

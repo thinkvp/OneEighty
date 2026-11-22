@@ -30,6 +30,10 @@ struct Stats
 {
     double gpuMs = 0;  // GPU work after upload, before download (motion + mip chain + blur)
     double flowMs = 0; // of which motion estimation (the *GpuFlow calls)
+    // wall-clock parts of a call (CUDA engine, ProcessGpuFlow): waiting for
+    // the engine (other calls), for the host's exclusive access to the device,
+    // uploads, download
+    double lockMs = 0, acquireMs = 0, uploadMs = 0, downloadMs = 0;
 };
 
 // Motion estimated on the GPU (Quality Normal / High): the CPU path

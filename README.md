@@ -66,11 +66,17 @@ Drop the effect on a 50p / 59.94p clip (at 100% speed) in a 25p sequence. Sped-u
 | **Shutter angle** | The blur to simulate at the timeline rate. 180° is the classic film look; 360° is the maximum smear. The slider starts at 90°: the footage already has that much blur (50p shot at 180° = 90° at 25p; 75° for 59.94p), so lower settings add nothing. You can still type 0–720. |
 | **Quality** | **Normal** (default): optical-flow motion blur, motion and blur both on the GPU. **High**: builds 6 in-between frames per output frame with the RIFE neural network and averages them, like a real shutter: clean backgrounds next to fast objects (no smudged court lines beside a bouncing ball) and a natural streak on the object. About 3× slower than Normal; *Advanced* has its sample count and analysis size for trading quality against speed. Works on 10-bit / log / 32-bit footage at full precision. |
 | **Exact frame timing** | On (default): even motion for 59.94p → 25p. Makes no difference for 50p → 25p. |
-| *Advanced* | Source shutter angle and frame rate (auto by default), a **motion-vector view** that shows what the effect is tracking, Force CPU, a debug log (`%TEMP%\OneEighty.log`), and update checks. |
+| *Advanced* | **Fast playback** (on by default, see below), source shutter angle and frame rate (auto by default), a **motion-vector view** that shows what the effect is tracking, Force CPU, a debug log (`%TEMP%\OneEighty.log`), and update checks. |
 
 **Tips**
 
-- It isn't real time: render the work area to preview (**Sequence › Render In to Out**).
+- **Playback is fast, exports are exact.** While Premiere plays, OneEighty
+  uses a quicker approximation built from the neighbouring timeline frames
+  (no in-between frames, so the blur is a little less accurate): near real time
+  at 1/2 playback resolution, about 12–14 fps at Full on UHD (RTX 5070 Ti).
+  Paused frames, rendered previews and exports always use Quality as set.
+  Untick **Fast playback** under *Advanced* to see the exact result while
+  playing (slowly), or render the work area (**Sequence › Render In to Out**).
 - Long-GOP camera files (H.264/HEVC, especially 10-bit 4:2:2 like Sony XAVC) are
   slow for Premiere to decode, and that is most of the render time. **ProRes
   proxies** make previews about 4–5× faster.
@@ -79,9 +85,11 @@ Drop the effect on a 50p / 59.94p clip (at 100% speed) in a 25p sequence. Sped-u
 - Problem area on a shot (e.g. an edge that tears)? Mask the effect in Premiere,
   or try Quality **High**.
 
-**Speed** (RTX 4070, UHD 59.94p on a 25p timeline, per frame): about **0.27 s**
-with ProRes source at Normal quality, about 1.2 s with long-GOP camera files.
-Quality High adds about 0.15 s per frame (UHD, measured offline).
+**Speed** (rendering at Normal, per frame): RTX 5070 Ti, UHD 50p long-GOP
+camera files (Sony XAVC) on a 25p timeline: about **0.27 s**, nearly all of it
+Premiere decoding the frames the effect asks for. RTX 4070, UHD 59.94p: about
+0.27 s with ProRes source, about 1.2 s with long-GOP files. Quality High adds
+about 0.15 s per frame (UHD, measured offline).
 
 ## How well does it work?
 

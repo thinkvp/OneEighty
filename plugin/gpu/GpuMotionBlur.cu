@@ -23,7 +23,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstddef>
+#include <chrono>
 #include <mutex>
+#include <string>
 
 namespace oe::gpu
 {
@@ -443,6 +446,15 @@ __global__ void KU8ToF4(const unsigned char* src, size_t sp, char* dst, size_t d
           argb ? make_float4(p[3] * k, p[2] * k, p[1] * k, p[0] * k) : make_float4(p[0] * k, p[1] * k, p[2] * k, p[3] * k));
 }
 
+// Float frame copy; with a FlipView on either side it flips the rows.
+__global__ void KCopyF4(const char* src, size_t sp, char* dst, size_t dp, int w, int h)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+        return;
+    Store(dst, dp, x, y, Load(src, sp, x, y));
+}
+
 __device__ __forceinline__ unsigned char ToU8(float v) { return (unsigned char)(fminf(fmaxf(v, 0.f), 1.f) * 255.f + 0.5f); }
 
 __global__ void KF4ToU8(const char* src, size_t sp, unsigned char* dst, size_t dp, int w, int h, int argb)
@@ -493,6 +505,25 @@ inline void DevFree(void* p)
     else
         cudaFree(p);
 }
+
+// Host frames whose rows run bottom-up in memory: negative row bytes (the
+// After Effects API allows them; Premiere 26.3 hands them out on an RTX 5070 Ti,
+// with hardware decoding on or off), held as two's complement in
+// the size_t row-bytes fields. cudaMemcpy2D takes only positive pitches, so
+// such a block is copied from its lowest row as it lies in memory and flipped
+// on the GPU: the kernels address rows as base + (size_t)y * pitch, so a view
+// from the last row with the pitch negated (FlipView) reads it top-down.
+inline bool BottomUp(size_t rowBytes) { return (ptrdiff_t)rowBytes < 0; }
+inline size_t AbsPitch(size_t rowBytes) { return BottomUp(rowBytes) ? (size_t)(-(ptrdiff_t)rowBytes) : rowBytes; }
+// Lowest address of a host block (its first row in memory).
+inline const void* BlockStart(const void* data, size_t rowBytes, int h)
+{
+    return BottomUp(rowBytes) ? (const char*)data + (ptrdiff_t)(h - 1) * (ptrdiff_t)rowBytes : data;
+}
+inline void* BlockStart(void* data, size_t rowBytes, int h)
+{
+    return const_cast<void*>(BlockStart((const void*)data, rowBytes, h));
+}
 } // namespace oe::gpu
 
 #include "DisFlowCuda.cuh"
@@ -530,6 +561,20 @@ struct DevBuf
     }
 };
 
+// A device image as the kernels take it (rows at p + (size_t)y * pitch).
+struct View
+{
+    char* p;
+    size_t pitch;
+};
+
+// b read or written upside down: from its last row, the pitch negated (it
+// wraps in the kernels' size_t row arithmetic to the row above). See BottomUp.
+inline View FlipView(const DevBuf& b)
+{
+    return {(char*)b.ptr + (size_t)(b.h - 1) * b.pitch, (size_t)(-(ptrdiff_t)b.pitch)};
+}
+
 class EngineImpl final : public Engine
 {
 public:
@@ -541,7 +586,7 @@ public:
             Bind bind(*this);
             if (!bind.ok)
                 return;
-            for (DevBuf* b : {&flowA_, &flowB_, &out_, &stageOut_, &fieldFlow_, &fieldMask_})
+            for (DevBuf* b : {&flowA_, &flowB_, &out_, &stageOut_, &stageOutF_, &fieldFlow_, &fieldMask_})
                 b->Release();
             for (int i = 0; i < kMaxFrames; ++i)
             {
@@ -693,13 +738,15 @@ public:
                 Fail(err, "out of GPU memory (field)");
                 break;
             }
-            ok = cudaMemcpy2D(fieldFlow_.ptr, fieldFlow_.pitch, f.flow, f.flowRowBytes, (size_t)f.width * 16, f.height,
-                              cudaMemcpyHostToDevice) == cudaSuccess &&
-                 cudaMemcpy2D(fieldMask_.ptr, fieldMask_.pitch, f.mask, f.maskRowBytes, (size_t)f.width * 4, f.height,
-                              cudaMemcpyHostToDevice) == cudaSuccess;
+            cudaError_t ue = cudaMemcpy2D(fieldFlow_.ptr, fieldFlow_.pitch, f.flow, f.flowRowBytes,
+                                          (size_t)f.width * 16, f.height, cudaMemcpyHostToDevice);
+            if (ue == cudaSuccess)
+                ue = cudaMemcpy2D(fieldMask_.ptr, fieldMask_.pitch, f.mask, f.maskRowBytes, (size_t)f.width * 4,
+                                  f.height, cudaMemcpyHostToDevice);
+            ok = ue == cudaSuccess;
             if (!ok)
             {
-                Fail(err, "field upload failed");
+                FailCuda(err, "field upload failed", ue);
                 break;
             }
             const DevBuf& a = frame_[s.frame0];
@@ -764,13 +811,23 @@ public:
         for (const HostImage* o : {prev, next})
             if (o && (o->width != cur.width || o->height != cur.height || o->isFloat != cur.isFloat))
                 return Fail(err, "frame size/format mismatch");
+        using WallClock = std::chrono::steady_clock;
+        auto ms = [](WallClock::time_point a, WallClock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        const auto w0 = WallClock::now();
         std::lock_guard<std::mutex> lock(mu_);
+        const auto w1 = WallClock::now();
         Bind bind(*this);
         if (!bind.ok)
             return Fail(err, bind.Error());
+        const auto w2 = WallClock::now();
         // slots: 0 = cur, 1 = next, 2 = prev
         bool ok = Upload(cur, 0, err) && (!next || Upload(*next, 1, err)) && (!prev || Upload(*prev, 2, err)) &&
                   EnsureOut(cur.width, cur.height, err) && SetupFlow(cur.width, cur.height, fs, err);
+        if (ok)
+            cudaStreamSynchronize(nullptr); // (uploads timed on their own)
+        const auto w3 = WallClock::now();
         if (ok)
         {
             cudaEventRecord(ev_[0], nullptr);
@@ -792,7 +849,15 @@ public:
             cudaEventRecord(ev_[2], nullptr);
             ok = ok && BlurSingle(s, err) && Finish(stats, err);
         }
+        const auto w4 = WallClock::now();
         ok = ok && Download(out, outRowBytes, cur.argb, cur.isFloat, err);
+        if (stats)
+        {
+            stats->lockMs = ms(w0, w1);
+            stats->acquireMs = ms(w1, w2);
+            stats->uploadMs = ms(w2, w3);
+            stats->downloadMs = ms(w4, WallClock::now());
+        }
         return ok;
     }
 
@@ -894,6 +959,15 @@ private:
         return false;
     }
 
+    // As Fail, with the CUDA error appended. A copy also reports an error left
+    // by an earlier kernel launch, so this names whatever went wrong first.
+    static bool FailCuda(std::string* err, const char* msg, cudaError_t e)
+    {
+        if (err)
+            *err = std::string(msg) + " (" + cudaGetErrorName(e) + ": " + cudaGetErrorString(e) + ")";
+        return false;
+    }
+
     static FlowField Field(const DevBuf& f) { return {(const float2*)f.ptr, f.pitch, f.w, f.h}; }
 
     // Host frame -> float device frame in frame_[slot].
@@ -904,19 +978,39 @@ private:
         DevBuf& f = frame_[slot];
         if (!f.Ensure(img.width, img.height, 16))
             return Fail(err, "out of GPU memory (upload)");
+        // Bottom-up host rows (see BottomUp): the block goes up as it lies in
+        // memory and is flipped on the GPU, reading the staging copy through
+        // FlipView.
+        const bool flip = BottomUp(img.rowBytes);
+        const void* src = BlockStart(img.data, img.rowBytes, img.height);
+        const size_t srcPitch = AbsPitch(img.rowBytes);
+        const dim3 b(16, 16);
         if (img.isFloat) // already float BGRA: straight copy, nothing clamped or quantised
-            return cudaMemcpy2D(f.ptr, f.pitch, img.data, img.rowBytes, (size_t)img.width * 16, img.height,
-                                cudaMemcpyHostToDevice) == cudaSuccess ||
-                   Fail(err, "upload failed");
+        {
+            DevBuf& dst = flip ? stage_[slot] : f;
+            if (flip && !dst.Ensure(img.width, img.height, 16))
+                return Fail(err, "out of GPU memory (upload)");
+            if (const cudaError_t e = cudaMemcpy2D(dst.ptr, dst.pitch, src, srcPitch, (size_t)img.width * 16,
+                                                   img.height, cudaMemcpyHostToDevice);
+                e != cudaSuccess)
+                return FailCuda(err, "upload failed", e);
+            if (flip)
+            {
+                const View v = FlipView(dst);
+                KCopyF4<<<Grid(img.width, img.height, b), b>>>(v.p, v.pitch, (char*)f.ptr, f.pitch, img.width,
+                                                               img.height);
+            }
+            return true;
+        }
         if (!stage_[slot].Ensure(img.width, img.height, 4))
             return Fail(err, "out of GPU memory (upload)");
-        if (cudaMemcpy2D(stage_[slot].ptr, stage_[slot].pitch, img.data, img.rowBytes, (size_t)img.width * 4,
-                         img.height, cudaMemcpyHostToDevice) != cudaSuccess)
-            return Fail(err, "upload failed");
-        const dim3 b(16, 16);
-        KU8ToF4<<<Grid(img.width, img.height, b), b>>>((const unsigned char*)stage_[slot].ptr, stage_[slot].pitch,
-                                                        (char*)f.ptr, f.pitch, img.width, img.height,
-                                                        img.argb ? 1 : 0);
+        if (const cudaError_t e = cudaMemcpy2D(stage_[slot].ptr, stage_[slot].pitch, src, srcPitch,
+                                               (size_t)img.width * 4, img.height, cudaMemcpyHostToDevice);
+            e != cudaSuccess)
+            return FailCuda(err, "upload failed", e);
+        const View v = flip ? FlipView(stage_[slot]) : View{(char*)stage_[slot].ptr, stage_[slot].pitch};
+        KU8ToF4<<<Grid(img.width, img.height, b), b>>>((const unsigned char*)v.p, v.pitch, (char*)f.ptr, f.pitch,
+                                                        img.width, img.height, img.argb ? 1 : 0);
         return true;
     }
 
@@ -926,9 +1020,10 @@ private:
             return Fail(err, "empty flow");
         if (!dst.Ensure(f.width, f.height, sizeof(float2)))
             return Fail(err, "out of GPU memory (flow)");
-        if (cudaMemcpy2D(dst.ptr, dst.pitch, f.data, f.rowBytes, (size_t)f.width * sizeof(float2), f.height,
-                         cudaMemcpyHostToDevice) != cudaSuccess)
-            return Fail(err, "flow upload failed");
+        if (const cudaError_t e = cudaMemcpy2D(dst.ptr, dst.pitch, f.data, f.rowBytes, (size_t)f.width * sizeof(float2),
+                                               f.height, cudaMemcpyHostToDevice);
+            e != cudaSuccess)
+            return FailCuda(err, "flow upload failed", e);
         return true;
     }
 
@@ -941,16 +1036,37 @@ private:
 
     bool Download(void* out, size_t outRowBytes, bool argb, bool isFloat, std::string* err)
     {
-        if (isFloat)
-            return cudaMemcpy2D(out, outRowBytes, out_.ptr, out_.pitch, (size_t)out_.w * 16, out_.h,
-                                cudaMemcpyDeviceToHost) == cudaSuccess ||
-                   Fail(err, "download failed");
+        // Bottom-up host rows (see BottomUp): written flipped into a staging
+        // buffer on the GPU, which then goes down as one block.
+        const bool flip = BottomUp(outRowBytes);
+        void* dst = BlockStart(out, outRowBytes, out_.h);
+        const size_t dstPitch = AbsPitch(outRowBytes);
         const dim3 b(16, 16);
-        KF4ToU8<<<Grid(out_.w, out_.h, b), b>>>((const char*)out_.ptr, out_.pitch, (unsigned char*)stageOut_.ptr,
-                                                stageOut_.pitch, out_.w, out_.h, argb ? 1 : 0);
-        if (cudaMemcpy2D(out, outRowBytes, stageOut_.ptr, stageOut_.pitch, (size_t)out_.w * 4, out_.h,
-                         cudaMemcpyDeviceToHost) != cudaSuccess)
-            return Fail(err, "download failed");
+        if (isFloat)
+        {
+            const DevBuf* src = &out_;
+            if (flip)
+            {
+                if (!stageOutF_.Ensure(out_.w, out_.h, 16))
+                    return Fail(err, "out of GPU memory (output)");
+                const View v = FlipView(stageOutF_);
+                KCopyF4<<<Grid(out_.w, out_.h, b), b>>>((const char*)out_.ptr, out_.pitch, v.p, v.pitch, out_.w,
+                                                        out_.h);
+                src = &stageOutF_;
+            }
+            if (const cudaError_t e = cudaMemcpy2D(dst, dstPitch, src->ptr, src->pitch, (size_t)out_.w * 16, out_.h,
+                                                   cudaMemcpyDeviceToHost);
+                e != cudaSuccess)
+                return FailCuda(err, "download failed", e);
+            return true;
+        }
+        const View v = flip ? FlipView(stageOut_) : View{(char*)stageOut_.ptr, stageOut_.pitch};
+        KF4ToU8<<<Grid(out_.w, out_.h, b), b>>>((const char*)out_.ptr, out_.pitch, (unsigned char*)v.p, v.pitch,
+                                                out_.w, out_.h, argb ? 1 : 0);
+        if (const cudaError_t e = cudaMemcpy2D(dst, dstPitch, stageOut_.ptr, stageOut_.pitch, (size_t)out_.w * 4,
+                                               out_.h, cudaMemcpyDeviceToHost);
+            e != cudaSuccess)
+            return FailCuda(err, "download failed", e);
         return true;
     }
 
@@ -1041,6 +1157,7 @@ private:
     HostDevice* host_ = nullptr; // set: ctx_ is the host's (see HostDevice)
     std::string desc_;           // device and context, for the log
     DevBuf frame_[kMaxFrames], out_, stage_[kMaxFrames], stageOut_; // float frames, output, 8-bit staging
+    DevBuf stageOutF_; // float output staging, for bottom-up host rows only (see BottomUp)
     DevBuf fieldFlow_, fieldMask_;                                   // Quality High: one sample's field
     DevBuf flowA_, flowB_, mipA_[3], mipB_[3];
     dis::Buf<float2> tilesA_[2], tilesB_[2]; // layered blur: tile max, neighbourhood max
